@@ -15,7 +15,7 @@ import re
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 

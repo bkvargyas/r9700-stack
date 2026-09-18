@@ -13,7 +13,7 @@ import torch
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 _PATCHED = False
 _CHUNK_BYTES = 256 << 20

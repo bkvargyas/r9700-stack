@@ -17,7 +17,7 @@ import torch
 
 from vllm.logger import init_logger
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 _PATCHED = False
 
 _MID = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])   # e2m1 decision thresholds on |x|/scale

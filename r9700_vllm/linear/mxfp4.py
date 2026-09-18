@@ -16,7 +16,7 @@ from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearKernel, MxF
 
 from ..kernels import moe as K
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 
 class R9700Mxfp4LinearKernel(MxFp4LinearKernel):

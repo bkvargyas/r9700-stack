@@ -24,7 +24,7 @@ from vllm.logger import init_logger
 
 from ..kernels import moe as K
 
-logger = init_logger(__name__)
+logger = init_logger("vllm." + __name__)
 
 _BOUND = False
 _PROFILE: torch.Tensor | None = None

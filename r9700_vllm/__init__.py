@@ -15,7 +15,7 @@ def _disabled(name: str) -> bool:
 
 def register() -> None:
     from vllm.logger import init_logger
-    log = init_logger("r9700_vllm")
+    log = init_logger("vllm.r9700_vllm")
     done = []
     try:
         from vllm.platforms import current_platform
