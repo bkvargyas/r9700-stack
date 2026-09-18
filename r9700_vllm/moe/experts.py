@@ -38,6 +38,14 @@ def _cfg(env: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
 CFG_GATE_UP = _cfg("R9K_MOE_CFG1", (2, 4, 2))
 CFG_DOWN = _cfg("R9K_MOE_CFG2", (4, 2, 1))
 FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
+# Cold-pass strategy by step width (routed rows = tokens x top-k). Measured 2026-09-18, MTP-3, 270 slots:
+#  - few rows (e.g. 4 concurrent = 160 rows): bulk-staging the few cold experts beats latency-bound UVA reads
+#    (@4: 182.5 vs 121.0 tok/s);
+#  - mid widths (16 concurrent = 640 rows): many cold experts with ~1 row each; UVA reads each once, staging only
+#    adds a copy (@16: 195.7 UVA vs 172.5 staged);
+#  - prefill chunks: staging avoids re-reading an expert once per 16*MT-row block.
+STAGE_MAX_ROWS = int(os.environ.get("R9K_STAGE_MAX_ROWS", "320"))
+STAGE_MIN_WIDE = int(os.environ.get("R9K_STAGE_MIN_WIDE", "2048"))
 
 
 def r9k_available() -> bool:
@@ -137,7 +145,7 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
             # inserts, so every routed expert is resident before the GEMMs: the cold pass is provably empty
             # and its two launches can be skipped on the host (no device sync needed; decode is always here).
             if numel > cache.no_cold_limit:
-                if cache.stage is not None:
+                if cache.stage is not None and (numel <= STAGE_MAX_ROWS or numel >= STAGE_MIN_WIDE):
                     s1, s2, smap = cache.stage_cold(topk_ids)      # bulk-copy cold experts to VRAM once
                     passes.append((s1, s2, moe_align_block_size(topk_ids, blk, global_num_experts, smap)))
                 else:
