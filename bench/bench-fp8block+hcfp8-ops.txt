@@ -1,0 +1,7 @@
+warmup done in 18.4s
+[stock-fp8block-hcfp8-ops] single-stream decode: 58.5 tok/s
+[stock-fp8block-hcfp8-ops] aggregate @4 concurrent: 96.9 tok/s (4 ok)
+[stock-fp8block-hcfp8-ops] aggregate @8 concurrent: 137.0 tok/s (8 ok)
+[stock-fp8block-hcfp8-ops] aggregate @16 concurrent: 128.2 tok/s (16 ok)
+conc 1: median ITL 39.9 ms, p90 48.6 ms
+Decoding metrics: Mean acceptance length: 2.64, Accepted throughput: 59.90 tokens/s, Drafte

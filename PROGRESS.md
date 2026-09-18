@@ -60,6 +60,10 @@ Bring-up fixes needed (all in the plugin / launcher, no vLLM source patches):
 
 Remaining gaps: short-prompt prefill (host read-through of offloaded experts over Gen3 PCIe), LRU miss traffic
 (~7.5 ms/step), untuned Triton fp8-block GEMMs (~4.7 ms/step); VM100 RAM upgrade would allow a full cache.
+Correction: the "+ fp8 HC linears" row above ran on a stale torch.compile cache that still used the bf16 HC path
+(Dynamo cannot trace our ctypes kernels; they are now torch custom ops, and the compile cache is keyed by R9K_* knobs):
+that gain is the fp8 LM heads alone. With fp8 HC + row-wise fp8 block projections truly active: 58.5 single, MTP
+acceptance 2.64 (vs ~3.0) -> worse; being A/B'd separately.
 Correction: the earlier "P2P gives nothing" A/B was flawed (tcclaviger's r4d AR kept using P2P IPC in both arms).
 
 ### Next
