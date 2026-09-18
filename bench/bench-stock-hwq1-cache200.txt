@@ -1,0 +1,8 @@
+10063
+[stock-hwq1-cache200] single-stream decode: 38.3 tok/s
+[stock-hwq1-cache200] aggregate @4 concurrent: 114.6 tok/s (4 ok)
+[stock-hwq1-cache200] aggregate @8 concurrent: 120.0 tok/s (8 ok)
+[stock-hwq1-cache200] aggregate @16 concurrent: 115.4 tok/s (16 ok)
+[stock-hwq1-cache200] prefill ~523 tok: 175 tok/s
+[stock-hwq1-cache200] prefill ~2023 tok: 333 tok/s
+[stock-hwq1-cache200] prefill ~8023 tok: 2832 tok/s
