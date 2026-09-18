@@ -17,6 +17,17 @@ def register() -> None:
     from vllm.logger import init_logger
     log = init_logger("r9700_vllm")
     done = []
+    try:
+        from vllm.platforms import current_platform
+        if not current_platform.is_rocm():
+            log.info("r9700_vllm: not ROCm, nothing registered")
+            return
+    except Exception:
+        return
+    if not _disabled("ple"):
+        from .ple import int6
+        if int6.patch():
+            done.append("ple_int6")
     if not _disabled("moe"):
         from .moe import ct_mxfp4
         if ct_mxfp4.patch():

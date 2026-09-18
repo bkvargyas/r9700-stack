@@ -6,10 +6,10 @@ cd "$(dirname "$0")"
 GFX_ARCH=${GFX_ARCH:-gfx1201}
 OUT=${OUT:-libr9k.so}
 HIPCC=${HIPCC:-hipcc}
-SRCS=(r9k_moe_mxfp4a8.hip)
+SRCS=(r9k_moe_mxfp4a8.hip r9k_ple.hip)
 $HIPCC -O3 -std=c++17 -fPIC -DNDEBUG --offload-arch="$GFX_ARCH" -ffp-contract=off -shared "${SRCS[@]}" -o "$OUT"
 if grep -q -a hidden_hostcall_buffer "$OUT"; then echo "ERROR: $OUT contains hostcall kernels" >&2; exit 1; fi
-for sym in r9k_moe_mxfp4a8 r9k_quant_rows_fp8 r9k_moe_block; do
+for sym in r9k_moe_mxfp4a8 r9k_quant_rows_fp8 r9k_moe_block r9k_ple_gather_int6; do
   nm -D "$OUT" | grep -q " T $sym$" || { echo "MISSING EXPORT: $sym" >&2; exit 1; }
 done
 echo "built $(ls -la "$OUT")"
