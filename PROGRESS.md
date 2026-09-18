@@ -33,7 +33,7 @@
   - `ple/int6.py` — int6 PLE table in pinned host memory (UVA) instead of stock's bf16-in-VRAM (51 GB/rank).
   - `linear/mxfp4.py` — dense MXFP4 linears (shared experts) on our kernel instead of per-call dequant emulation.
   - `spec/mtp_rocm.py` — MTP k>1 on ROCm (QSA metadata onto the spec-decode allowlist, cf. PR #55292).
-- `docker/Dockerfile` (stock nightly + plugin), `serve/serve-stock-fn.sh`, `bench/bringup-tests.sh`,
+- `docker/Dockerfile` (stock nightly + plugin), `serve/serve.sh` (was serve-stock-fn.sh), `bench/bringup-tests.sh`,
   `tests/` (MoE GEMM vs exact dequant, PLE vs reference, cache bit-identity + LRU invariants).
 
 ### Stock vLLM (ROCm 10 nightly) + plugin: bring-up and tuning log (2026-09-18 morning)
@@ -72,7 +72,7 @@ BENCH CAVEAT: bench.py runs are single-shot and confounded by compile-cache stat
 AOT graph (140 s startup) ran @4 at ~182 tok/s; fresh-compile starts (~470 s) ran ~118-121 with the same code).
 Need a repeated-run harness before trusting <15% differences.
 
-Launch (defaults now in serve-stock-fn.sh): `MTP=3 P2P=1 ~/serve-stock-fn.sh` then `python3 ~/warmup.py`
+Launch (defaults now in serve/serve.sh, MTP=3 default): `OVERLAYS=emulated-switch serve/serve.sh` then `python3 ~/warmup.py`
 (= OFFLOAD_GB=34, UTIL=0.94, R9K_EXPERT_CACHE_SLOTS=270, fp8 target+draft LM heads). 320 slots leaves no KV room.
 Opt-ins measured and left off: R9K_FP8_BLOCK=rowwise|block (acceptance drop / ~1 ms), R9K_FP8_LINEARS=hyper_connection
 (acceptance drop), R9K_DRAFT_LMHEAD=mxfp4 (throughput +, single -).

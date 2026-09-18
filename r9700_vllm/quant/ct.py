@@ -11,6 +11,8 @@ changes what it hands out per layer, and only on ROCm gfx12 with libr9k availabl
   * MoE layers with MXFP4 experts -> `R9kMxfp4MoEMethod` (libr9k grouped GEMM + expert cache; stock -> CUDA Marlin).
   * dense MXFP4 schemes -> stock scheme object with its kernel set to `R9700Mxfp4LinearKernel` (stock -> per-call
     dequant emulation).
+  * NVFP4 dense / MoE -> converted to MXFP4 at load, then the same libr9k paths (quant/nvfp4.py; stock ROCm has
+    only NVFP4 emulation for linears and no NVFP4 MoE backend). R9K_DISABLE=nvfp4 opts out.
   * opt-in R9K_FP8_BLOCK=block|rowwise: block-fp8 schemes -> `R9kW8A8Fp8` (libr9k split-K fp8 GEMM).
   * opt-in R9K_FP8_LINEARS=<regex>: matching unquantized linears -> `R9kFp8UnquantMethod`.
 Everything else is exactly the stock object.
@@ -32,6 +34,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxfp4 import (
     CompressedTensorsW4A4Mxfp4,
+)
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
+    CompressedTensorsW4A4Fp4,
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
@@ -181,12 +186,22 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
             cfg = MxFp4LinearLayerConfig(activation_quant_key=None)
             scheme.kernel = R9700Mxfp4LinearKernel(cfg)       # instance attribute, stock class untouched
             logger.info_once("r9700: dense MXFP4 linears -> libr9k (fp8 activations)")
+        elif isinstance(scheme, CompressedTensorsW4A4Fp4) and not _off("nvfp4"):
+            from ..linear.mxfp4 import R9700Mxfp4LinearKernel
+            from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+            from .nvfp4 import make_dense_scheme_cls
+            scheme.__class__ = _cached(make_dense_scheme_cls, CompressedTensorsW4A4Fp4)   # this instance only
+            scheme.kernel = R9700Mxfp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=None))
         elif isinstance(scheme, CompressedTensorsW8A8Fp8) and _mode("R9K_FP8_BLOCK") in ("block", "rowwise"):
             scheme.__class__ = R9kW8A8Fp8                        # this instance only
             scheme.r9k_mode = _mode("R9K_FP8_BLOCK")
         return scheme
 
     def get_quant_method(self, layer, prefix):
+        if r9k_available() and not _off("nvfp4") and self._is_nvfp4_moe(layer, prefix):
+            # before stock dispatch: stock has no NVFP4 MoE backend on ROCm and raises while selecting one
+            from .nvfp4 import make_moe_method_cls
+            return _cached(make_moe_method_cls, R9kMxfp4MoEMethod)(layer.moe_config)
         m = super().get_quant_method(layer, prefix)
         if not r9k_available():
             return m
@@ -197,3 +212,22 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         if pat and type(m) is UnquantizedLinearMethod and re.search(pat, prefix or ""):
             return R9kFp8UnquantMethod()
         return m
+
+    def _is_nvfp4_moe(self, layer, prefix) -> bool:
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+        if not isinstance(layer, RoutedExperts):
+            return False
+        self._add_fused_moe_to_target_scheme_map()
+        sd = self.get_scheme_dict(layer, (prefix or "") + ".0.gate_proj")
+        return bool(sd) and self._is_nvfp4_format(sd.get("weights"))
+
+
+_CLS_CACHE: dict = {}
+
+
+def _cached(factory, base):
+    """One generated subclass per (factory, base), so every layer shares the same class object."""
+    key = (factory, base)
+    if key not in _CLS_CACHE:
+        _CLS_CACHE[key] = factory(base)
+    return _CLS_CACHE[key]

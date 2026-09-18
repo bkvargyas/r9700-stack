@@ -25,6 +25,9 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         super().__init__(config)
         self._ids: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 
+    def input_quant_key(self):
+        return None      # quantizes its own activations (fp8 per row); no pre-quantized-input fusion
+
     @classmethod
     def is_supported(cls, compute_capability: int | None = None) -> tuple[bool, str | None]:
         from ..moe.experts import r9k_available
