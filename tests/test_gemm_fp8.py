@@ -14,7 +14,14 @@ for (M, N, Kd) in [(1, 4096, 2560), (4, 124160, 2560), (37, 1024, 2560), (100, 5
     W = F8.quantize_rows_fp8(w)
     q, s = K.quant_rows_fp8(x)
     out = F8.gemm_fp8(q, s, W)
-    r = rel(out, ref); good = r < 3e-2; ok &= good
+    # kernel exactness: against the dequantized fp8 operands (only accumulation-order differences remain)
+    wq = W.wq.view(torch.uint8).reshape(N // 16, Kd // 16, 2, 16, 8).permute(0, 3, 1, 2, 4).reshape(N, Kd)
+    wdq = wq.view(torch.float8_e4m3fn).float() * W.ws[:, None]
+    refq = (q.float() * s[:, None]) @ wdq.T
+    rk = rel(out, refq); good = rk < 5e-3; ok &= good
+    r = rel(out, ref)
+    print(f"  fp8  M={M:3d} N={N:6d} K={Kd}: kernel rel {rk:.2e} {'ok' if good else '<-- FAIL'} "
+          f"(vs bf16 {r:.2e} = fp8 W+A quantization)")
 
     if N % 16 == 0:
         pk, sc = quantize_mxfp4(w)
