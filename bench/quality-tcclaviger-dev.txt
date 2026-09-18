@@ -1,0 +1,7 @@
+RESTORED healthy 06:58:22
+CHAIN_DONE
+GSM8K no-think: 97.0% (97/100), 33670 tokens in 281s
+needle ~3828 tok: hit ('985440')
+needle ~15196 tok: hit ('894772')
+needle ~30354 tok: hit ('142450')
+needle: 3/3
