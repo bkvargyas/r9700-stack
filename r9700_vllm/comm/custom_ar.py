@@ -1,4 +1,5 @@
-"""Enable vLLM's custom (P2P IPC) all-reduce on gfx12 (R9700). Opt-out: R9K_CUSTOM_AR=0.
+"""Enable vLLM custom (P2P IPC) all-reduce on gfx12 (R9700): R9K_CUSTOM_AR=1. OFF by default -- measured 2026-09-18:
+it engages but produces garbage output on 2x R9700 (PCIe P2P, emulated switch); use libr4d AR instead.
 
 Stock RocmPlatform.use_custom_allreduce() is True only for gfx94/gfx95, so TP2 on two R9700s goes through RCCL:
 ~69 us per decode all-reduce, ~157 of them per MTP-3 step = ~11 ms/step (22% of GPU time). vLLM's CustomAllreduce
@@ -19,7 +20,7 @@ def patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("R9K_CUSTOM_AR", "1") != "1":
+    if os.environ.get("R9K_CUSTOM_AR", "0") != "1":   # default OFF: vLLM custom AR produces garbage on gfx1201
         return False
     try:
         from vllm.platforms import rocm as R
