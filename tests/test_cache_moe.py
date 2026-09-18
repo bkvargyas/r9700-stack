@@ -65,6 +65,13 @@ def main():
                 K.moe_gemm(a[0], a[1], W, o, sh, eh, nh, numel, d, t, *cfg, num_experts=E)
             for W, o, a, d, t, cfg in ((c1, o1, (xq, xs), topk, None, CFG_UP), (c2, o2, (hq, hs), 1, tw, CFG_DOWN)):
                 K.moe_gemm(a[0], a[1], W, o, sc, ec, nc, numel, d, t, *cfg, num_experts=E)
+        elif step % 3 == 0 and cache.stage is not None:
+            cache.update(topk_ids)
+            gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk)
+            gemm_pass(hq, hs, h2, o2, topk_ids, E, cache.table, numel, 1, tw)
+            sw1, sw2, smap = cache.stage_cold(topk_ids)     # cold pass from the VRAM staging area
+            gemm_pass(xq, xs, sw1, o1, topk_ids, E, smap, numel, topk)
+            gemm_pass(hq, hs, sw2, o2, topk_ids, E, smap, numel, 1, tw)
         else:
             cache.update(topk_ids)
             gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk)

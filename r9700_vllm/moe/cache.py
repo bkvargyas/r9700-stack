@@ -98,6 +98,31 @@ def _num_moe_layers() -> int:
         return 48
 
 
+_STAGING: dict[tuple, dict] = {}
+
+
+def _staging(dev, cap: int, shapes) -> dict:
+    """One VRAM staging area per device (layers run sequentially on one stream, so all cached layers share it):
+    `cap` expert rows for each of the four slabs, plus the E-length scratch used to build the stage map."""
+    key = (dev.index, cap, tuple(tuple(x) for x in shapes))
+    st = _STAGING.get(key)
+    if st is None:
+        (w13s, w13d), (w2s, w2d), s13s, s2s = shapes
+        st = {"w13": torch.empty((cap, *w13s), dtype=w13d, device=dev),
+              "w2": torch.empty((cap, *w2s), dtype=w2d, device=dev),
+              "s13": torch.empty((cap, *s13s), dtype=torch.uint8, device=dev),
+              "s2": torch.empty((cap, *s2s), dtype=torch.uint8, device=dev),
+              "dummy": torch.empty((cap, 16), dtype=torch.uint8, device=dev)}
+        _STAGING[key] = st
+        logger.info_once("r9700: cold-expert staging buffer %d experts (%.0f MiB) per GPU", cap,
+                         sum(t.numel() * t.element_size() for t in st.values()) / 2**20)
+    return st
+
+
+def staging_enabled() -> bool:
+    return os.environ.get("R9K_STAGE_COLD", "1") == "1"
+
+
 class LayerCache:
     def __init__(self, layer_idx: int, w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor,
                  N1: int, K1: int, N2: int, K2: int, slots: int):
@@ -140,6 +165,20 @@ class LayerCache:
         g = os.environ.get("R9K_LRU_GATHER", "8,16").split(",")
         self.chunks, self.lanes = int(g[0]), int(g[1])
         self._warm_start()
+        # wide steps (prefill / big batches): stage the routed-but-not-resident experts into VRAM with one bulk
+        # gather instead of streaming them over PCIe inside the cold GEMM (once per 16*MT-row block, ~2x traffic)
+        self.stage = None
+        if staging_enabled():
+            cap = E - self.S
+            if cap > 0:
+                self.stage = _staging(dev, cap, (((w13.shape[1],), w13.dtype), ((w2.shape[1],), w2.dtype),
+                                                 tuple(s13.shape[1:]), tuple(s2.shape[1:])))
+                self.stage_cap = cap
+                self._routed_i = torch.zeros((E,), dtype=torch.int32, device=dev)
+                self._stage_map = torch.full((E,), -1, dtype=torch.int32, device=dev)
+                self._stage_miss = torch.zeros((E, 2), dtype=torch.int32, device=dev)
+                self._stage_n = torch.zeros((1,), dtype=torch.int32, device=dev)
+                self._ar = torch.arange(E, dtype=torch.int32, device=dev)
 
     def _warm_start(self):
         prof = _profile()
@@ -228,6 +267,36 @@ class LayerCache:
             raise RuntimeError(f"r4d_lru_fused failed ({rc})")
         self._gather()
         return (sh, eh, nh), (sc, ec, nc)
+
+    def stage_cold(self, topk_ids: torch.Tensor):
+        """After update(): copy every routed expert that is not resident into the staging area. Returns
+        (W1, W2, stage_map) for a cold pass over VRAM. Device-side only (no host sync, cudagraph-safe)."""
+        st = self.stage
+        ids = topk_ids.reshape(-1).long()
+        r = self._routed_i
+        r.zero_()
+        r.index_fill_(0, ids.clamp_min(0), 1)
+        cold = (r > 0) & (self.table < 0)
+        idx = torch.cumsum(cold.to(torch.int32), 0, dtype=torch.int32) - 1
+        self._stage_map.copy_(torch.where(cold, idx, torch.full_like(idx, -1)))
+        order = torch.argsort((~cold).to(torch.int8), stable=True).to(torch.int32)   # cold experts first
+        self._stage_miss[:, 0] = order
+        self._stage_miss[:, 1] = self._stage_map[order.long()]
+        self._stage_n.copy_(cold.sum(dtype=torch.int32).reshape(1).clamp_max(self.stage_cap))
+        stream = torch.cuda.current_stream().cuda_stream
+        b = self.bytes
+        rc = _L().r4d_lru_gather(
+            st["w13"].data_ptr(), self.h_w13.data_ptr(), b[0],
+            st["w2"].data_ptr(), self.h_w2.data_ptr(), b[1],
+            st["s13"].data_ptr(), self.h_s13.data_ptr(), b[2],
+            st["s2"].data_ptr(), self.h_s2.data_ptr(), b[3],
+            st["dummy"].data_ptr(), self.h_dummy.data_ptr(), 16,
+            st["dummy"].data_ptr(), self.h_dummy.data_ptr(), 16,
+            self._stage_miss.data_ptr(), self._stage_n.data_ptr(), self.chunks, max(self.lanes, 32), stream)
+        if rc:
+            raise RuntimeError(f"r4d_lru_gather (staging) failed ({rc})")
+        return (K.Mxfp4Experts(st["w13"], st["s13"], self.N1, self.K1),
+                K.Mxfp4Experts(st["w2"], st["s2"], self.N2, self.K2), self._stage_map)
 
     def hot(self):
         return K.Mxfp4Experts(self.a_w13, self.a_s13, self.N1, self.K1), K.Mxfp4Experts(self.a_w2, self.a_s2, self.N2, self.K2)
