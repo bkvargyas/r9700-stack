@@ -52,6 +52,43 @@ def _as_param(t: torch.Tensor, like: torch.nn.Parameter) -> torch.nn.Parameter:
     return p
 
 
+def _maybe_attach_cache(method, layer) -> None:
+    import re
+    from . import cache as C
+    from ..kernels.moe import GROUP
+    s13, s2 = layer.w13_weight_scale, layer.w2_weight_scale
+    N1, K1 = s13.shape[2], (s13.shape[1] - 1) * GROUP
+    N2, K2 = s2.shape[2], (s2.shape[1] - 1) * GROUP
+    per_expert = (layer.w13_weight[0].numel() * 4 + layer.w2_weight[0].numel() * 4 + s13[0].numel() + s2[0].numel())
+    slots = C.slots_per_layer(per_expert)
+    if slots <= 0:
+        return
+    name = getattr(layer, "layer_name", "") or ""
+    m = re.search(r"layers\.(\d+)\.", name)
+    idx = int(m.group(1)) if m else 0
+    w13, w2 = layer.w13_weight.data, layer.w2_weight.data
+    if not C.is_host(layer.w13_weight):
+        w13 = C.to_host(w13)
+        layer.w13_weight = _as_param(w13, layer.w13_weight)
+        layer.w13_weight._vllm_is_uva_offloaded = True
+    if not C.is_host(layer.w2_weight):
+        w2 = C.to_host(w2)
+        layer.w2_weight = _as_param(w2, layer.w2_weight)
+        layer.w2_weight._vllm_is_uva_offloaded = True
+    cache = C.LayerCache(idx, w13, w2, s13.data, s2.data, N1, K1, N2, K2, slots)
+    # the host copies of the scales now back the cold pass; drop the device ones (keep shapes for _dims)
+    layer.w13_weight_scale = torch.nn.Parameter(cache.h_s13, requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(cache.h_s2, requires_grad=False)
+    from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
+    method.moe_quant_config = mxfp4_w4a16_moe_quant_config(w1_scale=layer.w13_weight_scale,
+                                                           w2_scale=layer.w2_weight_scale)
+    method.moe_kernel.fused_experts.quant_config = method.moe_quant_config
+    method.moe_kernel.fused_experts.r9k_cache = cache
+    torch.cuda.empty_cache()
+    logger.info_once("r9700: expert cache ON: %d slots/layer (%.2f MiB/expert/rank), %s GB/rank budget",
+                     cache.S, per_expert / 2**20, C.budget_gb())
+
+
 def patch() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -99,6 +136,7 @@ def patch() -> bool:
             moe_quant_config=self.moe_quant_config, moe_config=self.moe, experts_cls=R9700Mxfp4Experts,
             mxfp4_backend=self.mxfp4_backend, routing_tables=layer._expert_routing_tables())
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        _maybe_attach_cache(self, layer)
 
     cls.__init__ = __init__
     cls.process_weights_after_loading = process_weights_after_loading

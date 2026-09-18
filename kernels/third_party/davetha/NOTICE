@@ -1,0 +1,16 @@
+r9700-lru-expert-cache
+Copyright 2026 the r9700-lru-expert-cache authors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+The unified diffs under patches/ are derivative works of:
+  * vLLM (https://github.com/vllm-project/vllm), Apache License 2.0
+  * modifications to vLLM distributed in the container image
+    tcclaviger/vllm:DevQwenNextFlash
+
+No file from that image is redistributed here; patches/apply_patches.sh fetches
+the originals from the image at build time.
+
+The closed kernel library r4d.so in that image is built from libr4d
+(https://codeberg.org/StillDeadcode/libr4d). The HIP kernels under kernels/lru/
+are independent of it and link only against the HIP runtime.
