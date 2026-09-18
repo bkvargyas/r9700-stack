@@ -45,7 +45,8 @@ sudo docker rm -f vllmstock 2>/dev/null
 sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-  -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
+  -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 \
+  -e GPU_MAX_HW_QUEUES=${HWQ:-1} -e HSA_ENABLE_MWAITX=1 -e OMP_NUM_THREADS=8 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
   "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache:/root/.cache/vllm \
   "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
