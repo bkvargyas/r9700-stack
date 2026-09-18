@@ -40,4 +40,8 @@ def register() -> None:
         from .spec import mtp_rocm
         if mtp_rocm.patch():
             done.append("mtp_k>1")
+    if not _disabled("draft_head"):
+        from .spec import draft_head
+        if draft_head.patch():
+            done.append("draft_head_mxfp4")
     log.info("r9700_vllm %s registered: %s", __version__, ", ".join(done) or "nothing")
