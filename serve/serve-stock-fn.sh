@@ -22,6 +22,8 @@ if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
   sudo docker run --rm --entrypoint bash -v $REPO:/opt/r9700 $IMG -c \
     "cd /opt/r9700/kernels && ./build.sh && cp libr9k.so /opt/r9700/r9700_vllm/kernels/" || exit 1
 fi
+# forward every R9K_* plugin knob from the caller's environment into the container
+for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
 [ -n "$MTP" ] && ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
