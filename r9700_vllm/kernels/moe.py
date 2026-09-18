@@ -25,7 +25,7 @@ def lib() -> ctypes.CDLL:
         path = os.environ.get("R9K_LIB") or os.path.join(os.path.dirname(__file__), "libr9k.so")
         L = ctypes.CDLL(path)
         L.r9k_moe_mxfp4a8.restype = ctypes.c_int
-        L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 10 + [ctypes.c_int] * 8 + [ctypes.c_long]
+        L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 8 + [ctypes.c_long]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         assert L.r9k_moe_block() == MOE_BLOCK
@@ -40,10 +40,13 @@ def _stream() -> int:
 @dataclass
 class Mxfp4Experts:
     wq: torch.Tensor    # [E, N/16 * K/16 * 32] int32, fragment order
-    ws: torch.Tensor    # [E, K/32, N] uint8
-    wref: torch.Tensor  # [E, N] uint8
+    wsr: torch.Tensor   # [E, K/32 + 1, N] uint8: E8M0 exponents K-block-major, last row = per-row reference
     N: int
     K: int
+
+    @property
+    def estride(self) -> int:
+        return (self.K // GROUP + 1) * self.N
 
 
 def permute_fragments(packed: torch.Tensor) -> torch.Tensor:
@@ -65,10 +68,17 @@ def prepare_mxfp4_weights(packed: torch.Tensor, scale: torch.Tensor) -> Mxfp4Exp
     K = Kh * 2
     assert N % 16 == 0 and K % GROUP == 0, (N, K)
     assert scale.shape == (E, N, K // GROUP), (scale.shape, (E, N, K // GROUP))
+    return Mxfp4Experts(permute_fragments(packed.view(torch.uint8)), pack_scales(scale), N, K)
+
+
+def pack_scales(scale: torch.Tensor) -> torch.Tensor:
+    """[E, N, K/32] E8M0 -> [E, K/32 + 1, N]: transposed block exponents plus the per-row max as the last row."""
     scale = scale.view(torch.uint8)
-    wref = scale.max(dim=2).values.contiguous()        # [E, N]
-    ws = scale.transpose(1, 2).contiguous()            # [E, K/32, N]
-    return Mxfp4Experts(permute_fragments(packed.view(torch.uint8)), ws, wref, N, K)
+    E, N, nb = scale.shape
+    out = torch.empty((E, nb + 1, N), dtype=torch.uint8, device=scale.device)
+    out[:, :nb].copy_(scale.transpose(1, 2))
+    out[:, nb] = scale.max(dim=2).values
+    return out
 
 
 def quant_rows_fp8(x: torch.Tensor):
@@ -85,14 +95,22 @@ def quant_rows_fp8(x: torch.Tensor):
 
 def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.Tensor,
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
-             a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2):
-    """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r."""
+             a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
+             num_experts: int | None = None):
+    """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
+
+    The grid covers at most ceil(numel/16) + min(numel, E) blocks -- the most moe_align_block_size can fill
+    with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
+    launch stays cudagraph-safe."""
     assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
+    E = num_experts if num_experts is not None else w.wq.shape[0]
+    max_blocks = min(expert_ids.numel(), (numel + MOE_BLOCK - 1) // MOE_BLOCK + min(numel, E))
     rc = lib().r9k_moe_mxfp4a8(
-        a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.ws.data_ptr(), w.wref.data_ptr(), out.data_ptr(),
+        a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
+        w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
         sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
         topk_w.data_ptr() if topk_w is not None else 0,
-        expert_ids.numel(), numel, a_row_div, w.K, w.N, WV, SK, NPW, _stream())
+        w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, _stream())
     if rc:
         raise RuntimeError(f"r9k_moe_mxfp4a8 failed ({rc}) N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW}")
     return out

@@ -18,10 +18,11 @@
 //   * the epilogue can fold in the router weight topk_w[r] (down GEMM), so the caller only has to sum
 //     the top-k rows per token afterwards.
 //
-// Weight per expert e (all tensors expert-major, contiguous):
+// Weight per expert e (expert-major):
 //   Wp  [E][N/16][K/16][32] uint32   fragment order (mxfp4_layout.permute_w per expert)
-//   Ws  [E][K/32][N]        uint8    E8M0 block exponents, transposed to K-block-major
-//   Wref[E][N]              uint8    per-row reference exponent = max over K blocks
+//   Ws  e*ws_estride + [K/32][N]  uint8   E8M0 block exponents, transposed to K-block-major
+//   Wref e*wref_estride + [N]     uint8   per-row reference exponent = max over K blocks
+// (the Python side packs Ws and Wref into one [E][K/32+1][N] tensor: both strides (K/32+1)*N.)
 // Activations: A [Ma][K] e4m3 (per-row dynamic scale As[Ma] fp32). Output C [numel][N] bf16.
 // Shape rules: N % 16 == 0, K % (SK*32) == 0 (K=320 -> SK in {1,2,5,10}).
 #include <hip/hip_runtime.h>
@@ -66,7 +67,7 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ Wref_all, __hip_bfloat16* __restrict__ C,
     const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
     const int* __restrict__ ntpp, const float* __restrict__ topk_w,
-    int numel, int a_row_div, int K, int N, int WV, int SK) {
+    long ws_estride, long wref_estride, int numel, int a_row_div, int K, int N, int WV, int SK) {
   const int by = blockIdx.y;
   if (by * MOE_BLOCK >= ntpp[0]) return;
   const int e = expert_ids[by];
@@ -81,8 +82,8 @@ __global__ void r9k_moe_mxfp4a8_kernel(
   const int ksteps = K / 16;
 
   const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
-  const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * (K / GROUP) * N;
-  const unsigned char* __restrict__ Wref = Wref_all + (size_t)e * N;
+  const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
+  const unsigned char* __restrict__ Wref = Wref_all + (size_t)e * wref_estride;
 
   // This lane's A row: the sorted flat index of row nlane of the block, clamped to row 0 of the block
   // (always valid when the block is live) for padding entries.
@@ -178,7 +179,7 @@ extern "C" int r9k_moe_block(void) { return MOE_BLOCK; }
 // Returns 0 on success, negative on a shape error (the Python side raises).
 extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, long c,
                                long sorted_ids, long expert_ids, long ntpp, long topk_w,
-                               int max_blocks, int numel, int a_row_div, int K, int N,
+                               long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div, int K, int N,
                                int WV, int SK, int NPW, long stream) {
   if (N % 16) return -1;
   if (K % (SK * GROUP)) return -2;
@@ -191,7 +192,8 @@ extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, lon
 #define L(NP) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<NP>), grid, block, smem, st,            \
       (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws, \
       (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids,                        \
-      (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, numel, a_row_div, K, N, WV, SK)
+      (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel,  \
+      a_row_div, K, N, WV, SK)
   switch (NPW) {
     case 1: L(1); break;
     case 2: L(2); break;
