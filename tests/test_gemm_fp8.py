@@ -33,6 +33,30 @@ for (M, N, Kd) in [(1, 4096, 2560), (4, 124160, 2560), (37, 1024, 2560), (100, 5
                    torch.tensor([mpad], dtype=torch.int32, device="cuda"), M, 1, None, num_experts=1)
         r2 = rel(o2, ref); good = r2 < 0.2; ok &= good
         print(f"  mxfp4 (quantized head) M={M:3d} N={N:6d}: rel {r2:.2e} {'ok' if good else '<-- FAIL'}")
+# block-scaled (128x128 weight blocks, per-token-group-128 activations): exactness vs dequantized operands
+for (M, N, Kd) in [(1, 8192, 2560), (4, 6656, 2560), (7, 2560, 3072), (100, 2560, 3072)]:
+    w = (torch.randn(N, Kd, generator=g) * 0.05).cuda()
+    bs = (torch.rand((N + 127) // 128, Kd // 128, generator=g) * 0.02 + 0.001).cuda()
+    wq8 = w.to(torch.float8_e4m3fn)
+    x = torch.randn(M, Kd, generator=g).to(torch.bfloat16).cuda()
+    q, s = F8.quant_group128_fp8(x)
+    out = F8.gemm_fp8_block(q, s, F8.permute_fp8(wq8.view(torch.uint8)), bs, N, Kd)
+    wd = wq8.float() * bs.repeat_interleave(128, 0)[:N].repeat_interleave(128, 1)
+    xd = q.float() * s.repeat_interleave(128, 1)
+    refq = xd @ wd.T
+    rk = rel(out, refq); good = rk < 5e-3; ok &= good
+    print(f"  fp8-block M={M:3d} N={N:5d} K={Kd}: kernel rel {rk:.2e} {'ok' if good else '<-- FAIL'}")
+    for _ in range(3): F8.gemm_fp8_block(q, s, F8.permute_fp8(wq8.view(torch.uint8)), bs, N, Kd)
+wp = F8.permute_fp8(wq8.view(torch.uint8))
+for M in (1, 4):
+    x = torch.randn(M, 2560).to(torch.bfloat16).cuda(); w8 = torch.randn(8192, 2560).cuda().to(torch.float8_e4m3fn)
+    bsb = torch.rand(64, 20).cuda() * 0.01 + 0.001; wpb = F8.permute_fp8(w8.view(torch.uint8))
+    q, s = F8.quant_group128_fp8(x)
+    for _ in range(5): F8.gemm_fp8_block(q, s, wpb, bsb, 8192, 2560)
+    torch.cuda.synchronize(); t = time.perf_counter()
+    for _ in range(100): F8.gemm_fp8_block(q, s, wpb, bsb, 8192, 2560)
+    torch.cuda.synchronize(); us = (time.perf_counter() - t) / 100 * 1e6
+    print(f"  fp8-block 8192x2560 M={M}: {us:.0f} us ({8192*2560/us/1e3:.0f} GB/s)  [vLLM Triton tuned: ~120 us]")
 # bench LM-head shape per rank at TP2
 w = (torch.randn(124160, 2560) * 0.02).to(torch.bfloat16).cuda()
 W = F8.quantize_rows_fp8(w)

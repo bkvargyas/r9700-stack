@@ -24,6 +24,12 @@ def _fp8_linear_fake(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int
     return x.new_empty((x.shape[0], N))
 
 
+def _fp8_block_linear(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    from .kernels import fp8 as F8
+    q, s = F8.quant_group128_fp8(x)
+    return F8.gemm_fp8_block(q, s, wq, bs, N, K)
+
+
 _MX_TABLES: dict[tuple, tuple] = {}
 
 
@@ -57,6 +63,8 @@ def register() -> None:
     if _DONE:
         return
     direct_register_custom_op("fp8_linear", _fp8_linear, mutates_args=[], fake_impl=_fp8_linear_fake, target_lib=_LIB)
+    direct_register_custom_op("fp8_block_linear", _fp8_block_linear, mutates_args=[], fake_impl=_fp8_linear_fake,
+                              target_lib=_LIB)
     direct_register_custom_op("mxfp4_linear", _mxfp4_linear, mutates_args=[], fake_impl=_mxfp4_linear_fake,
                               target_lib=_LIB)
     _DONE = True
@@ -76,3 +84,11 @@ def mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K
     x2 = x.reshape(-1, K)
     x2 = (x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)).contiguous()
     return torch.ops.r9700.mxfp4_linear(x2, wq, wsr, N, K).reshape(*lead, N)
+
+
+def fp8_block_linear(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    register()
+    lead = x.shape[:-1]
+    x2 = x.reshape(-1, K)
+    x2 = (x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)).contiguous()
+    return torch.ops.r9700.fp8_block_linear(x2, wq, bs, N, K).reshape(*lead, N)

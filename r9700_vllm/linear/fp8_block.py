@@ -45,7 +45,8 @@ def patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
-    if os.environ.get("R9K_FP8_BLOCK", "").lower() != "rowwise":
+    mode = os.environ.get("R9K_FP8_BLOCK", "").lower()
+    if mode not in ("rowwise", "block"):
         return False
     try:
         from vllm.model_executor.layers.quantization.compressed_tensors.schemes import (
@@ -68,14 +69,28 @@ def patch() -> bool:
         if w.dim() != 2 or w.shape[0] % 16 or w.shape[1] % 16:
             return orig_pwal(self, layer)
         blk = tuple(getattr(layer, "weight_block_size", None) or (128, 128))
-        layer._r9k_fp8 = _requant_rowwise(w.view(torch.float8_e4m3fn), bs, blk)
+        if mode == "block":
+            # exact: same fp8 bytes and block scales, permuted into fragment order (same size)
+            if tuple(blk) != (128, 128) or w.shape[1] % 128:
+                return orig_pwal(self, layer)
+            from ..kernels import fp8 as F8
+            layer._r9k_fp8b = (F8.permute_fp8(w.view(torch.uint8)), bs.float().contiguous(), w.shape[0], w.shape[1])
+        else:
+            layer._r9k_fp8 = _requant_rowwise(w.view(torch.float8_e4m3fn), bs, blk)
         dev = w.device
         layer.weight = Parameter(torch.empty((0,), dtype=w.dtype, device=dev), requires_grad=False)
         layer.weight_scale = Parameter(torch.empty((0,), dtype=torch.float32, device=dev), requires_grad=False)
         layer.input_scale = None
-        logger.info_once("r9700: block-fp8 linears -> row-wise fp8 on libr9k (R9K_FP8_BLOCK=rowwise)")
+        logger.info_once("r9700: block-fp8 linears -> libr9k split-K fp8 GEMM (R9K_FP8_BLOCK=%s)", mode)
 
     def apply_weights(self, layer, x, bias=None):
+        Wb = getattr(layer, "_r9k_fp8b", None)
+        if Wb is not None:
+            if not isinstance(x, torch.Tensor):
+                raise RuntimeError("r9700 R9K_FP8_BLOCK got a pre-quantized activation; unset R9K_FP8_BLOCK")
+            from ..ops import fp8_block_linear
+            out = fp8_block_linear(x, *Wb)
+            return out + bias if bias is not None else out
         W = getattr(layer, "_r9k_fp8", None)
         if W is None:
             return orig_apply(self, layer, x, bias)

@@ -18,6 +18,10 @@ def _L():
     if not _BOUND:
         L.r9k_gemm_fp8.restype = ctypes.c_int
         L.r9k_gemm_fp8.argtypes = [ctypes.c_long] * 5 + [ctypes.c_int] * 8 + [ctypes.c_long]
+        L.r9k_gemm_fp8_block.restype = ctypes.c_int
+        L.r9k_gemm_fp8_block.argtypes = [ctypes.c_long] * 5 + [ctypes.c_int] * 8 + [ctypes.c_long]
+        L.r9k_quant_group128_fp8.restype = ctypes.c_int
+        L.r9k_quant_group128_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         _BOUND = True
     return L
 
@@ -63,4 +67,32 @@ def gemm_fp8(a_q: torch.Tensor, a_s: torch.Tensor, w: Fp8Weight, out: torch.Tens
                            M, w.K, w.N, out.stride(0), WV, SK, NPW, MT, _stream())
     if rc:
         raise RuntimeError(f"r9k_gemm_fp8 failed ({rc}) M={M} N={w.N} K={w.K}")
+    return out
+
+
+def quant_group128_fp8(x: torch.Tensor):
+    """bf16 [M, K] -> (e4m3 [M, K], fp32 [M, K/128]) per-token-group-128 dynamic scales."""
+    assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(1) == 1 and x.shape[1] % 128 == 0
+    M, K = x.shape
+    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.empty((M, K // 128), dtype=torch.float32, device=x.device)
+    rc = _L().r9k_quant_group128_fp8(x.data_ptr(), q.data_ptr(), s.data_ptr(), M, K, x.stride(0), _stream())
+    if rc:
+        raise RuntimeError(f"r9k_quant_group128_fp8 failed ({rc})")
+    return q, s
+
+
+def gemm_fp8_block(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int,
+                   out: torch.Tensor | None = None, WV: int = 4, SK: int = 4, NPW: int = 2):
+    """Block-scaled fp8: a_s [M, K/128], bs [ceil(N/128), K/128] (weight in permute_fp8 fragment order)."""
+    M = a_q.shape[0]
+    if out is None:
+        out = torch.empty((M, N), dtype=torch.bfloat16, device=a_q.device)
+    while SK > 1 and K % (128 * SK):
+        SK //= 2
+    MT = 4 if M > 32 else (2 if M > 16 else 1)
+    rc = _L().r9k_gemm_fp8_block(a_q.data_ptr(), a_s.data_ptr(), wq.data_ptr(), bs.data_ptr(), out.data_ptr(),
+                                 M, K, N, out.stride(0), WV, SK, NPW, MT, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_gemm_fp8_block failed ({rc}) M={M} N={N} K={K}")
     return out
