@@ -90,6 +90,26 @@ def main():
         ok &= same and inv
         print(f"  step {step:2d}: nmiss={int(cache.n_miss.item()):2d} resident-routed {resident_routed:2d}/{numel} "
               f"bit-identical={same} invariants={inv}")
+    # wide read-through steps (distinct > max_distinct): the staged cold pass must carry real work
+    if cache.stage is not None:
+        for step in range(6):
+            Mw = 8
+            topk_ids = torch.stack([torch.randperm(E, generator=g)[:topk] for _ in range(Mw)]).to(torch.int32).cuda()
+            numel = Mw * topk
+            tw = torch.rand(numel, generator=g).cuda()
+            x = (torch.randn(Mw, K1, generator=g) * 0.5).to(torch.bfloat16).cuda()
+            h = (torch.randn(numel, K2, generator=g) * 0.5).to(torch.bfloat16).cuda()
+            xq, xs = K.quant_rows_fp8(x); hq, hs = K.quant_rows_fp8(h)
+            r1 = torch.zeros(numel, N1, dtype=torch.bfloat16, device="cuda"); r2 = torch.zeros(numel, N2, dtype=torch.bfloat16, device="cuda")
+            gemm_pass(xq, xs, ref1, r1, topk_ids, E, None, numel, topk); gemm_pass(hq, hs, ref2, r2, topk_ids, E, None, numel, 1, tw)
+            cache.update(topk_ids)
+            o1 = torch.zeros_like(r1); o2 = torch.zeros_like(r2)
+            gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk); gemm_pass(hq, hs, h2, o2, topk_ids, E, cache.table, numel, 1, tw)
+            sw1, sw2, smap = cache.stage_cold(topk_ids)
+            gemm_pass(xq, xs, sw1, o1, topk_ids, E, smap, numel, topk); gemm_pass(hq, hs, sw2, o2, topk_ids, E, smap, numel, 1, tw)
+            torch.cuda.synchronize()
+            ncold = int((smap >= 0).sum()); same = torch.equal(o1, r1) and torch.equal(o2, r2); ok &= same and ncold > 0
+            print(f"  wide step {step}: staged {ncold} cold experts, bit-identical={same}")
     print("ALL OK" if ok else "FAILURES")
     return 0 if ok else 1
 
