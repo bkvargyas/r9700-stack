@@ -1,6 +1,6 @@
 """R9700Mxfp4Experts: vLLM modular fused-MoE experts backed by libr9k's grouped MXFP4 x FP8 GEMM (gfx1201).
 
-Layer weights (set by the CT MXFP4 hook's process_weights_after_loading, see ct_mxfp4.py):
+Layer weights (set by R9kMxfp4MoEMethod.process_weights_after_loading, quant/ct.py):
   w13_weight        [E, N1/16*K1/16*32] int32   fragment order   (N1 = 2*I, K1 = hidden)
   w2_weight         [E, N2/16*K2/16*32] int32                    (N2 = hidden, K2 = I)
   w13_weight_scale  [E, K1/32 + 1, N1]  uint8   exponents K-major + per-row reference (last row)

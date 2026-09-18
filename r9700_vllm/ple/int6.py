@@ -4,19 +4,21 @@ Stock vLLM's AMD PLE path wants a bf16 table ([160M rows/rank, 160] = ~51 GB/ran
 int6 GPTQ checkpoint (``ngram_embedding.shard_N.weight_packed`` u8 [rows, 120] + ``.weight_scale`` f16
 [rows, 5]) and could not hold the table in VRAM anyway. This hook:
 
-  * replaces ``PLEVocabParallelEmbedding`` inside ``vllm.models.qwen4_exp.amd.ple_layer`` with a subclass that
-    builds its vocab-parallel metadata on the meta device, then allocates its TP slice of the table as fused
-    int6 rows (130 B/row) in pinned host memory and exposes it to the GPU through a UVA view;
-  * swaps the embedding's quant method so ``embedding(layer, ids)`` is libr9k's gather+dequant kernel (stock
-    masking, zero-fill and TP all-reduce in ``VocabParallelEmbedding.forward`` are untouched);
-  * wraps ``Qwen4ExpNGramEmbedding.load_weights`` to route ``shard_N.weight_packed / weight_scale`` into the
-    fused host rows (TP overlap computed with stock ``compute_ple_shard_overlap``).
+  * ``R9kInt6PLEEmbedding`` (a ``PLEVocabParallelEmbedding`` subclass, installed by models/qwen4_exp.py only
+    while the model is constructed) builds its vocab-parallel metadata on the meta device, then allocates its TP
+    slice of the table as fused int6 rows (130 B/row) in pinned host memory behind a UVA view;
+  * its quant method's ``embedding(layer, ids)`` is libr9k's gather+dequant kernel (stock masking, zero-fill and
+    TP all-reduce in ``VocabParallelEmbedding.forward`` are untouched);
+  * it has its own ``load_weights``: stock ``Qwen4ExpNGramEmbedding.load_weights`` hands the (non-``.weight``)
+    ``shard_N.weight_packed / weight_scale`` tensors to ``AutoWeightsLoader``, which recurses into the child's
+    ``load_weights`` -- they land in the fused host rows (TP overlap via stock ``compute_ple_shard_overlap``).
 
 Only engages when the checkpoint's PLE shards are int6 (fp16 scales); otherwise stock behaviour.
 ~20.8 GB of pinned host RAM per rank at TP2 for Qwen3.8-Flash-Next.
 """
 from __future__ import annotations
 
+import functools
 import json
 import os
 import re
@@ -27,11 +29,10 @@ from vllm.logger import init_logger
 
 logger = init_logger("vllm." + __name__)
 
-_PATCHED = False
-_SHARD_RE = re.compile(r"^ngram_embedding\.shard_(\d+)\.weight_(packed|scale)$")
+_SHARD_RE = re.compile(r"^shard_(\d+)\.weight_(packed|scale)$")
 
 
-def _checkpoint_ple_format() -> str | None:
+def checkpoint_ple_format() -> str | None:
     """'int6' if the served checkpoint's PLE shards carry fp16 scales, else None (stock path)."""
     forced = os.environ.get("R9K_PLE_FORMAT")
     if forced:
@@ -73,7 +74,8 @@ class _Int6EmbeddingMethod:
         return gather_int6(layer.weight, ids, self.head_dim)
 
 
-def _make_embedding_cls(base):
+@functools.lru_cache(None)
+def make_int6_embedding_cls(base):
     from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding  # noqa: F401
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
 
@@ -94,6 +96,12 @@ def _make_embedding_cls(base):
             self.weight = torch.nn.Parameter(view, requires_grad=False)
             self.weight._vllm_is_uva_offloaded = True
             self._r9k_host = host
+            try:
+                from vllm.config import get_current_vllm_config
+                cfg = get_current_vllm_config().model_config.hf_text_config
+                self.split_parts = int(getattr(cfg, "split_ngram_parts", 512))
+            except Exception:
+                self.split_parts = 512
             self.quant_method = _Int6EmbeddingMethod(embedding_dim)
             self.params_dtype = torch.bfloat16
             logger.info_once("r9700: PLE int6 table %d rows x %d B = %.1f GiB pinned host (UVA) per rank",
@@ -115,52 +123,17 @@ def _make_embedding_cls(base):
                 dst[:, packed_bytes:].copy_(src.contiguous().view(torch.uint8).view(ov.row_count, -1))
             return ov.row_count
 
+        def load_weights(self, weights):
+            shard_size = (self.org_vocab_size + self.split_parts - 1) // self.split_parts
+            loaded = set()
+            for name, w in weights:
+                m = _SHARD_RE.match(name)
+                if m is None:
+                    raise ValueError(f"r9700: unexpected PLE int6 tensor {name!r}")
+                self.load_int6_shard(int(m.group(1)), m.group(2), w, shard_size)
+                loaded.add(name)
+            if loaded:
+                loaded.add("weight")
+            return loaded
+
     return R9kInt6PLEEmbedding
-
-
-def patch() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-    try:
-        from vllm.models.qwen4_exp.amd import ple_layer as pl
-        from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding
-    except Exception as e:
-        logger.warning("r9700: PLE hook not installed (%s)", e)
-        return False
-
-    stock_cls = PLEVocabParallelEmbedding
-    int6_cls = _make_embedding_cls(stock_cls)
-
-    def factory(*args, **kwargs):
-        if _checkpoint_ple_format() == "int6":
-            return int6_cls(*args, **kwargs)
-        return stock_cls(*args, **kwargs)
-
-    pl.PLEVocabParallelEmbedding = factory
-
-    ng = pl.Qwen4ExpNGramEmbedding
-    orig_load = ng.load_weights
-
-    def load_weights(self, weights):
-        emb = self.ngram_embedding
-        if not isinstance(emb, int6_cls):
-            return orig_load(self, weights)
-        shard_size = (emb.org_vocab_size + self.split_ngram_parts - 1) // self.split_ngram_parts
-        rest, got = [], set()
-        for name, w in weights:
-            m = _SHARD_RE.match(name)
-            if m:
-                emb.load_int6_shard(int(m.group(1)), m.group(2), w, shard_size)
-                got.add(name)
-            else:
-                rest.append((name, w))
-        loaded = set(orig_load(self, rest))
-        if got:
-            loaded.add("ngram_embedding.weight")
-            loaded.update(got)
-        return loaded
-
-    ng.load_weights = load_weights
-    _PATCHED = True
-    return True

@@ -4,8 +4,8 @@ Stock vLLM on ROCm gfx12 falls back to EmulationMxfp4LinearKernel: it dequantize
 every call (Flash-Next's shared experts hit this 48x per step). This kernel reuses libr9k's grouped
 MXFP4 x FP8 GEMM with a single expert: activations are quantized per row to e4m3, the routing tables are the
 identity (sorted ids 0..Mpad-1, all blocks -> expert 0), so any M works and the weight stays 4-bit.
-Inserted at the front of vLLM's ROCm MXFP4 kernel list (gfx12 only). Also takes stock's W4A4 (kMxfp4Dynamic)
-requests, serving them with fp8 activations (see can_implement).
+Handed to stock CT MXFP4 schemes by R9kCompressedTensorsConfig.get_scheme (quant/ct.py); serves stock's W4A4
+(kMxfp4Dynamic) requests with fp8 activations (see can_implement).
 """
 from __future__ import annotations
 
@@ -55,23 +55,3 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         N, Kd = layer._r9k_nk
         out = mxfp4_linear(x, layer.weight, layer.weight_scale, N, Kd).to(x.dtype)
         return out + bias if bias is not None else out
-
-
-_PATCHED = False
-
-
-def patch() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-    try:
-        from vllm.model_executor.kernels import linear as L
-        from vllm.platforms import PlatformEnum
-        lst = L._POSSIBLE_MXFP4_KERNELS.setdefault(PlatformEnum.ROCM, [])
-        if R9700Mxfp4LinearKernel not in lst:
-            lst.insert(0, R9700Mxfp4LinearKernel)
-    except Exception as e:
-        logger.warning("r9700: MXFP4 linear kernel not registered (%s)", e)
-        return False
-    _PATCHED = True
-    return True

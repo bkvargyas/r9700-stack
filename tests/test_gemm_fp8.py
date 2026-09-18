@@ -2,7 +2,7 @@
 import sys, time
 import torch
 from r9700_vllm.kernels import moe as K, fp8 as F8
-from r9700_vllm.spec.draft_head import quantize_mxfp4
+from r9700_vllm.models.lm_heads import quantize_mxfp4
 
 def rel(a, b): return ((a.float() - b.float()).norm() / b.float().norm()).item()
 ok = True

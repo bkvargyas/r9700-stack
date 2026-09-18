@@ -1,4 +1,4 @@
-"""TP=2 all-reduce on libr4d's one-shot P2P kernel (gfx1201), wrapped around vLLM's CudaCommunicator.
+"""TP=2 all-reduce on libr4d's one-shot P2P kernel (gfx1201), as a CudaCommunicator subclass.
 
 libr4d (codeberg.org/StillDeadcode/libr4d, license pending) ships r4d_ar_oneshot_2rank_exact: each rank pushes its
 input into the peer's fine-grained IPC scratch and reduces locally (fp32 accumulate, bit-identical to RCCL's sum).
@@ -17,10 +17,10 @@ import os
 import torch
 import torch.distributed as dist
 
+from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
 from vllm.logger import init_logger
 
 logger = init_logger("vllm." + __name__)
-_PATCHED = False
 _DTYPE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
 _R4D = None
 
@@ -97,25 +97,17 @@ class R4dAllReduce:
         return out
 
 
-def patch() -> bool:
-    global _PATCHED
-    if _PATCHED:
-        return True
-    if os.environ.get("R9K_R4D_AR", "1") != "1":
-        return False
-    try:
-        from vllm.distributed.device_communicators.cuda_communicator import CudaCommunicator
-        from ..moe.experts import r9k_available
-    except Exception as e:
-        logger.warning("r9700: r4d AR hook not installed (%s)", e)
-        return False
-    orig_init = CudaCommunicator.__init__
-    orig_ar = CudaCommunicator.all_reduce
+class R9kCommunicator(CudaCommunicator):
+    """Stock CudaCommunicator (RCCL + vLLM's paths) with the TP=2 all-reduce routed to libr4d when it fits.
+    Installed by R9700Platform.get_device_communicator_cls (platform.py); no class patching."""
 
     def __init__(self, *a, **k):
-        orig_init(self, *a, **k)
+        super().__init__(*a, **k)
         self._r9k_ar = None
+        if os.environ.get("R9K_R4D_AR", "1") != "1":
+            return
         try:
+            from ..moe.experts import r9k_available
             if "tp" in (getattr(self, "unique_name", "") or "") and getattr(self, "world_size", 1) == 2 \
                     and r9k_available():
                 ar = R4dAllReduce(self.cpu_group, self.device)
@@ -125,12 +117,7 @@ def patch() -> bool:
             logger.warning("r9700: r4d AR setup failed, staying on RCCL (%s)", e)
 
     def all_reduce(self, input_):
-        ar = getattr(self, "_r9k_ar", None)
+        ar = self._r9k_ar
         if ar is not None and ar.should(input_):
             return ar.all_reduce(input_)
-        return orig_ar(self, input_)
-
-    CudaCommunicator.__init__ = __init__
-    CudaCommunicator.all_reduce = all_reduce
-    _PATCHED = True
-    return True
+        return super().all_reduce(input_)

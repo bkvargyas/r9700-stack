@@ -4,12 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "r9700-vllm"
-version = "0.1.0"
+version = "0.2.0"
 description = "gfx1201 (Radeon AI PRO R9700) kernels and plugin hooks for stock vLLM on ROCm 10"
 requires-python = ">=3.10"
 
 [project.entry-points."vllm.general_plugins"]
 r9700 = "r9700_vllm:register"
+
+[project.entry-points."vllm.platform_plugins"]
+r9700 = "r9700_vllm.platform:detect"
 
 [tool.setuptools.packages.find]
 include = ["r9700_vllm*"]

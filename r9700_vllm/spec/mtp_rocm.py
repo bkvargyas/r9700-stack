@@ -4,8 +4,13 @@ Stock vLLM keeps a ROCm-only allowlist of attention-metadata types for multi-ste
 (SpecDecodeBaseProposer.allowed_attn_types). Qwen4Exp's QSA builder emits FlashAttentionMetadata (its builder
 subclasses FlashAttentionMetadataBuilder) and QSAForwardMetadata for the indexer; neither is listed, so k>1
 raises. Same idea as open upstream PR #55292. Appends both types after the stock __init__ builds the list.
+
+The one remaining monkeypatch of a vLLM class (no extension point for it). Version-gated via compat/gate.py and
+self-disabling: it only appends types stock does not already allow.
 """
 from __future__ import annotations
+
+import functools
 
 from vllm.logger import init_logger
 
@@ -17,6 +22,8 @@ def patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
+    from ..compat import gate
+    gate.check("mtp_allowlist")
     try:
         from vllm.v1.spec_decode import llm_base_proposer as lbp
     except Exception as e:
@@ -25,6 +32,7 @@ def patch() -> bool:
     cls = lbp.SpecDecodeBaseProposer
     orig = cls.__init__
 
+    @functools.wraps(orig)
     def __init__(self, *a, **k):
         orig(self, *a, **k)
         if getattr(self, "allowed_attn_types", None) is None:
@@ -43,6 +51,7 @@ def patch() -> bool:
         self.allowed_attn_types = tuple(self.allowed_attn_types) + tuple(
             t for t in extra if t not in self.allowed_attn_types)
 
+    __init__.__r9k_patch__ = "mtp_allowlist"
     cls.__init__ = __init__
     _PATCHED = True
     return True

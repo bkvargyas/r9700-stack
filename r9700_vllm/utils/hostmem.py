@@ -7,6 +7,8 @@ then take vLLM's UVA device view of it -- the same approach tcclaviger's expert 
 """
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 _KEEP: list[torch.Tensor] = []
@@ -35,3 +37,25 @@ def uva_empty(shape, dtype) -> torch.Tensor:
     v = get_accelerator_view_from_cpu_tensor(host)
     v._r9k_host = host
     return v
+
+
+@contextlib.contextmanager
+def exact_pinning():
+    """Within the block, CPU ``Tensor.pin_memory()`` pins at exact size (hipHostRegister) instead of torch's 2^k
+    rounding. Used around model construction, where vLLM's UVA offloader pins every offloaded parameter
+    (+~22% host RAM for Flash-Next's experts otherwise). Restored on exit; not thread-scoped (construction is
+    single-threaded per worker)."""
+    stock = torch.Tensor.pin_memory
+
+    def exact(self, *a, **k):
+        if self.device.type != "cpu":
+            return stock(self, *a, **k)
+        out = pinned_empty(self.shape, self.dtype)
+        out.copy_(self)
+        return out
+
+    torch.Tensor.pin_memory = exact
+    try:
+        yield
+    finally:
+        torch.Tensor.pin_memory = stock

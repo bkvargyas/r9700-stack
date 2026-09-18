@@ -1,12 +1,19 @@
-"""r9700_vllm: gfx1201 (Radeon AI PRO R9700) kernels and hooks for stock vLLM on ROCm 10.
+"""r9700_vllm: gfx1201 (Radeon AI PRO R9700) kernels for stock vLLM on ROCm 10, through vLLM's extension points.
 
-Loaded by vLLM in every process through the ``vllm.general_plugins`` entry point (see pyproject.toml).
-Every hook is idempotent, only engages on ROCm gfx12, and logs (instead of raising) if the vLLM API it
-targets has moved, leaving that part of vLLM stock. Disable individual hooks with R9K_DISABLE=moe,ple,...
+Entry points (pyproject.toml):
+  vllm.platform_plugins  r9700 = r9700_vllm.platform:detect   RocmPlatform subclass -> libr4d TP=2 all-reduce
+  vllm.general_plugins   r9700 = r9700_vllm:register           everything below, in every vLLM process
+
+register():
+  * torch custom ops (r9700::*) for the libr9k kernels                         ops.py
+  * quantization config "compressed-tensors" -> R9kCompressedTensorsConfig    quant/ct.py
+  * model classes for Qwen4Exp{ForConditionalGeneration,ForCausalLM,MTP}     models/qwen4_exp.py
+  * one version-gated monkeypatch: MTP k>1 attention-type allowlist          spec/mtp_rocm.py
+Only engages on ROCm. R9K_DISABLE=quant,models,mtp turns individual pieces off (R9K_PLATFORM=0 for the platform).
 """
 import os
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 
 def _disabled(name: str) -> bool:
@@ -16,7 +23,6 @@ def _disabled(name: str) -> bool:
 def register() -> None:
     from vllm.logger import init_logger
     log = init_logger("vllm.r9700_vllm")
-    done = []
     try:
         from vllm.platforms import current_platform
         if not current_platform.is_rocm():
@@ -24,46 +30,21 @@ def register() -> None:
             return
     except Exception:
         return
+    done = []
     from . import ops
     ops.register()
-    if not _disabled("compat"):
-        from .compat import checkpoint
-        if checkpoint.patch():
-            done.append("ckpt_compat")
-    if not _disabled("ple"):
-        from .ple import int6
-        if int6.patch():
-            done.append("ple_int6")
-    if not _disabled("moe"):
-        from .moe import ct_mxfp4
-        if ct_mxfp4.patch():
-            done.append("ct_mxfp4_moe")
-    if not _disabled("linear"):
-        from .linear import mxfp4
-        if mxfp4.patch():
-            done.append("mxfp4_linear")
-    if not _disabled("fp8_block"):
-        from .linear import fp8_block
-        if fp8_block.patch():
-            done.append("fp8_block_rowwise")
-    if not _disabled("fp8_linears"):
-        from .linear import fp8_unquant
-        if fp8_unquant.patch():
-            done.append("fp8_linears")
-    if not _disabled("r4d_ar"):
-        from .comm import r4d_ar
-        if r4d_ar.patch():
-            done.append("r4d_allreduce")
-    if not _disabled("custom_ar"):
-        from .comm import custom_ar
-        if custom_ar.patch():
-            done.append("custom_ar_gfx12")
+    if not _disabled("quant"):
+        from .quant import ct  # noqa: F401  (registers "compressed-tensors")
+        done.append("quant:compressed-tensors")
+    if not _disabled("models"):
+        from vllm import ModelRegistry
+        from .models.qwen4_exp import ARCHS
+        for arch, qualname in ARCHS.items():
+            ModelRegistry.register_model(arch, qualname)
+        done.append("models:" + ",".join(ARCHS))
     if not _disabled("mtp"):
         from .spec import mtp_rocm
         if mtp_rocm.patch():
-            done.append("mtp_k>1")
-    if not _disabled("draft_head"):
-        from .spec import draft_head
-        if draft_head.patch():
-            done.append("lm_heads")
-    log.info("r9700_vllm %s registered: %s", __version__, ", ".join(done) or "nothing")
+            done.append("patch:mtp_allowlist")
+    plat = type(current_platform).__name__
+    log.info("r9700_vllm %s registered: %s (platform %s)", __version__, ", ".join(done) or "nothing", plat)
