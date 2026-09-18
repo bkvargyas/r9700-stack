@@ -60,6 +60,8 @@ Bring-up fixes needed (all in the plugin / launcher, no vLLM source patches):
 
 | **VM100 256 GB RAM: all experts host-resident, LRU cache 270 slots on all 48 layers** | **75.3** | 120.5 | **193.8** | **194.7** | | **99/100** | **3/3** |
 
+| same + Fable review P0 guards (commit 0f8af02) | 78.1 | | 203.4 | 187.9 | | 98/100 | 3/3 |
+
 Launch (defaults now in serve-stock-fn.sh): `MTP=3 P2P=1 ~/serve-stock-fn.sh` then `python3 ~/warmup.py`
 (= OFFLOAD_GB=34, UTIL=0.94, R9K_EXPERT_CACHE_SLOTS=270, fp8 target+draft LM heads). 320 slots leaves no KV room.
 Opt-ins measured and left off: R9K_FP8_BLOCK=rowwise|block (acceptance drop / ~1 ms), R9K_FP8_LINEARS=hyper_connection
