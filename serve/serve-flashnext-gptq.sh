@@ -23,6 +23,10 @@ CGCFG=(--compilation-config '{"cudagraph_capture_sizes": [4], "max_cudagraph_cap
 # XENV="K=V K2=V2": extra container env (kernel ablation toggles). PROF=1: enable torch profiler (/start_profile, /stop_profile) -> ~/fn-prof.
 for kv in $XENV; do ENVX+=(-e "$kv"); done
 [ "$PROF" = 1 ] && { mkdir -p ~/fn-prof; ENVX+=(-v $HOME/fn-prof:/prof); EXTRA+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
+# WRAP=rocprof: run the server under rocprofv3 kernel tracing (output ~/fn-prof/rp, finalized on docker stop).
+ENTRY=(); PRE=()
+[ "$WRAP" = rocprof ] && { mkdir -p ~/fn-prof; ENVX+=(-v $HOME/fn-prof:/prof); ENTRY=(--entrypoint /opt/rocm/bin/rocprofv3)
+  PRE=(--kernel-trace --memory-copy-trace --stats -f csv -d /prof/rp -o %nid%_%pid% -- /app/tools/image_entrypoint.sh); }
 mkdir -p ~/flashnext-cache-gptq ~/flashnext-ple-gptq ~/flashnext-tunableop
 sudo docker rm -f vllmflashnext 2>/dev/null
 sudo docker run -d --name vllmflashnext --restart unless-stopped --privileged --ipc=host --network=host \
@@ -36,7 +40,7 @@ sudo docker run -d --name vllmflashnext --restart unless-stopped --privileged --
   "${P2P_MOUNT[@]}" "${ENVX[@]}" \
   -v $HOME/models:/models -v $HOME/flashnext-ple-gptq:/app/pleoffload \
   -v $HOME/flashnext-cache-gptq:/cache/vllm -v $HOME/flashnext-tunableop:/tunableop \
-  tcclaviger/vllm:dev \
+  "${ENTRY[@]}" tcclaviger/vllm:dev "${PRE[@]}" \
   /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8-Flash-Next Qwen3.8 --host 0.0.0.0 --port 8080 \
   --tensor-parallel-size 2 --max-model-len 262144 --max-num-seqs 16 \
@@ -49,4 +53,4 @@ sudo docker run -d --name vllmflashnext --restart unless-stopped --privileged --
   "${CGCFG[@]}" \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
   --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 1.0, "original_max_position_embeddings": 262144, "mrope_section": [11, 11, 10], "mrope_interleaved": true, "partial_rotary_factor": 0.25, "rope_theta": 10000000}}}'
-echo "started Flash-Next GPTQ (P2P=${P2P:-1} MEM=${MEM:-auto} CG=${CG:-4} NOP2P=${NOP2P:-0} PROF=${PROF:-0} XENV=${XENV:-none})"
+echo "started Flash-Next GPTQ (P2P=${P2P:-1} MEM=${MEM:-auto} CG=${CG:-4} NOP2P=${NOP2P:-0} PROF=${PROF:-0} XENV=${XENV:-none} WRAP=${WRAP:-none})"
