@@ -115,22 +115,24 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         numel = M * topk
         dev = hidden_states.device
 
+        MT = K.pick_mt(numel, global_num_experts)
+        blk = K.MOE_BLOCK * MT
         cache = getattr(self, "r9k_cache", None)
         if cache is None:
             passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1), K.Mxfp4Experts(w2, self.w2_scale, N2, K2),
-                       moe_align_block_size(topk_ids, K.MOE_BLOCK, global_num_experts, expert_map))]
+                       moe_align_block_size(topk_ids, blk, global_num_experts, expert_map))]
         else:
             assert expert_map is None, "r9k expert cache: expert parallelism not supported"
             cache.update(topk_ids)          # LRU manage + gather misses host -> VRAM slots
             (h1, h2), (c1, c2) = cache.hot(), cache.cold()
-            passes = [(h1, h2, moe_align_block_size(topk_ids, K.MOE_BLOCK, global_num_experts, cache.table)),
-                      (c1, c2, moe_align_block_size(topk_ids, K.MOE_BLOCK, global_num_experts, cache.map_cold))]
+            passes = [(h1, h2, moe_align_block_size(topk_ids, blk, global_num_experts, cache.table)),
+                      (c1, c2, moe_align_block_size(topk_ids, blk, global_num_experts, cache.map_cold))]
 
         xq, xs = K.quant_rows_fp8(hidden_states)
         gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
         for W1, _, (sid, eid, ntpp) in passes:
             K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *CFG_GATE_UP,
-                       num_experts=global_num_experts)
+                       num_experts=global_num_experts, MT=MT)
 
         act = torch.empty((numel, N1 // 2), dtype=torch.bfloat16, device=dev)
         self.activation(activation, act, gate_up)
@@ -142,5 +144,5 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *CFG_DOWN,
-                       num_experts=global_num_experts)
+                       num_experts=global_num_experts, MT=MT)
         ops.moe_sum(down.view(M, topk, N2), output)

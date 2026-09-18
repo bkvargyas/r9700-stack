@@ -60,7 +60,7 @@ __device__ __forceinline__ v2i mxfp4_unpack8(unsigned int wv, int dsh) {
   return out;
 }
 
-template <int NPW>
+template <int MT, int NPW>
 __global__ void r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
@@ -68,8 +68,11 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
     const int* __restrict__ ntpp, const float* __restrict__ topk_w,
     long ws_estride, long wref_estride, int numel, int a_row_div, int K, int N, int WV, int SK) {
+  // One workgroup row = one routing block of BLK = 16*MT sorted rows (moe_align_block_size(block=16*MT)),
+  // processed as MT WMMA M-tiles that share every weight fragment (MT x fewer weight reads per row).
+  constexpr int BLK = 16 * MT;
   const int by = blockIdx.y;
-  if (by * MOE_BLOCK >= ntpp[0]) return;
+  if (by * BLK >= ntpp[0]) return;
   const int e = expert_ids[by];
   if (e < 0) return;
 
@@ -85,15 +88,22 @@ __global__ void r9k_moe_mxfp4a8_kernel(
   const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
   const unsigned char* __restrict__ Wref = Wref_all + (size_t)e * wref_estride;
 
-  // This lane's A row: the sorted flat index of row nlane of the block, clamped to row 0 of the block
-  // (always valid when the block is live) for padding entries.
-  int flat = sorted_ids[by * MOE_BLOCK + nlane];
-  if (flat >= numel) flat = sorted_ids[by * MOE_BLOCK];
-  const unsigned char* __restrict__ arow = A + (size_t)(flat / a_row_div) * K;
-
-  v8f acc[NPW];
+  // This lane's A row in each M tile: the sorted flat index, clamped to the block's first row (always valid
+  // for a live block) for padding entries.
+  const int first = sorted_ids[by * BLK];
+  const unsigned char* __restrict__ arow[MT];
 #pragma unroll
-  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+  for (int i = 0; i < MT; i++) {
+    int flat = sorted_ids[by * BLK + i * 16 + nlane];
+    if (flat >= numel) flat = first;
+    arow[i] = A + (size_t)(flat / a_row_div) * K;
+  }
+
+  v8f acc[NPW][MT];
+#pragma unroll
+  for (int j = 0; j < NPW; j++)
+#pragma unroll
+    for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
 
   const int ntmax = N / 16 - 1;
   int wtile[NPW], wrow[NPW];
@@ -110,40 +120,50 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     const int kg = kbase + k;
     const int kstep = kg / 16;
     const int blk = kg / GROUP;
-    v2i af;
-    const unsigned int* pa = (const unsigned int*)(arow + kg + mhalf);
-    af[0] = (int)pa[0];
-    af[1] = (int)pa[1];
+    v2i af[MT];
+#pragma unroll
+    for (int i = 0; i < MT; i++) {
+      const unsigned int* pa = (const unsigned int*)(arow[i] + kg + mhalf);
+      af[i][0] = (int)pa[0];
+      af[i][1] = (int)pa[1];
+    }
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
       const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
       int dsh = (int)wref[j] - (int)Ws[(size_t)blk * N + wrow[j]];
       dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
       const v2i wf = mxfp4_unpack8(wv, dsh);
-      acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf, acc[j]);
+#pragma unroll
+      for (int i = 0; i < MT; i++)
+        acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
     }
   }
 
+  // Reduce the SK partial sums in LDS, one M tile at a time (buffer stays WV*NPW*SK*256 floats).
   const int ncols = WV * NPW;
 #pragma unroll
-  for (int j = 0; j < NPW; j++) {
-    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+  for (int i = 0; i < MT; i++) {
+    __syncthreads();
 #pragma unroll
-    for (int q = 0; q < 8; q++) red[slot + lane * 8 + q] = acc[j][q];
-  }
-  __syncthreads();
-  for (int t = tid; t < ncols * 256; t += blockDim.x) {
-    const int col = t >> 8, off = t & 255;
-    const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
-    const int mrow = ((off >> 7) << 3) + (off & 7);          // row within the 16-row block
-    if (n >= N) continue;
-    const int fr = sorted_ids[by * MOE_BLOCK + mrow];
-    if (fr >= numel) continue;                                // padding row
-    float v = 0.f;
-    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-    float sc = __int_as_float((int)Wref[n] << 23) * As[fr / a_row_div];
-    if (topk_w) sc *= topk_w[fr];
-    C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
+    for (int j = 0; j < NPW; j++) {
+      const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+      for (int q = 0; q < 8; q++) red[slot + lane * 8 + q] = acc[j][i][q];
+    }
+    __syncthreads();
+    for (int t = tid; t < ncols * 256; t += blockDim.x) {
+      const int col = t >> 8, off = t & 255;
+      const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
+      const int mrow = i * 16 + ((off >> 7) << 3) + (off & 7);   // row within the BLK-row block
+      if (n >= N) continue;
+      const int fr = sorted_ids[by * BLK + mrow];
+      if (fr >= numel) continue;                                  // padding row
+      float v = 0.f;
+      for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+      float sc = __int_as_float((int)Wref[n] << 23) * As[fr / a_row_div];
+      if (topk_w) sc *= topk_w[fr];
+      C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
+    }
   }
 }
 
@@ -174,13 +194,13 @@ __global__ void r9k_quant_rows_fp8_kernel(const __hip_bfloat16* __restrict__ x, 
   }
 }
 
-extern "C" int r9k_moe_block(void) { return MOE_BLOCK; }
+extern "C" int r9k_moe_block(void) { return MOE_BLOCK; }   // rows per M tile; routing block = 16*MT
 
 // Returns 0 on success, negative on a shape error (the Python side raises).
 extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, long c,
                                long sorted_ids, long expert_ids, long ntpp, long topk_w,
                                long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div, int K, int N,
-                               int WV, int SK, int NPW, long stream) {
+                               int WV, int SK, int NPW, int MT, long stream) {
   if (N % 16) return -1;
   if (K % (SK * GROUP)) return -2;
   if (WV * SK * WAVE32 > 1024) return -3;
@@ -189,17 +209,20 @@ extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, lon
   if (smem > 64 * 1024) return -4;
   dim3 grid((N / 16 + ncols - 1) / ncols, max_blocks), block(WV * SK * WAVE32);
   hipStream_t st = (hipStream_t)stream;
-#define L(NP) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<NP>), grid, block, smem, st,            \
+#define L(MTv, NP) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP>), grid, block, smem, st,     \
       (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws, \
       (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids,                        \
       (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel,  \
       a_row_div, K, N, WV, SK)
-  switch (NPW) {
-    case 1: L(1); break;
-    case 2: L(2); break;
-    case 4: L(4); break;
-    default: return -5;
+#define LM(MTv) switch (NPW) { case 1: L(MTv, 1); break; case 2: L(MTv, 2); break; case 4: L(MTv, 4); break; \
+                               default: return -5; }
+  switch (MT) {
+    case 1: LM(1); break;
+    case 2: LM(2); break;
+    case 4: LM(4); break;
+    default: return -7;
   }
+#undef LM
 #undef L
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }

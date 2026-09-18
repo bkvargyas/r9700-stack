@@ -25,7 +25,7 @@ def lib() -> ctypes.CDLL:
         path = os.environ.get("R9K_LIB") or os.path.join(os.path.dirname(__file__), "libr9k.so")
         L = ctypes.CDLL(path)
         L.r9k_moe_mxfp4a8.restype = ctypes.c_int
-        L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 8 + [ctypes.c_long]
+        L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         assert L.r9k_moe_block() == MOE_BLOCK
@@ -96,24 +96,33 @@ def quant_rows_fp8(x: torch.Tensor):
 def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.Tensor,
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
              a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
-             num_experts: int | None = None):
+             num_experts: int | None = None, MT: int = 1):
     """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
 
-    The grid covers at most ceil(numel/16) + min(numel, E) blocks -- the most moe_align_block_size can fill
+    sorted_ids/expert_ids must come from moe_align_block_size(block_size=16*MT). MT M-tiles per workgroup share
+    each weight fragment (use MT>1 when experts see many rows: prefill / wide batches).
+    The grid covers at most ceil(numel/BLK) + min(numel, E) blocks -- the most moe_align_block_size can fill
     with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
     launch stays cudagraph-safe."""
     assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     E = num_experts if num_experts is not None else w.wq.shape[0]
-    max_blocks = min(expert_ids.numel(), (numel + MOE_BLOCK - 1) // MOE_BLOCK + min(numel, E))
+    blk = MOE_BLOCK * MT
+    max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
     rc = lib().r9k_moe_mxfp4a8(
         a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
         w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
         sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
         topk_w.data_ptr() if topk_w is not None else 0,
-        w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, _stream())
+        w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, MT, _stream())
     if rc:
-        raise RuntimeError(f"r9k_moe_mxfp4a8 failed ({rc}) N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW}")
+        raise RuntimeError(f"r9k_moe_mxfp4a8 failed ({rc}) N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW} MT={MT}")
     return out
+
+
+def pick_mt(numel: int, num_experts: int) -> int:
+    """M tiles per routing block from the host-known row count: rows per touched expert >= 32 -> 4, >= 16 -> 2."""
+    per = numel / max(1, min(num_experts, numel))
+    return 4 if per >= 32 else (2 if per >= 16 else 1)
 
 
 def align_block_size_ref(topk_ids: torch.Tensor, num_experts: int, block: int = MOE_BLOCK):

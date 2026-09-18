@@ -33,7 +33,7 @@ def check(name, got, exp, tol=2e-2):
     return ok
 
 
-def run_case(E, M, topk, N1, K1, N2, K2, seed, cfg1=(2, 4, 2), cfg2=(4, 2, 1)):
+def run_case(E, M, topk, N1, K1, N2, K2, seed, cfg1=(2, 4, 2), cfg2=(4, 2, 1), MT=1):
     g = torch.Generator().manual_seed(seed)
     dev = "cuda"
     p1, s1, W1 = make_experts(E, N1, K1, g)
@@ -43,7 +43,7 @@ def run_case(E, M, topk, N1, K1, N2, K2, seed, cfg1=(2, 4, 2), cfg2=(4, 2, 1)):
     x = (torch.randn(M, K1, generator=g) * 0.5).to(torch.bfloat16)
     scores = torch.randn(M, E, generator=g)
     topk_w, topk_ids = torch.softmax(scores, -1).topk(topk, dim=-1)
-    sorted_ids, expert_ids, ntpp = K.align_block_size_ref(topk_ids, E)
+    sorted_ids, expert_ids, ntpp = K.align_block_size_ref(topk_ids, E, K.MOE_BLOCK * MT)
     numel = M * topk
     ok = True
 
@@ -55,10 +55,10 @@ def run_case(E, M, topk, N1, K1, N2, K2, seed, cfg1=(2, 4, 2), cfg2=(4, 2, 1)):
     # gate_up: rows r -> token r // topk
     out1 = torch.zeros(numel, N1, dtype=torch.bfloat16, device=dev)
     K.moe_gemm(xq, xs, w1, out1, sorted_ids.to(dev), expert_ids.to(dev), ntpp.to(dev), numel, topk,
-               None, *cfg1)
+               None, *cfg1, MT=MT)
     Aq = xd.cpu()
     ref1 = torch.stack([Aq[r // topk] @ W1[topk_ids.flatten()[r]].T for r in range(numel)])
-    ok &= check(f"gate_up E={E} M={M} top{topk} N={N1} K={K1} cfg{cfg1}", out1.cpu(), ref1)
+    ok &= check(f"gate_up E={E} M={M} top{topk} N={N1} K={K1} cfg{cfg1} MT{MT}", out1.cpu(), ref1)
 
     # down: per (token, j) input, router weight folded into the epilogue
     h = (torch.randn(numel, K2, generator=g) * 0.5).to(torch.bfloat16)
@@ -67,9 +67,9 @@ def run_case(E, M, topk, N1, K1, N2, K2, seed, cfg1=(2, 4, 2), cfg2=(4, 2, 1)):
     tw = topk_w.flatten().float()
     out2 = torch.zeros(numel, N2, dtype=torch.bfloat16, device=dev)
     K.moe_gemm(hq, hs, w2, out2, sorted_ids.to(dev), expert_ids.to(dev), ntpp.to(dev), numel, 1,
-               tw.to(dev), *cfg2)
+               tw.to(dev), *cfg2, MT=MT)
     ref2 = torch.stack([(hd[r] @ W2[topk_ids.flatten()[r]].T) * tw[r] for r in range(numel)])
-    ok &= check(f"down    E={E} M={M} top{topk} N={N2} K={K2} cfg{cfg2}", out2.cpu(), ref2)
+    ok &= check(f"down    E={E} M={M} top{topk} N={N2} K={K2} cfg{cfg2} MT{MT}", out2.cpu(), ref2)
     return ok, (w1, w2, xq, xs, hq, hs, sorted_ids, expert_ids, ntpp, numel, tw)
 
 
@@ -110,6 +110,9 @@ if __name__ == "__main__":
     # odd shapes: N=48 tail, K=320 with SK=5/10
     allok &= run_case(8, 3, 2, 48, 1024, 2560, 320, 3, cfg1=(4, 4, 1), cfg2=(2, 5, 2))[0]
     allok &= run_case(8, 3, 2, 640, 2560, 2560, 320, 4, cfg1=(4, 2, 4), cfg2=(1, 10, 4))[0]
+    # multi-tile routing blocks (prefill-like: many rows per expert)
+    for MT in (2, 4):
+        allok &= run_case(16, 200, 4, 640, 2560, 2560, 320, 10 + MT, MT=MT)[0]
     print("-- perf (Flash-Next TP2 shapes, E=512)")
     for M in (1, 4, 16):
         allok &= bench(512, M, 10, 640, 2560, 2560, 320, (2, 4, 2), (4, 2, 1))
