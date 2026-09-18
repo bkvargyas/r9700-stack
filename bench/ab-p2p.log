@@ -1,0 +1,27 @@
+vllmflashnext
+bd3aab647896aa248d63680428e491254975262d8ee48f9b4665f167d300051a
+started Flash-Next GPTQ (P2P=1 MEM=60 CG=default)
+[gptq-p2p-mem60] HEALTHY after 392s
+[0;36m(Worker_TP1 pid=134)[0;0m [32mINFO[0m [90m09-18 04:10:49[0m [90m[cudagraph_mem.py:80][0m Estimated CUDA graph memory: 3.14 GiB (57 graphs x 52 MiB + 256 MiB pool base; analytic V2 estimate, compare against 
+[0;36m(EngineCore pid=87)[0;0m [32mINFO[0m [90m09-18 04:10:49[0m [90m[kv_cache_utils.py:2393][0m GPU KV cache size: 270,930 tokens, Maximum concurrency for 262,144 tokens per request: 1.03x
+[0;36m(Worker_TP0 pid=133)[0;0m [32mINFO[0m [90m09-18 04:10:49[0m [90m[speculator.py:167][0m Draft step update fused into one launch (2 QSA cache owner(s), 6 KV cache group(s), 1 group(s) keep their own update).
+[0;36m(Worker_TP0 pid=133)[0;0m Capturing CUDA graphs (PIECEWISE):   0%|          | 0/19 [00:00<?, ?it/s]Capturing CUDA graphs (PIECEWISE):   5%|▌         | 1/19 [00:01<00:27,  1.53s/it]Capturing CUDA graphs (PIEC
+[0;36m(Worker_TP1 pid=134)[0;0m [32mINFO[0m [90m09-18 04:10:58[0m [90m[speculator.py:206][0m Capturing model for speculator...
+[0;36m(Worker_TP0 pid=133)[0;0m [32mINFO[0m [90m09-18 04:10:58[0m [90m[speculator.py:206][0m Capturing model for speculator...
+[0;36m(Worker_TP0 pid=133)[0;0m Capturing CUDA graphs (FULL):   0%|          | 0/9 [00:00<?, ?it/s]Capturing CUDA graphs (FULL):  11%|█         | 1/9 [00:00<00:03,  2.26it/s]Capturing CUDA graphs (FULL):  22%|█�
+[0;36m(Worker_TP0 pid=133)[0;0m Capturing prefill CUDA graphs (PIECEWISE):   0%|          | 0/19 [00:00<?, ?it/s]Capturing prefill CUDA graphs (PIECEWISE):  11%|█         | 2/19 [00:00<00:07,  2.35it/s]Capturing p
+[0;36m(Worker_TP0 pid=133)[0;0m Capturing prefill CUDA graphs (FULL):   0%|          | 0/9 [00:00<?, ?it/s]Capturing prefill CUDA graphs (FULL):  56%|█████▌    | 5/9 [00:00<00:00, 43.83it/s]Capturing pre
+[0;36m(Worker_TP0 pid=133)[0;0m Capturing decode CUDA graphs (FULL):   0%|          | 0/5 [00:00<?, ?it/s]Capturing decode CUDA graphs (FULL):  20%|██        | 1/5 [00:00<00:03,  1.13it/s]Capturing decode CUDA g
+[0;36m(Worker_TP0 pid=133)[0;0m [32mINFO[0m [90m09-18 04:11:05[0m [90m[gpu_worker.py:910][0m Free memory on device (31.39/31.86 GiB) on startup. Desired GPU memory utilization is (0.95, 30.27 GiB). Actual usage i
+[0;36m(Worker_TP1 pid=134)[0;0m [32mINFO[0m [90m09-18 04:11:05[0m [90m[gpu_worker.py:910][0m Free memory on device (31.39/31.86 GiB) on startup. Desired GPU memory utilization is (0.95, 30.27 GiB). Actual usage i
+[gptq-p2p-mem60] warming up...
+[gptq-p2p-mem60] single-stream decode: 69.7 tok/s
+[gptq-p2p-mem60] aggregate @4 concurrent: 140.2 tok/s (4 ok)
+[gptq-p2p-mem60] aggregate @8 concurrent: 197.3 tok/s (8 ok)
+[gptq-p2p-mem60] aggregate @16 concurrent: 208.7 tok/s (16 ok)
+[gptq-p2p-mem60] prefill ~523 tok: 558 tok/s
+[gptq-p2p-mem60] prefill ~2023 tok: 2166 tok/s
+[gptq-p2p-mem60] prefill ~8023 tok: 3635 tok/s
+vllmflashnext
+c33d65367438a30003853cedfa31859f74b4a437e4f94381e7dbb41686462130
+started Flash-Next GPTQ (P2P=0 MEM=60 CG=default)
