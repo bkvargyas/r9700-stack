@@ -58,7 +58,7 @@ sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
   --tensor-parallel-size 2 --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
-  --max-num-batched-tokens 4096 --gpu-memory-utilization ${UTIL:-0.94} \
+  --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization ${UTIL:-0.94} \
   --cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice ${LMONLY---language-model-only} \
   "${ARGS[@]}" $EXTRA
