@@ -20,6 +20,9 @@ PP=$HOME/p2p-patched
 EXTRA=(); ENVX=(); [ "$NOP2P" = 1 ] && { EXTRA+=(--disable-custom-all-reduce); ENVX+=(-e NCCL_P2P_DISABLE=1); }
 [ -n "$MEM" ] && EXTRA+=(--expert-offload-mem $MEM)
 CGCFG=(--compilation-config '{"cudagraph_capture_sizes": [4], "max_cudagraph_capture_size": 4}'); [ "$CG" = default ] && CGCFG=()
+# XENV="K=V K2=V2": extra container env (kernel ablation toggles). PROF=1: enable torch profiler (/start_profile, /stop_profile) -> ~/fn-prof.
+for kv in $XENV; do ENVX+=(-e "$kv"); done
+[ "$PROF" = 1 ] && { mkdir -p ~/fn-prof; ENVX+=(-v $HOME/fn-prof:/prof); EXTRA+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
 mkdir -p ~/flashnext-cache-gptq ~/flashnext-ple-gptq ~/flashnext-tunableop
 sudo docker rm -f vllmflashnext 2>/dev/null
 sudo docker run -d --name vllmflashnext --restart unless-stopped --privileged --ipc=host --network=host \
@@ -46,4 +49,4 @@ sudo docker run -d --name vllmflashnext --restart unless-stopped --privileged --
   "${CGCFG[@]}" \
   --speculative-config '{"method": "mtp", "num_speculative_tokens": 3}' \
   --hf-overrides '{"text_config": {"rope_parameters": {"rope_type": "yarn", "factor": 1.0, "original_max_position_embeddings": 262144, "mrope_section": [11, 11, 10], "mrope_interleaved": true, "partial_rotary_factor": 0.25, "rope_theta": 10000000}}}'
-echo "started Flash-Next GPTQ (P2P=${P2P:-1} MEM=${MEM:-auto} CG=${CG:-4} NOP2P=${NOP2P:-0})"
+echo "started Flash-Next GPTQ (P2P=${P2P:-1} MEM=${MEM:-auto} CG=${CG:-4} NOP2P=${NOP2P:-0} PROF=${PROF:-0} XENV=${XENV:-none})"

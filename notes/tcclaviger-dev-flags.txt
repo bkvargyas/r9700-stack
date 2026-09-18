@@ -1,0 +1,360 @@
+Local (non-upstream) flags in this image
+=======================================
+
+Entrypoint routes (this script, first matching flag wins)
+  --tune                        RDNA4 GEMM config tuner
+  --quantize                    MXFP4-16 quantizer (bare form)
+  --format rfa|rfi|mxfp4|composite
+                                unified quantizer CLI (tools/quantize.py)
+  --rfa | --rfi | --mixedQuant JSON
+                                legacy triggers for the same engine
+  --calib [CORPUS.jsonl]        ACTIVATION-AWARE quantization, on any RFA/RFI
+                                scheme above. Off unless this flag is given, and
+                                the checkpoint it writes is byte-format
+                                identical either way -- only the stored values
+                                change, so the runtime and loaders are untouched.
+                                Instead of judging weights on their own, it runs
+                                the model over the corpus WHILE quantizing, one
+                                decoder layer at a time (capture -> quantize ->
+                                re-run the quantized layer so the next one sees
+                                what inference will really feed it). Only the
+                                active layer is resident, so models far larger
+                                than VRAM are fine. MoE statistics are per
+                                expert, from the tokens actually routed there.
+                                Pair with:
+                                  --weighted-scale   activation-weighted scale
+                                  --gptq-group       + within-group error
+                                                     feedback (implies the above)
+                                  --nsamples N --seq-len N   corpus budget
+                                  --expert-min-tokens N      rarely-routed
+                                                     experts stay data-free
+                                  --no-resume        disable per-layer resume
+                                                     (on by default; refuses to
+                                                     resume if the run config
+                                                     changed)
+                                  --feedback W       width of the GPTQ error
+                                                     feedback block: 16 (one
+                                                     scale group -- error never
+                                                     leaves it), 256, full (all
+                                                     of K), or auto (default;
+                                                     picks the widest that fits
+                                                     free VRAM, once, and pins
+                                                     it for the run). Wider
+                                                     blocks propagate error
+                                                     further and measure lower
+                                                     weighted output error.
+                                  --feedback-margin F  VRAM safety margin (0.10)
+                                  --carried R        where the carried hidden
+                                                     state lives: device (VRAM,
+                                                     2x at fwd#2), host (system
+                                                     RAM, slices streamed via a
+                                                     pinned ring -- corpus size
+                                                     stops being a VRAM
+                                                     question; also lets a
+                                                     serving model stay loaded),
+                                                     or auto (default: governor
+                                                     picks; a wider --feedback
+                                                     always beats device
+                                                     residency). Cannot change
+                                                     the output bytes.
+                                  --no-sequential-capture
+                                                     quantize the whole layer
+                                                     against one capture. The
+                                                     default instead quantizes
+                                                     gate/up first and RE-captures
+                                                     down_proj on what the
+                                                     quantized gate/up actually
+                                                     produce.
+                                  --micro-batch N    sequences per forward (8),
+                                                     halved on OOM down to 1.
+                                                     nsamples is trimmed to a
+                                                     whole number of these.
+                                  --gptq-gain        measure what the feedback
+                                                     bought: quantizes every
+                                                     module TWICE (feedback on,
+                                                     then off with the weighted
+                                                     scale still on) and reports
+                                                     tr(dW*B*dW') for both.
+                                                     Diagnostic; cannot change an
+                                                     emitted byte. ~2x quantize.
+                                  --aa-gpus SPEC     GPUs sharing the quantize
+                                                     column: all (default), a
+                                                     count, or '0,2,3'. Output is
+                                                     bit-identical at any count.
+                                  --aa-gpu0-share F  home GPU's quantize share
+                                                     (it also runs the forwards)
+                                  --no-row-shard     assign whole modules only.
+                                                     Default splits a module by
+                                                     output ROW when a layer has
+                                                     too few modules to fill the
+                                                     devices (dense models).
+                                  --allow-mixed-gpus proceed across mixed gfx
+                                                     targets (refused by default;
+                                                     breaks bit-identity)
+                                  --aa-debug         content-hashed trace of every
+                                                     intermediate -> aa_debug.jsonl
+                                  --stats-out DIR    where the per-layer stats
+                                                     sidecars go (<output>/aa_stats)
+                                  --no-stats         do not write them at all
+                                  --stats-max-bytes SIZE
+                                                     skip a layer's stats sidecar
+                                                     above this (default 2G;
+                                                     --feedback full writes none
+                                                     unless --stats-out is given)
+                                With NO path it uses the corpus baked into this
+                                image (tools/quant_engine/aa/corpus/
+                                aa_calib_2m.jsonl.gz, 3438 rows, ~1.9M tokens
+                                over 26 domains). Balanced by TOKENS, not rows:
+                                H = sum_t x x^T is token-weighted, so a domain's
+                                influence is its token share. Disjoint from the
+                                KL-divergence evaluation set. Give a path for
+                                your own; format = tools/expert_map/
+                                calibration.py. Image rows are skipped (this
+                                path reads token ids only). Slower than
+                                data-free; writes aa_report.json.
+                                NOTE: the --calib path ships in the :dev tag
+                                only, not :latest. Quantize with :dev, serve the
+                                result with :latest -- the checkpoint format is
+                                identical either way.
+                                Full prose: --format rfa --help
+  --kvcalibration               FP8 KV-CACHE SCALE CALIBRATION. Without
+      --modeldir DIR            calibrated scales vLLM defaults k_scale and
+      [--outputdir DIR]         v_scale to 1.0, which on a model whose K
+                                activations run an amax of ~24 is not a small
+                                error but the wrong scale. Runs the calibration
+                                corpus through the model ONE SEQUENCE AT A TIME
+                                and records the real range of q/k/v before the
+                                cache write, via the same route vLLM's own
+                                --calculate-kv-scales uses -- except accumulated
+                                over the whole corpus instead of taken from the
+                                first batch only.
+                                  scale = (observed_max * 1.1) / range_constant
+                                The divisors are NOT the fp8 max: they are
+                                Q/K/V_SCALE_CONSTANT (200/200/100), read at run
+                                time so an override cannot desync the checkpoint
+                                from the runtime. The 1.1 is headroom for
+                                outliers the corpus never saw.
+                                Text corpus is the baked aa_calib_2m; 120 vision
+                                samples are added when config.json declares a
+                                vision tower (their images ship baked next to
+                                the corpus, no mount needed; skipped with a log
+                                line only if the baked dir is absent).
+                                Text rows are trimmed to a fixed TOKEN-PARITY
+                                subset (~25k tokens/domain, of 3438 rows).
+                                What this measures is a max over per-sequence
+                                maxima, so coverage of the extremes decides
+                                accuracy, not row count -- and the subset takes
+                                every domain's longest row first (highest RoPE
+                                positions, where K amax peaks post-rotary) then
+                                samples the rest across the length distribution.
+                                Same measured range as the whole corpus at a
+                                quarter of the wall clock. Corpus, subset and
+                                vision sample count are fixed, not flags, so
+                                every calibration measures the same corpus.
+                                Writes a SCALARS-ONLY safetensors plus the index
+                                entries that reach it -- never rewrites an
+                                existing shard, so a failure cannot corrupt the
+                                checkpoint. --outputdir defaults to --modeldir,
+                                where it is live immediately. Also writes
+                                kv_calibration_report.json: per layer per kind
+                                the observed min/max/mean over PER-SEQUENCE
+                                maxima and their spread ratio, which is the
+                                evidence for whether the corpus explored the
+                                range at all.
+                                Capture runs at kv-cache-dtype auto, so it
+                                measures UNQUANTIZED q/k/v. Serve the result
+                                with --kv-cache-dtype fp8.
+                                Refuses a checkpoint that already declares
+                                quantization_config.kv_cache_scheme.
+                                Options: -tp N (4), --pad F (1.1),
+                                --dryRunLimit N (smoke test), --textOnly (skip
+                                the vision corpus even on a vision model),
+                                --max-model-len.
+  --test --ppl                  WikiText-2 perplexity of the model this
+                                container is serving; run it via docker exec
+                                in the serving container. Zero config:
+                                endpoint port and max-num-batched-tokens from
+                                /proc/1/cmdline, model id from /v1/models,
+                                tokenizer from /app/models, n-ctx fixed 2048,
+                                output /app/models/ppl_result.json. A VRAM
+                                preflight sizes the prompt-logprobs spike
+                                against live rocm-smi free memory and refuses
+                                to start (exit 3) when it cannot fit, printing
+                                the --gpu-memory-utilization that would.
+  --map-experts DIR             per-(layer,expert) activation-importance map
+                                (tools/expert_map/map_experts.py). Runs
+                                domain-tagged calibration prefills through vLLM
+                                and captures the fused kernel's per-slot output,
+                                so any quantization this image serves is mapped
+                                as-shipped -- no dequant, no bf16 source.
+                                Writes expert_map.json (created if absent,
+                                activation columns updated in place if present)
+                                + expert_map_sequences.json next to the model,
+                                and STREAMS per-prompt rows to
+                                expert_map_sequences.jsonl.gz as each prompt
+                                finishes (nothing per-prompt held in RAM; the
+                                map is re-written atomically every
+                                --checkpoint-every N prompts, default 1).
+                                Calibration data defaults to the corpus baked
+                                into the image (tools/expert_map/corpus/
+                                expert_map_calib_v4.jsonl.gz); override with
+                                at most one of:
+                                  --corpus FILE           prebuilt .jsonl
+                                  --source DOMAIN PATH [N] [SHAPE]
+                                                          repeatable; built now
+                                Prebuild a corpus with build_corpus.py to skip
+                                the parse and pin prompts across models.
+                                Run --map-experts DIR --help for both data
+                                shapes and the full flag list.
+                                Other opts: -tp N (default 4), --out-dir,
+                                --seq-len, --limit N (smoke test), --dry-run,
+                                --engine-arg KEY=VALUE (repeatable; any other
+                                EngineArgs field, e.g. the expert-offload set:
+                                enable_expert_offload=true expert_offload_mem=40
+                                ple_nvme_offload=true ple_nvme_dir=... ple_cache_gb=16).
+                                Fused shared-expert slots are captured and
+                                dropped from the map automatically.
+                                Engine config is forced: enforce_eager, prefix
+                                caching off, max_num_seqs=1; chunked prefill off
+                                unless --chunked-prefill N (recommended: the
+                                serve config's --max-num-batched-tokens).
+  --flags                       this list
+  --recipes [FILTER|--list]     confirmed serve configurations: the flags, env
+                                and system RAM used at runtime. Pure text from
+                                /app/recipes; FILTER matches the path.
+  (none)                        vllm serve "$@"
+
+vllm serve — DRY repetition penalty        (vllm serve --help=dry)
+  --dry-multiplier FLOAT        server default scale; 0.0 = OFF (the default)
+  --dry-penalty-ramp FLOAT      base = 1 + ramp (default 0.75 -> base 1.75)
+  --dry-allowed-length INT      repeats up to this length unpenalized (default 2)
+  --dry-range INT               trailing tokens scanned; -1 = all, 0 = off
+  --dry-sequence-breakers STR...strings a repeat may not span
+
+vllm serve — degenerate-loop detection     (vllm serve --help=degen)
+  --degen-max-period INT        largest period checked; 0 disables (ON by default)
+  --degen-min-repeats INT       repeats required before abort
+  --degen-min-span INT          minimum token span before abort
+
+vllm serve — GDN state side-cache          (vllm serve --help=side-cache)
+  --gdn-side-cache-entries INT  entries for hybrid GDN prefix caching
+                                (needs --mamba-cache-mode align; auto 10 if unset)
+
+vllm serve — MoE expert offload with a device-side expert cache (vllm serve --help=OffloadConfig)
+  --enable-expert-offload       Implied by any other --expert-* flag. One cache
+                                space per GPU: all VRAM left after the fixed
+                                terms (non-expert weights, one-request KV, CUDA
+                                graphs, runtime overhead), in expert-sized
+                                slots; not a flag. A third of it holds the
+                                hottest experts of the whole model (from the
+                                model-expertprofile.safetensors sidecar beside
+                                the checkpoint) plus every layer's shared
+                                expert: VRAM-only, never moved, no host copy.
+                                The rest is the swap region; the remaining
+                                experts live in pinned system RAM behind UVA and
+                                libr4d's moe_lru_* kernels decide ON THE DEVICE,
+                                every step, which of them sit in the swap slots
+                                by routing rank x recency (eviction = host read
+                                into the victim slot). Every step runs one GEMM
+                                over the slots and one over the host tensors.
+                                Needs an experts class with the hot/cold split
+                                (R4dMxfp4MoEExperts); TP only. The plan is
+                                printed at startup and refuses to start, with
+                                the table, when nothing fits.
+  --expert-offload-mem GiB      cap on total system RAM for the swappable
+                                experts across all ranks (0 = auto bound). When
+                                short, the next hottest experts become VRAM-only
+                                too until the rest fits.
+  --expert-precise-memory       size the cache with the fitted runtime-overhead
+                                figure instead of the default that keeps ~1 GiB
+                                per GPU free for the compile / graph-capture
+                                phase; more cache, slower first compile.
+  Every boot places and warms the cache from the sidecar's hot-to-cold
+  ranking; nothing about the cache is ever written to disk.
+  Launching by Hugging Face repo id resolves the checkpoint through the HF
+  cache before planning (downloads on first use), same as a local folder.
+
+vllm serve — PLE n-gram table on NVMe    (vllm serve --help=OffloadConfig)
+  --ple-nvme-offload            REQUIRES VLLM_PLE_CPU_OFFLOAD=1. Implied by any
+                                other --ple-* flag. The PLE
+                                offload process streams the checkpoint's
+                                n-gram table shards into ONE flat row file on
+                                NVMe (47.7 GiB on Qwen3.8-Flash-Next) instead of
+                                materializing and mlocking the whole table in
+                                RAM, and serves lookups through a clock-LRU row
+                                cache in RAM in front of O_DIRECT io_uring
+                                reads. A row's location is row_id x row_bytes;
+                                nothing is searched, nothing else is resident.
+                                Frees ~40 GiB of RAM for expert offload; costs
+                                NVMe IOPS on prefill (cold ~65k reads per 4096
+                                tokens) and nothing measurable on decode.
+                                Lifecycle: one serve per model directory
+                                (exclusive flock, released by the kernel on any
+                                death); every table left by an earlier process
+                                is deleted at boot; written as .tmp, fsync,
+                                rename; deleted on clean shutdown or a failed
+                                load. RAM while serving: --ple-cache-gb x1.1
+                                plus ~2 GiB; the build itself holds one shard
+                                at a time and drops its page cache every GiB.
+  --ple-cache-gb GiB            RAM row cache (default 8), filled sequentially
+                                from the table head at boot, adapts from there
+  --ple-nvme-dir DIR            where the table file goes (default: beside the
+                                checkpoint -- the model directory, or the HF
+                                cache snapshot for a repo id). Must be NVMe
+                                with the table's size free.
+  --ple-nvme-queue-depth N      io_uring depth for miss reads (512)
+
+vllm serve — local quantization schemes
+  --quantization mxfp4_16|rfa|rfi   (rfp458 = legacy alias of rfa)
+
+Per-request overrides (OpenAI body: SamplingParams fields or vllm_xargs)
+  enable_dry, dry_multiplier, dry_base, dry_ramp, dry_allowed_length,
+  dry_range, dry_sequence_breakers
+    e.g. "vllm_xargs": {"enable_dry": false}   turns DRY off for one request
+         "vllm_xargs": {"enable_dry": true}    turns it on (multiplier 0.8) even
+                                               when the server default is 0
+
+Env toggles
+  VLLM_PLE_CPU_OFFLOAD=1            run the PLE (per-layer n-gram embedding) in a
+                                    dedicated CPU process that hands rows to the
+                                    GPUs over ROCr; the 47.7 GiB table then lives
+                                    in system RAM (mlocked) instead of VRAM. Add
+                                    --ple-nvme-offload to move it to NVMe.
+  VLLM_PLE_MLOCK=0                  do not mlock the RAM-resident PLE table
+  VLLM_PLE_OFFLOAD_HOST_SLOTS=N     host slots per PLE pipeline (4)
+  VLLM_DISABLE_RDNA4_FP8_KERNEL=1   fall back to the generic w8a8 Triton kernel
+  VLLM_GDN_SIDECACHE_DEBUG=1        verbose GDN side-cache logging
+  VLLM_ATTN_AUTOTUNE_DUMP_DIR=DIR   dump attention autotuner results
+  NO_AMD_GDN_HIP=1                  DISABLE the native HIP GDN path. It is ON by
+                                    default: on gfx12x the Qwen GDN
+                                    linear-attention core (conv1d +
+                                    gated-delta-rule) runs through the AOT HIP
+                                    kernels in /app/gdnhip instead of the
+                                    fla-Triton ones, so that path never
+                                    JIT/autotunes. No flag is needed to enable
+                                    it -- arch, model and GDN head dims are
+                                    detected at startup and each layer falls
+                                    back to Triton if its dims are outside the
+                                    kernel envelope. Selecting it also forces
+                                    the GDN conv+ssm state to fp32 (the kernels
+                                    mutate it in place as float) and defaults
+                                    the conv state layout to DS. Spec-decode
+                                    batches still take the Triton path, so an
+                                    MTP/dflash model sees no benefit yet.
+  VLLM_GDN_USE_RECURRENT=1          route GDN prefill to the scalar recurrent
+                                    kernel instead of the WMMA matrix-core
+                                    default. 128-dim heads only; every other
+                                    head size runs recurrent regardless
+                                    (A/B for the long-context prefill win).
+  VLLM_TUNABLEOP_WARMUP=0           skip the startup TunableOp GEMM warmup. The
+                                    warmup tunes the dense projections at the
+                                    cudagraph capture sizes between model
+                                    construction and weight load, bypassing the
+                                    hipBLASLt grid heuristic (clamped at 4096, so
+                                    LLM shapes fall off it). In-memory only, no
+                                    file is written. Requires TunableOp on:
+                                    PYTORCH_TUNABLEOP_ENABLED=1. Respects
+                                    PYTORCH_TUNABLEOP_TUNING (=0 skips, =1 leaves
+                                    tuning enabled afterwards instead of freezing
+                                    it) and never touches
+                                    PYTORCH_TUNABLEOP_RECORD_UNTUNED.
