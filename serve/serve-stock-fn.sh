@@ -7,6 +7,9 @@ IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
 SDKLIB=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib
 VLIB=/usr/local/lib/python3.12/dist-packages/vllm
+# HSA_ENABLE_IPC_MODE_LEGACY=0: the nightly image sets =1, which makes hipIpcGetMemHandle fail ("invalid argument")
+# on this box -> no RCCL P2P -> SHM transport, whose proxy round-trips cost ~1-2 ms per all-reduce inside HIP graphs
+# (130 ms/step with 99 all-reduces). tcclaviger's image runs =0.
 # Hostcall-free RCCL built IN this image (rccl/build-nightly.sh) + hostcall-metadata-patched copies of vLLM's
 # _rocm_C / _C_stable_libtorch (p2p/scanhc.sh finds them). Required on the emulated-switch VM topology, where any
 # kernel requesting hidden_hostcall_buffer fails with hipErrorIllegalState (PCIe atomics are dropped).
@@ -42,7 +45,7 @@ sudo docker rm -f vllmstock 2>/dev/null
 sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
-  -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
+  -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
   "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache:/root/.cache/vllm \
   "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
