@@ -25,6 +25,9 @@ if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
   sudo docker run --rm --entrypoint bash -v $REPO:/opt/r9700 $IMG -c \
     "cd /opt/r9700/kernels && ./build.sh && cp libr9k.so /opt/r9700/r9700_vllm/kernels/" || exit 1
 fi
+# torch.compile/AOT cache per plugin configuration: vLLM's cache key does not see R9K_* knobs, and a graph traced
+# with different weight layouts fails at runtime ("wrong number of dimensions").
+CKEY=$( (env | grep '^R9K_' | sort; echo "$MTP") | md5sum | cut -c1-10)
 # forward every R9K_* plugin knob from the caller's environment into the container
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
@@ -47,7 +50,7 @@ sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 \
   -e GPU_MAX_HW_QUEUES=${HWQ:-1} -e HSA_ENABLE_MWAITX=1 -e OMP_NUM_THREADS=8 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
-  "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache:/root/.cache/vllm \
+  "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
   -v $HOME/vllmstock-triton:/root/.triton \
   "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
