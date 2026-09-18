@@ -133,6 +133,15 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     return out
 
 
+def pick_cfg(N: int, K: int) -> tuple[int, int, int]:
+    """A legal (WV, SK, NPW) for any N % 16 == 0, K % 32 == 0: deep split-K for long K (weight streaming with few
+    N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320."""
+    for WV, SK, NPW in ((2, 4, 2), (4, 2, 1), (2, 5, 2), (4, 1, 1)):
+        if K % (SK * GROUP) == 0 and (K >= 1024 or SK <= 2):
+            return WV, SK, NPW
+    return 4, 1, 1
+
+
 def pick_mt(numel: int, num_experts: int) -> int:
     """M tiles per routing block from the host-known row count: rows per touched expert >= 32 -> 4, >= 16 -> 2."""
     per = numel / max(1, min(num_experts, numel))
