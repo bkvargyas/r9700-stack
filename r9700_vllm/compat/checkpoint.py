@@ -22,7 +22,7 @@ logger = init_logger("vllm." + __name__)
 _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 # fork-calibrated query scales for its fp8 attention path; stock QSA has no slot for them (k/v scales map fine)
-_DROP_MAIN = re.compile(r"\.self_attn\.q_scale$")
+_DROP_MAIN = re.compile(r"\.self_attn\.[qkv]_scale$")   # bf16 KV: all unused (fp8-KV work will need k/v)
 
 
 def _fix_ct_formats() -> bool:
