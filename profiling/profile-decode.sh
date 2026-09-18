@@ -30,7 +30,12 @@ s=stamp(); u=req("Summarize in one sentence: "+long,8); W["prefill8k"]=[s,stamp(
 json.dump(W,open("/home/devops/fn-prof/windows.json","w"),indent=1)
 for k,(a,b,n) in W.items(): print(k, f"{(b['mono']-a['mono'])/1e9:.2f}s", n, "tokens")
 EOF
-echo "stopping server (rocprofv3 flush)..."; docker stop -t 600 vllmflashnext >/dev/null
+# rocprofv3 is PID 1 and does NOT forward SIGTERM to its child (it just waits for children), so `docker stop`
+# ends in SIGKILL and the trace is lost. Stop the vLLM server itself; rocprofv3 then finalizes and exits.
+echo "stopping vLLM inside the container (rocprofv3 flushes on child exit)..."
+docker exec vllmflashnext bash -c 'pkill -INT -f "bin/vllm serve" || pkill -INT -f "vllm serve"'
+for i in $(seq 1 180); do docker ps -q -f name=vllmflashnext | grep -q . || break; sleep 10; done
+docker ps -q -f name=vllmflashnext | grep -q . && { echo "container still up after 30 min; killing"; docker kill vllmflashnext; }
 sleep 5; sudo chown -R $USER $P; ls -la $P/rp | head; du -sh $P/rp
 python3 ~/analyze-prof.py $P > $P/report.txt 2>&1; cat $P/report.txt
 echo PROFILE_DONE
