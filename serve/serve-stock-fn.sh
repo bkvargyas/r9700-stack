@@ -26,6 +26,14 @@ fi
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
+# WRAP=rocprof: rocprofv3 kernel trace, collection window ROCPROF_WINDOW="delay_s:dur_s" after process start
+ENTRY=(); PRE=()
+if [ "$WRAP" = rocprof ]; then
+  mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
+  ENTRY=(--entrypoint /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin/rocprofv3)
+  PRE=(--kernel-trace --memory-copy-trace --stats -f csv -d /prof/rp -o %nid%_%pid%
+       --collection-period "${ROCPROF_WINDOW:-600:20}:1" --collection-period-unit sec -- vllm serve)
+fi
 # PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels)
 [ "${PROF:-0}" = 1 ] && { mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
   ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
@@ -36,7 +44,7 @@ sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES=0,1 -e VLLM_ROCM_USE_AITER=0 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
   "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache:/root/.cache/vllm \
-  $IMG /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
+  "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
   --tensor-parallel-size 2 --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
   --max-num-batched-tokens 4096 --gpu-memory-utilization ${UTIL:-0.92} \
