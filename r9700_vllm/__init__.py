@@ -44,6 +44,10 @@ def register() -> None:
         from .linear import fp8_unquant
         if fp8_unquant.patch():
             done.append("fp8_linears")
+    if not _disabled("r4d_ar"):
+        from .comm import r4d_ar
+        if r4d_ar.patch():
+            done.append("r4d_allreduce")
     if not _disabled("custom_ar"):
         from .comm import custom_ar
         if custom_ar.patch():
