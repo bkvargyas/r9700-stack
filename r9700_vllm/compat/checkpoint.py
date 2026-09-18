@@ -22,7 +22,7 @@ logger = init_logger("vllm." + __name__)
 _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 # fork-calibrated query scales for its fp8 attention path; stock QSA has no slot for them (k/v scales map fine)
-_DROP_MAIN = re.compile(r"\.self_attn\.[qkv]_scale$")   # bf16 KV: all unused (fp8-KV work will need k/v)
+_DROP_MAIN = re.compile(r"\.self_attn\.(attn\.)?[qkv]_scale$")   # bf16 KV: all unused (fp8-KV work will need k/v)
 
 
 def _fix_ct_formats() -> bool:
@@ -117,7 +117,18 @@ def patch() -> bool:
         morig = mcls.load_weights
 
         def model_load_weights(self, weights):
-            return morig(self, ((n, w) for n, w in weights if not _DROP_MAIN.search(n)))
+            last = []
+
+            def gen():
+                for n, w in weights:
+                    if _DROP_MAIN.search(n):
+                        continue
+                    last[:] = [n]
+                    yield n, w
+            try:
+                return morig(self, gen())
+            except ValueError as e:
+                raise ValueError(f"{e} [r9700: last checkpoint tensor fed: {last[:1]}]") from None
 
         mcls.load_weights = model_load_weights
     except Exception as e:
