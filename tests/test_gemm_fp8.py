@@ -15,7 +15,7 @@ for (M, N, Kd) in [(1, 4096, 2560), (4, 124160, 2560), (37, 1024, 2560), (100, 5
     q, s = K.quant_rows_fp8(x)
     out = F8.gemm_fp8(q, s, W)
     r = rel(out, ref); good = r < 3e-2; ok &= good
-    print(f"  fp8  M={M:3d} N={N:6d} K={Kd}: rel {r:.2e} {'ok' if good else '<-- FAIL'}")
+
     if N % 16 == 0:
         pk, sc = quantize_mxfp4(w)
         Wm = K.prepare_mxfp4_weights(pk[None], sc[None])

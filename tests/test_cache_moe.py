@@ -14,9 +14,13 @@ from r9700_vllm.moe import cache as C
 from test_moe_mxfp4 import make_experts
 
 
+CFG_UP, CFG_DOWN = (2, 4, 2), (4, 2, 1)     # same as production (K=320 needs SK in {1,2,5,10})
+
+
 def gemm_pass(xq, xs, W, out, topk_ids, E, mapping, numel, a_row_div, tw=None):
     sid, eid, ntpp = moe_align_block_size(topk_ids, K.MOE_BLOCK, E, mapping)
-    K.moe_gemm(xq, xs, W, out, sid, eid, ntpp, numel, a_row_div, tw, num_experts=E)
+    cfg = CFG_UP if W.K != 320 else CFG_DOWN
+    K.moe_gemm(xq, xs, W, out, sid, eid, ntpp, numel, a_row_div, tw, *cfg, num_experts=E)
 
 
 def main():
@@ -57,10 +61,10 @@ def main():
         o2 = torch.zeros(numel, N2, dtype=torch.bfloat16, device="cuda")
         if step % 2:
             (sh, eh, nh), (sc, ec, nc) = cache.update_fused(topk_ids, K.MOE_BLOCK)
-            for W, o, a, d, t in ((h1, o1, (xq, xs), topk, None), (h2, o2, (hq, hs), 1, tw)):
-                K.moe_gemm(a[0], a[1], W, o, sh, eh, nh, numel, d, t, num_experts=E)
-            for W, o, a, d, t in ((c1, o1, (xq, xs), topk, None), (c2, o2, (hq, hs), 1, tw)):
-                K.moe_gemm(a[0], a[1], W, o, sc, ec, nc, numel, d, t, num_experts=E)
+            for W, o, a, d, t, cfg in ((h1, o1, (xq, xs), topk, None, CFG_UP), (h2, o2, (hq, hs), 1, tw, CFG_DOWN)):
+                K.moe_gemm(a[0], a[1], W, o, sh, eh, nh, numel, d, t, *cfg, num_experts=E)
+            for W, o, a, d, t, cfg in ((c1, o1, (xq, xs), topk, None, CFG_UP), (c2, o2, (hq, hs), 1, tw, CFG_DOWN)):
+                K.moe_gemm(a[0], a[1], W, o, sc, ec, nc, numel, d, t, *cfg, num_experts=E)
         else:
             cache.update(topk_ids)
             gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk)
