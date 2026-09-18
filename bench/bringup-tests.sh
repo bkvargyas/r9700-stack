@@ -8,6 +8,6 @@ sudo docker run --rm --ipc=host --device=/dev/kfd --device=/dev/dri --group-add 
 set -o pipefail
 cd /opt/r9700/kernels && ./build.sh >/dev/null && cp libr9k.so /opt/r9700/r9700_vllm/kernels/ || exit 1
 cd /opt/r9700/tests
-for t in test_moe_mxfp4.py test_ple_int6.py test_cache_moe.py; do
+for t in test_moe_mxfp4.py test_ple_int6.py test_cache_moe.py test_gemm_fp8.py; do
   echo "=== $t"; timeout 600 python3 $t 2>&1 | grep -vE "^(INFO|WARNING|DEBUG)|Warning" | tail -40; echo "rc=$?"
 done'

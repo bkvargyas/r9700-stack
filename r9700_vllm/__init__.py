@@ -47,5 +47,5 @@ def register() -> None:
     if not _disabled("draft_head"):
         from .spec import draft_head
         if draft_head.patch():
-            done.append("draft_head_mxfp4")
+            done.append("lm_heads")
     log.info("r9700_vllm %s registered: %s", __version__, ", ".join(done) or "nothing")
