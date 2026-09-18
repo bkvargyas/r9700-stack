@@ -28,6 +28,9 @@ fi
 # torch.compile/AOT cache per plugin configuration: vLLM's cache key does not see R9K_* knobs, and a graph traced
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 CKEY=$( (env | grep '^R9K_' | sort; echo "$MTP") | md5sum | cut -c1-10)
+# recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
+: ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
+export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
 # forward every R9K_* plugin knob from the caller's environment into the container
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
@@ -55,8 +58,8 @@ sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   "${ENTRY[@]}" $IMG "${PRE[@]}" /models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port 8080 \
   --tensor-parallel-size 2 --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
-  --max-num-batched-tokens 4096 --gpu-memory-utilization ${UTIL:-0.92} \
-  --cpu-offload-gb ${OFFLOAD_GB:-24} --cpu-offload-params experts \
+  --max-num-batched-tokens 4096 --gpu-memory-utilization ${UTIL:-0.94} \
+  --cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice ${LMONLY---language-model-only} \
   "${ARGS[@]}" $EXTRA
-echo "started stock vLLM + r9700 plugin (offload ${OFFLOAD_GB:-24} GB/rank, maxlen ${MAXLEN:-32768})"
+echo "started stock vLLM + r9700 plugin (offload ${OFFLOAD_GB:-34} GB/rank, maxlen ${MAXLEN:-32768})"

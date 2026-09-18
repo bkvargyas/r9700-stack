@@ -58,6 +58,13 @@ Bring-up fixes needed (all in the plugin / launcher, no vLLM source patches):
 | + fp8 LM heads + fp8 HC linears (cache 180) | 62.1 | 100.3 | 134.0 | 127.8 | 480 | 95/100 | 3/3 |
 | + libr4d all-reduce | **68.0** | 105.8 | **139.5** | **139.6** | 487 | | |
 
+| **VM100 256 GB RAM: all experts host-resident, LRU cache 270 slots on all 48 layers** | **75.3** | 120.5 | **193.8** | **194.7** | | **99/100** | **3/3** |
+
+Launch (defaults now in serve-stock-fn.sh): `MTP=3 P2P=1 ~/serve-stock-fn.sh` then `python3 ~/warmup.py`
+(= OFFLOAD_GB=34, UTIL=0.94, R9K_EXPERT_CACHE_SLOTS=270, fp8 target+draft LM heads). 320 slots leaves no KV room.
+Opt-ins measured and left off: R9K_FP8_BLOCK=rowwise|block (acceptance drop / ~1 ms), R9K_FP8_LINEARS=hyper_connection
+(acceptance drop), R9K_DRAFT_LMHEAD=mxfp4 (throughput +, single -).
+
 Remaining gaps: short-prompt prefill (host read-through of offloaded experts over Gen3 PCIe), LRU miss traffic
 (~7.5 ms/step), untuned Triton fp8-block GEMMs (~4.7 ms/step); VM100 RAM upgrade would allow a full cache.
 Correction: the "+ fp8 HC linears" row above ran on a stale torch.compile cache that still used the bf16 HC path

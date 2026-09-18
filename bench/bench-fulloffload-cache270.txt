@@ -1,0 +1,10 @@
+GPU KV cache size: 124,625 tokens
+10063
+warmup done in 18.1s
+[fulloffload-cache270] single-stream decode: 75.3 tok/s
+[fulloffload-cache270] aggregate @4 concurrent: 120.5 tok/s (4 ok)
+[fulloffload-cache270] aggregate @8 concurrent: 193.8 tok/s (8 ok)
+[fulloffload-cache270] aggregate @16 concurrent: 194.7 tok/s (16 ok)
+conc 1: median ITL 32.0 ms, p90 41.2 ms
+conc 4: median ITL 42.0 ms, p90 45.1 ms
+Decoding metrics: Mean acceptance length: 2.78, Accepted throughput: 102.80 tokens/s, Draft
