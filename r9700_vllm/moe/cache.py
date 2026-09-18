@@ -135,6 +135,8 @@ class LayerCache:
         self.max_inserts = min(int(os.environ.get("R9K_LRU_MAX_INSERTS", "64")), S)
         self.max_distinct = int(S * float(os.environ.get("R9K_LRU_THRESH", "0.5")))
         self.miss = torch.full((max(1, self.max_inserts), 2), -1, **i32)
+        # rows per step up to which the cold (host read-through) pass cannot have work: distinct <= rows
+        self.no_cold_limit = min(self.max_distinct, self.max_inserts) if S > self.max_distinct else 0
         self.n_miss = torch.zeros((1,), **i32)
         self.fused = os.environ.get("R9K_LRU_FUSED", "1") == "1" and E <= 1024
         self._align: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}

@@ -132,7 +132,12 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
                 cache.update(topk_ids)          # LRU manage + gather misses host -> VRAM slots
                 hot_al = moe_align_block_size(topk_ids, blk, global_num_experts, cache.table)
                 cold_al = moe_align_block_size(topk_ids, blk, global_num_experts, cache.map_cold)
-            passes = [(h1, h2, hot_al), (c1, c2, cold_al)]
+            passes = [(h1, h2, hot_al)]
+            # If numel <= min(max_distinct, max_inserts), the manager never reads through and never caps
+            # inserts, so every routed expert is resident before the GEMMs: the cold pass is provably empty
+            # and its two launches can be skipped on the host (no device sync needed; decode is always here).
+            if numel > cache.no_cold_limit:
+                passes.append((c1, c2, cold_al))
 
         xq, xs = K.quant_rows_fp8(hidden_states)
         gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
