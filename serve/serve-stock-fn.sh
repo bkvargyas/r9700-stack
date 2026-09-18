@@ -9,6 +9,12 @@ SDKLIB=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib
 RCCL=$HOME/rccl10/librccl-p2p.so.1.0
 MNT=(-v $REPO:/opt/r9700)
 [ "${P2P:-1}" = 1 ] && MNT+=(-v $RCCL:$SDKLIB/librccl.so.1:ro -e NCCL_PROTO=Simple) || MNT+=(-e NCCL_P2P_DISABLE=1)
+# (re)build libr9k.so into the mounted repo when missing or older than any kernel source
+SO=$REPO/r9700_vllm/kernels/libr9k.so
+if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
+  sudo docker run --rm --entrypoint bash -v $REPO:/opt/r9700 $IMG -c \
+    "cd /opt/r9700/kernels && ./build.sh && cp libr9k.so /opt/r9700/r9700_vllm/kernels/" || exit 1
+fi
 ARGS=()
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
 [ -n "$MTP" ] && ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
