@@ -26,7 +26,7 @@ def gemm_pass(xq, xs, W, out, topk_ids, E, mapping, numel, a_row_div, tw=None):
 def main():
     torch.manual_seed(0)
     g = torch.Generator().manual_seed(1)
-    E, S, M, topk = 64, 16, 4, 6
+    E, S, M, topk = 64, 48, 4, 6      # max_distinct = 24 >= 24 rows/step -> inserts; every 7th step uniform
     N1, K1, N2, K2 = 640, 2560, 2560, 320
     p1, s1, _ = make_experts(E, N1, K1, g)
     p2, s2, _ = make_experts(E, N2, K2, g)
@@ -41,7 +41,7 @@ def main():
     for step in range(40):
         if step == 30:
             hot_pref = torch.randperm(E, generator=g)[:24]    # working-set shift -> burst of misses
-        pool = hot_pref if step % 7 else torch.arange(E)      # every 7th step: uniform (read-through-ish)
+        pool = hot_pref if step % 7 else torch.arange(E)      # every 7th step: uniform over E (big churn)
         topk_ids = torch.stack([pool[torch.randperm(pool.numel(), generator=g)[:topk]] for _ in range(M)])
         topk_ids = topk_ids.to(torch.int32).cuda()
         tw = torch.rand(M * topk, generator=g).cuda()
