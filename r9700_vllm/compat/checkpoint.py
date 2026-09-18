@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import re
 
+import torch
+
 from vllm.logger import init_logger
 
 logger = init_logger("vllm." + __name__)
@@ -45,11 +47,42 @@ def _fix_ct_formats() -> bool:
     return True
 
 
+def _exact_uva_pinning() -> bool:
+    """Stock UVAOffloader pins each offloaded param with tensor.pin_memory(), which rounds to a power of two
+    (+~22% for Flash-Next's expert tensors). Swap in exact-size hipHostRegister pinning while it offloads."""
+    try:
+        from vllm.model_executor.offloader import uva
+    except Exception:
+        return False
+    from ..utils.hostmem import pinned_empty
+    cls = uva.UVAOffloader
+    orig = cls._maybe_offload_to_cpu
+    stock_pin = torch.Tensor.pin_memory
+
+    def exact_pin(self, *a, **k):
+        if self.device.type != "cpu":
+            return stock_pin(self, *a, **k)
+        out = pinned_empty(self.shape, self.dtype)
+        out.copy_(self)
+        return out
+
+    def _maybe_offload_to_cpu(self, module, prefix=""):
+        torch.Tensor.pin_memory = exact_pin
+        try:
+            return orig(self, module, prefix)
+        finally:
+            torch.Tensor.pin_memory = stock_pin
+
+    cls._maybe_offload_to_cpu = _maybe_offload_to_cpu
+    return True
+
+
 def patch() -> bool:
     global _PATCHED
     if _PATCHED:
         return True
     _fix_ct_formats()
+    _exact_uva_pinning()
     try:
         from vllm.models.qwen4_exp.amd import mtp as M
     except Exception as e:
