@@ -26,6 +26,9 @@ fi
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
+# PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels)
+[ "${PROF:-0}" = 1 ] && { mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
+  ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
 [ -n "$MTP" ] && ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
 sudo docker rm -f vllmstock 2>/dev/null
 sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
