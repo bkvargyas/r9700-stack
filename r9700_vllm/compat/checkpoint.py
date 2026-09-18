@@ -68,7 +68,7 @@ def _fix_ct_formats() -> bool:
             groups = config.get("config_groups") or {}
             for name in list(groups):
                 tg = groups[name].get("targets") or []
-                if tg and all(str(t).startswith("re:mtp") and ".mlp." in str(t) for t in tg):
+                if tg and all(str(t).startswith("re:mtp") and "mlp" in str(t) for t in tg):
                     del groups[name]
                     logger.info_once("r9700: CT group %s (MTP MLP, fp8 block-128) dropped: MTP experts/shared "
                                      "expert are re-quantized to MXFP4 at load", name)
