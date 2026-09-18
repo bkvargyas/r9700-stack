@@ -18,7 +18,7 @@ _DONE = False
 def _fp8_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: int) -> torch.Tensor:
     from .kernels import fp8 as F8, moe as KM
     q, s = KM.quant_rows_fp8(x)
-    return F8.gemm_fp8(q, s, F8.Fp8Weight(wq, ws, N, K))
+    return F8.gemm_fp8(q, s, F8.Fp8Weight(wq, ws, N, K), None, *F8.pick_cfg("fp8row", N, K, x.shape[0]))
 
 
 def _fp8_linear_fake(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: int) -> torch.Tensor:
@@ -28,7 +28,7 @@ def _fp8_linear_fake(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int
 def _fp8_block_linear(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int) -> torch.Tensor:
     from .kernels import fp8 as F8
     q, s = F8.quant_group128_fp8(x)
-    return F8.gemm_fp8_block(q, s, wq, bs, N, K)
+    return F8.gemm_fp8_block(q, s, wq, bs, N, K, None, *F8.pick_cfg("fp8block", N, K, x.shape[0]))
 
 
 _MX_TABLES: dict[tuple, tuple] = {}
@@ -58,7 +58,7 @@ def _nvfp4_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, wg: torch
         return out
     q, s = KM.quant_rows_fp8(x)
     t, MT = _identity_tables(x, M)
-    KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K, 16),
+    KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K, 16, M=M, kind="nvfp4"),
                 num_experts=1, MT=MT)
     return out
 
@@ -84,7 +84,8 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
              torch.zeros(mpad // blk, dtype=torch.int32, device=x.device),
              torch.full((1,), mpad, dtype=torch.int32, device=x.device))
         _MX_TABLES[key] = t
-    KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K), num_experts=1, MT=MT)
+    KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K, M=M, kind="mxfp4"), num_experts=1,
+                MT=MT)
     return out
 
 

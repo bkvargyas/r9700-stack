@@ -314,9 +314,62 @@ extern "C" int r9k_moe_nvfp4a8(long a, long as, long wq, long ws, long wg, long 
                     max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream);
 }
 
+// Vectorized single-pass variant: each thread keeps its 16-byte chunks of the row in registers (one DRAM read),
+// block max via wave shuffles + LDS, then hardware OCP-e4m3 conversion (v_cvt_pk_fp8_f32) and 8-byte stores.
+// Needs K % 8 == 0, 16-byte aligned rows and K <= RQ_THREADS * RQ_VEC * 8. ~4x fewer instructions than the
+// scalar two-pass kernel, which cost ~8 us per M<=8 call inside the decode graphs (266 calls per 27B step).
+#define RQ_THREADS 512
+#define RQ_VEC 5
+__device__ __forceinline__ float bf16lo(unsigned int w) { return __uint_as_float(w << 16); }
+__device__ __forceinline__ float bf16hi(unsigned int w) { return __uint_as_float(w & 0xFFFF0000u); }
+
+__global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
+    const __hip_bfloat16* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ s, int K, int ld) {
+  const int row = blockIdx.x, tid = threadIdx.x, nvec = K / 8;
+  const uint4* xr = (const uint4*)(x + (size_t)row * ld);
+  uint4 v[RQ_VEC];
+  float m = 0.f;
+#pragma unroll
+  for (int i = 0; i < RQ_VEC; i++) {
+    const int c = tid + i * RQ_THREADS;
+    v[i] = c < nvec ? xr[c] : make_uint4(0, 0, 0, 0);
+    const unsigned int w[4] = {v[i].x, v[i].y, v[i].z, v[i].w};
+#pragma unroll
+    for (int j = 0; j < 4; j++) m = fmaxf(m, fmaxf(fabsf(bf16lo(w[j])), fabsf(bf16hi(w[j]))));
+  }
+  __shared__ float wmax[RQ_THREADS / 32];
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+  if ((tid & 31) == 0) wmax[tid >> 5] = m;
+  __syncthreads();
+  if (tid < 32) {
+    float t = tid < RQ_THREADS / 32 ? wmax[tid] : 0.f;
+    for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor(t, o, 32));
+    if (tid == 0) wmax[0] = t;
+  }
+  __syncthreads();
+  const float amax = fmaxf(wmax[0], 1e-12f);
+  const float inv = 448.f / amax;
+  if (tid == 0) s[row] = amax / 448.f;
+  uint2* qr = (uint2*)(q + (size_t)row * K);
+#pragma unroll
+  for (int i = 0; i < RQ_VEC; i++) {
+    const int c = tid + i * RQ_THREADS;
+    if (c >= nvec) break;
+    int lo = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].x) * inv, bf16hi(v[i].x) * inv, 0, false);
+    lo = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].y) * inv, bf16hi(v[i].y) * inv, lo, true);
+    int hi = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].z) * inv, bf16hi(v[i].z) * inv, 0, false);
+    hi = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].w) * inv, bf16hi(v[i].w) * inv, hi, true);
+    qr[c] = make_uint2((unsigned int)lo, (unsigned int)hi);
+  }
+}
+
 extern "C" int r9k_quant_rows_fp8(long x, long q, long s, int M, int K, int ld, long stream) {
   if (M <= 0) return 0;
-  hipLaunchKernelGGL(r9k_quant_rows_fp8_kernel, dim3(M), dim3(256), 0, (hipStream_t)stream,
-                     (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
+  if (K % 8 == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && K <= RQ_THREADS * RQ_VEC * 8)
+    hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
+                       (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
+  else
+    hipLaunchKernelGGL(r9k_quant_rows_fp8_kernel, dim3(M), dim3(256), 0, (hipStream_t)stream,
+                       (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }

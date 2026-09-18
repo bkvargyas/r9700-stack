@@ -132,6 +132,8 @@ def make_native_dense_scheme_cls(base):
             N, Kh = w.shape
             if N % 16 or (2 * Kh) % 16:
                 raise ValueError(f"r9700 native NVFP4: unsupported shape N={N} K={2 * Kh}")
+            from ..utils import note_shape
+            note_shape("nvfp4", N, 2 * Kh)
             mult = 1.0 / _row_div(layer.weight_global_scale.data, list(layer.logical_widths))
             W = KM.prepare_nvfp4_weights(w[None], s16[None], mult[None].to(w.device))
             for n in ("weight_packed", "weight_global_scale", "input_global_scale", "weight_scale"):

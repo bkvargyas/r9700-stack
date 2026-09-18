@@ -67,7 +67,7 @@ class _HeadMethod:
         x2 = (x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)).contiguous()
         if self.fmt == "fp8":
             q, s = K.quant_rows_fp8(x2)
-            out = F8.gemm_fp8(q, s, self.W)
+            out = F8.gemm_fp8(q, s, self.W, None, *F8.pick_cfg("fp8row", self.Np, self.K, x2.shape[0]))
         else:
             fake = type("L", (), {})()
             fake.weight, fake.weight_scale, fake._r9k_nk = self.W.wq, self.W.wsr, (self.Np, self.K)

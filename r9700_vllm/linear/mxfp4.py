@@ -48,6 +48,8 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         N, Kh = w.shape
         if N % 16 or (2 * Kh) % 32:
             raise ValueError(f"R9700Mxfp4LinearKernel: unsupported shape N={N} K={2 * Kh}")
+        from ..utils import note_shape
+        note_shape("mxfp4_dense", N, 2 * Kh)
         layer.weight = Parameter(K.permute_fragments(w.view(torch.uint8)[None]), requires_grad=False)
         layer.weight_scale = Parameter(K.pack_scales(s.view(torch.uint8)[None]), requires_grad=False)
         layer._r9k_nk = (N, 2 * Kh)

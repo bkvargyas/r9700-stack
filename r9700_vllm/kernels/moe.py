@@ -165,9 +165,15 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     return out
 
 
-def pick_cfg(N: int, K: int, group: int = GROUP) -> tuple[int, int, int]:
+def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str | None = None
+             ) -> tuple[int, int, int]:
     """A legal (WV, SK, NPW) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
     N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320."""
+    if kind and M:
+        from .tuned import lookup
+        t = lookup(kind, N, K, M)
+        if t:
+            return t
     for WV, SK, NPW in ((2, 4, 2), (4, 2, 1), (2, 5, 2), (4, 1, 1)):
         if K % (SK * group) == 0 and (K >= 1024 or SK <= 2):
             return WV, SK, NPW

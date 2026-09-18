@@ -18,4 +18,4 @@ r9700 = "r9700_vllm.platform:detect"
 include = ["r9700_vllm*"]
 
 [tool.setuptools.package-data]
-r9700_vllm = ["kernels/*.so"]
+r9700_vllm = ["kernels/*.so", "kernels/tuned.json"]

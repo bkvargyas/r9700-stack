@@ -104,15 +104,58 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
 
     r9k_mode = "block"
 
+    def _to_mxfp4(self, layer, w, bs) -> bool:
+        """R9K_FP8_TO_MXFP4=<regex|1>: requantize this fp8 linear to MXFP4 (half the weight bytes; GGZ14 serves the
+        27B this way by default -- same GSM8K). Exact dequant (per-channel or 128x128 block scales), MSE-searched
+        E8M0 per 32, then the dense libr9k MXFP4 kernel. The LM head is never converted."""
+        pat = os.environ.get("R9K_FP8_TO_MXFP4", "")
+        prefix = getattr(layer, "prefix", "") or ""
+        if not pat or "lm_head" in prefix or w.dim() != 2 or w.shape[0] % 16 or w.shape[1] % 32:
+            return False
+        if pat != "1" and not re.search(pat, prefix):
+            return False
+        from .nvfp4 import quantize_mxfp4_search
+        from ..linear.mxfp4 import R9700Mxfp4LinearKernel
+        from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+        N, Kd = w.shape
+        packed = torch.empty((N, Kd // 2), dtype=torch.uint8, device=w.device)
+        e8 = torch.empty((N, Kd // 32), dtype=torch.uint8, device=w.device)
+        bsf = bs.float()
+        for r0 in range(0, N, 4096):
+            r1 = min(N, r0 + 4096)
+            wf = w[r0:r1].float()
+            if bsf.numel() == N or bsf.numel() == 1:
+                wf = wf * bsf.reshape(-1, 1)[r0:r1] if bsf.numel() == N else wf * bsf.reshape(())
+            else:                                            # 128x128 block scales
+                sb = bsf.repeat_interleave(128, 0)[r0:r1].repeat_interleave(128, 1)[:, :Kd]
+                wf = wf * sb
+            p, s = quantize_mxfp4_search(wf)
+            packed[r0:r1].copy_(p)
+            e8[r0:r1].copy_(s)
+        kern = R9700Mxfp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=None))
+        layer.weight = Parameter(packed, requires_grad=False)
+        layer.weight_scale = Parameter(e8, requires_grad=False)
+        layer.input_scale = None
+        kern.process_weights_after_loading(layer)
+        layer._r9k_mx = kern
+        logger.info_once("r9700: fp8 linears requantized to MXFP4 (R9K_FP8_TO_MXFP4=%s)", pat)
+        return True
+
     def process_weights_after_loading(self, layer) -> None:
         from ..kernels import fp8 as F8
         from compressed_tensors.quantization import QuantizationStrategy
         w, bs = layer.weight.data, layer.weight_scale.data
+        if w.dtype == torch.float8_e4m3fn and self._to_mxfp4(layer, w, bs):
+            return
+        if self.r9k_mode == "stock":
+            return super().process_weights_after_loading(layer)
         if self.r9k_mode == "channel":
             if (self.strategy != QuantizationStrategy.CHANNEL or w.dim() != 2 or w.shape[0] % 16
                     or w.shape[1] % 16 or w.dtype != torch.float8_e4m3fn):
                 return super().process_weights_after_loading(layer)
             N, Kd = w.shape
+            from ..utils import note_shape
+            note_shape("fp8_channel", N, Kd)
             layer._r9k_fp8 = F8.Fp8Weight(F8.permute_fp8(w.view(torch.uint8)), bs.float().reshape(-1).contiguous(),
                                           N, Kd)
             dev = w.device
@@ -125,6 +168,8 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         if (self.strategy != QuantizationStrategy.BLOCK or w.dim() != 2 or w.shape[0] % 16 or w.shape[1] % 16
                 or (self.r9k_mode == "block" and (blk != (128, 128) or w.shape[1] % 128))):
             return super().process_weights_after_loading(layer)
+        from ..utils import note_shape
+        note_shape("fp8_" + self.r9k_mode, w.shape[0], w.shape[1])
         if self.r9k_mode == "block":
             layer._r9k_fp8b = (F8.permute_fp8(w.view(torch.uint8)), bs.float().contiguous(), w.shape[0], w.shape[1])
         else:
@@ -138,6 +183,9 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
 
     def apply_weights(self, layer, x, bias=None):
         from .. import ops
+        mx = getattr(layer, "_r9k_mx", None)
+        if mx is not None:
+            return mx.apply_weights(layer, x, bias)
         Wb = getattr(layer, "_r9k_fp8b", None)
         W = getattr(layer, "_r9k_fp8", None)
         if Wb is None and W is None:
@@ -221,6 +269,9 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         elif isinstance(scheme, CompressedTensorsW8A8Fp8) and _mode("R9K_FP8_BLOCK") in ("block", "rowwise"):
             scheme.__class__ = R9kW8A8Fp8                        # this instance only
             scheme.r9k_mode = _mode("R9K_FP8_BLOCK")
+        elif isinstance(scheme, CompressedTensorsW8A8Fp8) and os.environ.get("R9K_FP8_TO_MXFP4"):
+            scheme.__class__ = R9kW8A8Fp8                        # requant only; other layers fall back to stock
+            scheme.r9k_mode = "stock"
         return scheme
 
     def get_quant_method(self, layer, prefix):

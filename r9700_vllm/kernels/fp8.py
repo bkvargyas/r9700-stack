@@ -70,6 +70,13 @@ def gemm_fp8(a_q: torch.Tensor, a_s: torch.Tensor, w: Fp8Weight, out: torch.Tens
     return out
 
 
+def pick_cfg(kind: str, N: int, K: int, M: int) -> tuple[int, int, int]:
+    """kind 'fp8row' | 'fp8block': tuned (tuned.json) or the historical default (4, 4, 2)."""
+    from .tuned import lookup
+    t = lookup(kind, N, K, M)
+    return t if t else (4, 4, 2)
+
+
 def quant_group128_fp8(x: torch.Tensor):
     """bf16 [M, K] -> (e4m3 [M, K], fp32 [M, K/128]) per-token-group-128 dynamic scales."""
     assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(1) == 1 and x.shape[1] % 128 == 0

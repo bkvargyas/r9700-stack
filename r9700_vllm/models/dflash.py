@@ -11,6 +11,8 @@ Upstream candidate: dequantize in `_build_context_kv_buffers` when qkv_proj is q
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.logger import init_logger
@@ -37,17 +39,116 @@ def _dequant_fused_kv(model) -> None:
                      tuple(model._fused_kv_weight.shape))
 
 
+def _dequant_weight(lin, chunk: int = 2048) -> torch.Tensor:
+    """dequant(W) [N, K] bf16 through the layer's own quant method (identity-row inputs)."""
+    K = lin.input_size_per_partition
+    dev = next(lin.parameters()).device
+    cols = []
+    for k0 in range(0, K, chunk):
+        k1 = min(K, k0 + chunk)
+        eye = torch.zeros((k1 - k0, K), dtype=torch.bfloat16, device=dev)
+        eye[torch.arange(k1 - k0, device=dev), torch.arange(k0, k1, device=dev)] = 1
+        cols.append(lin.quant_method.apply(lin, eye, None))             # [k1-k0, N] = W[:, k0:k1]^T
+    return torch.cat(cols, dim=0).t().contiguous()
+
+
+class _BlockMethod:
+    """quant_method stand-in for swapped block-fp8 linears (LinearBase.forward only calls .apply)."""
+
+    def apply(self, layer, x, bias=None):
+        from .. import ops
+        out = ops.fp8_block_linear(x, *layer._r9k_fp8b).to(x.dtype)
+        return out + bias if bias is not None else out
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+
+def swap_fp8_linears(root) -> int:
+    """Stock Fp8LinearMethod linears (quant_method 'fp8' checkpoints, dynamic activations) -> libr9k per-row fp8
+    GEMM with the checkpoint's exact fp8 values: bytes recovered as round_e4m3(dequant(W) / s) with the layer's own
+    (per-tensor or per-row) scale -- exact because bf16 dequant error << the e4m3 step. Verified per layer; a layer
+    that does not round-trip, has static activation scales or an unsupported shape stays on stock."""
+    from vllm.model_executor.layers.linear import LinearBase
+    from ..kernels import fp8 as F8
+    from ..quant.ct import R9kFp8UnquantMethod
+    n = 0
+    for name, lin in root.named_modules():
+        qm = getattr(lin, "quant_method", None)
+        if not isinstance(lin, LinearBase) or type(qm).__name__ != "Fp8LinearMethod":
+            continue
+        if getattr(lin, "input_scale", None) is not None:
+            continue
+        W = _dequant_weight(lin)
+        N, K = W.shape
+        if N % 16 or K % 16:
+            continue
+        bsc = getattr(lin, "weight_scale_inv", None)
+        bsc = bsc if isinstance(bsc, torch.Tensor) else getattr(lin, "weight_scale", None)
+        if getattr(qm, "block_quant", False):
+            # 128x128 block scales -> exact bytes + r9k_gemm_fp8_block (needs K % 128)
+            if bsc is None or bsc.dim() != 2 or K % 128 or bsc.shape != ((N + 127) // 128, K // 128):
+                continue
+            bs = bsc.detach().float().contiguous()
+            full = bs.repeat_interleave(128, 0)[:N].repeat_interleave(128, 1)
+            q = (W.float() / full).to(torch.float8_e4m3fn)
+            err = ((q.float() * full - W.float()).abs().max() / W.float().abs().max().clamp_min(1e-12)).item()
+            if err > 1e-2:
+                logger.warning("r9700: %s block-fp8 round-trip error %.3g, left on stock", name, err)
+                continue
+            lin._r9k_fp8b = (F8.permute_fp8(q.view(torch.uint8)), bs, N, K)
+            from ..utils import note_shape
+            note_shape("fp8block", N, K)
+            lin.weight = torch.nn.Parameter(torch.empty((0,), dtype=torch.float8_e4m3fn, device=W.device),
+                                            requires_grad=False)
+            lin.quant_method = _BlockMethod()
+            n += 1
+            continue
+        sc = lin.weight_scale.detach().float().reshape(-1)
+        if sc.numel() == 1:
+            row = sc.expand(N)
+        elif sc.numel() == N:
+            row = sc
+        else:
+            continue
+        q = (W.float() / row[:, None]).to(torch.float8_e4m3fn)
+        err = ((q.float() * row[:, None] - W.float()).abs().max() / W.float().abs().max().clamp_min(1e-12)).item()
+        if err > 1e-2:
+            logger.warning("r9700: %s fp8 round-trip error %.3g, left on stock", name, err)
+            continue
+        lin._r9k_fp8 = F8.Fp8Weight(F8.permute_fp8(q.view(torch.uint8)), row.contiguous(), N, K)
+        from ..utils import note_shape
+        note_shape("fp8row", N, K)
+        lin.weight = torch.nn.Parameter(torch.empty((0,), dtype=torch.float8_e4m3fn, device=W.device),
+                                        requires_grad=False)
+        lin.quant_method = R9kFp8UnquantMethod()
+        n += 1
+    return n
+
+
+def _finish(model) -> None:
+    _dequant_fused_kv(model.model)          # uses the stock quant methods: before the swap
+    from collections import Counter
+    from vllm.model_executor.layers.linear import LinearBase
+    kinds = Counter(type(getattr(m, "quant_method", None)).__name__ for m in model.modules() if isinstance(m, LinearBase))
+    logger.info("r9700: DFlash drafter linear methods: %s", str(dict(kinds)))
+    if os.environ.get("R9K_DRAFT_FP8", "1") == "1":
+        n = swap_fp8_linears(model)
+        if n:
+            logger.info_once("r9700: DFlash drafter: %d fp8 linears -> libr9k fp8 GEMM (exact bytes)", n)
+
+
 class R9kDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def load_weights(self, weights):
         out = super().load_weights(weights)
-        _dequant_fused_kv(self.model)
+        _finish(self)
         return out
 
 
 class R9kDFlash2Qwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
     def load_weights(self, weights):
         out = super().load_weights(weights)
-        _dequant_fused_kv(self.model)
+        _finish(self)
         return out
 
 

@@ -28,13 +28,16 @@ fi
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
-CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC} $PSRC") | md5sum | cut -c1-10)
+CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
 # forward every R9K_* plugin knob from the caller's environment into the container
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
+# ATTN=<backend> (e.g. TRITON_ATTN) for the target; DRAFT_ATTN=<backend> for a separate drafter (must support
+# full cudagraphs or vLLM runs the draft eagerly)
+[ -n "$ATTN" ] && ARGS+=(--attention-backend "$ATTN")
 # OFFLOAD_GB=0: no expert offload (models that fit in VRAM, e.g. the dense 27B checkpoints)
 OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts)
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
@@ -52,7 +55,7 @@ fi
 MTP=${MTP-3}
 # DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP
 if [ -n "$DRAFT" ]; then
-  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}}")
+  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}}")
 elif [ -n "$MTP" ]; then
   ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
 fi
