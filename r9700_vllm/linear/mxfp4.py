@@ -4,7 +4,8 @@ Stock vLLM on ROCm gfx12 falls back to EmulationMxfp4LinearKernel: it dequantize
 every call (Flash-Next's shared experts hit this 48x per step). This kernel reuses libr9k's grouped
 MXFP4 x FP8 GEMM with a single expert: activations are quantized per row to e4m3, the routing tables are the
 identity (sorted ids 0..Mpad-1, all blocks -> expert 0), so any M works and the weight stays 4-bit.
-Inserted at the front of vLLM's ROCm MXFP4 kernel list; declines anything but weight-only on gfx12.
+Inserted at the front of vLLM's ROCm MXFP4 kernel list (gfx12 only). Also takes stock's W4A4 (kMxfp4Dynamic)
+requests, serving them with fp8 activations (see can_implement).
 """
 from __future__ import annotations
 
@@ -33,8 +34,12 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
 
     @classmethod
     def can_implement(cls, config: MxFp4LinearLayerConfig) -> tuple[bool, str | None]:
-        if config.activation_quant_key is not None:
-            return False, "weight-only MXFP4 only"
+        # Stock CompressedTensorsW4A4Mxfp4 always asks for kMxfp4Dynamic activations, even for checkpoints that
+        # declare input_activations=null (weight-only, e.g. Flash-Next's shared experts). We run fp8 (e4m3,
+        # per-row) activations instead: more precise than MXFP4 activations and what the weights were tuned for.
+        from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp4Dynamic
+        if config.activation_quant_key not in (None, kMxfp4Dynamic):
+            return False, "weight-only / MXFP4-activation requests only"
         return True, None
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
