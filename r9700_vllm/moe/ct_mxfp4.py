@@ -63,6 +63,8 @@ def _maybe_attach_cache(method, layer) -> None:
     slots = C.slots_per_layer(per_expert)
     if slots <= 0:
         return
+    if C.host_only() and not (C.is_host(layer.w13_weight) and C.is_host(layer.w2_weight)):
+        return          # layer lives in VRAM already: nothing to cache
     name = getattr(layer, "layer_name", "") or ""
     m = re.search(r"layers\.(\d+)\.", name)
     idx = int(m.group(1)) if m else 0
@@ -85,8 +87,8 @@ def _maybe_attach_cache(method, layer) -> None:
     method.moe_kernel.fused_experts.quant_config = method.moe_quant_config
     method.moe_kernel.fused_experts.r9k_cache = cache
     torch.cuda.empty_cache()
-    logger.info_once("r9700: expert cache ON: %d slots/layer (%.2f MiB/expert/rank), %s GB/rank budget",
-                     cache.S, per_expert / 2**20, C.budget_gb())
+    logger.info("r9700: expert cache ON for %s: %d slots (%.2f MiB/expert/rank)", name or idx, cache.S,
+                per_expert / 2**20)
 
 
 def patch() -> bool:

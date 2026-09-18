@@ -237,7 +237,20 @@ class LayerCache:
 
 
 def slots_per_layer(bytes_per_expert: int) -> int:
+    """Slots per cached layer: R9K_EXPERT_CACHE_SLOTS if set, else the R9K_EXPERT_CACHE_GB budget spread over
+    the layers that will be cached (R9K_EXPERT_CACHE_LAYERS, default all MoE layers)."""
+    slots = int(os.environ.get("R9K_EXPERT_CACHE_SLOTS", "0") or 0)
+    if slots > 0:
+        return slots
     gb = budget_gb()
     if gb <= 0:
         return 0
-    return int(gb * 2**30 // (_num_moe_layers() * bytes_per_expert))
+    nl = int(os.environ.get("R9K_EXPERT_CACHE_LAYERS", "0") or 0) or _num_moe_layers()
+    return int(gb * 2**30 // (nl * bytes_per_expert))
+
+
+def host_only() -> bool:
+    """Cache only layers whose experts are already UVA-offloaded (stock --cpu-offload-params experts moves whole
+    layers). Then the offloader's host copy is the backing store and no extra host RAM is needed; layers left in
+    VRAM run uncached. Default on; R9K_EXPERT_CACHE_HOST_ONLY=0 migrates GPU layers to host too (needs RAM)."""
+    return os.environ.get("R9K_EXPERT_CACHE_HOST_ONLY", "1") == "1"
