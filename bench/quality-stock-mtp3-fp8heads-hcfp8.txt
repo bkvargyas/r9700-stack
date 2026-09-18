@@ -1,0 +1,5 @@
+GSM8K no-think: 95.0% (95/100), 34310 tokens in 378s
+needle ~3828 tok: hit ('985440')
+needle ~15196 tok: hit ('894772')
+needle ~30354 tok: hit ('142450')
+needle: 3/3
