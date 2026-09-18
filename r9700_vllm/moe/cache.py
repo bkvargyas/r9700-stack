@@ -51,7 +51,7 @@ def _L():
 
 def _uva_empty(shape, dtype) -> torch.Tensor:
     from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
-    host = torch.empty(shape, dtype=dtype, pin_memory=True)
+    host = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
     v = get_accelerator_view_from_cpu_tensor(host)
     v._r9k_host = host  # keep the pinned allocation alive with the view
     return v

@@ -86,7 +86,7 @@ def _make_embedding_cls(base):
             self.head_dim = embedding_dim
             self.row_bytes = int6_row_bytes(embedding_dim)
             rows = self.num_embeddings_per_partition
-            host = torch.empty((rows, self.row_bytes), dtype=torch.uint8, pin_memory=True)
+            host = torch.empty((rows, self.row_bytes), dtype=torch.uint8, device="cpu", pin_memory=True)
             view = get_accelerator_view_from_cpu_tensor(host)
             del self.weight
             self.weight = torch.nn.Parameter(view, requires_grad=False)
