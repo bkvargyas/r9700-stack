@@ -32,4 +32,8 @@ def register() -> None:
         from .moe import ct_mxfp4
         if ct_mxfp4.patch():
             done.append("ct_mxfp4_moe")
+    if not _disabled("linear"):
+        from .linear import mxfp4
+        if mxfp4.patch():
+            done.append("mxfp4_linear")
     log.info("r9700_vllm %s registered: %s", __version__, ", ".join(done) or "nothing")
