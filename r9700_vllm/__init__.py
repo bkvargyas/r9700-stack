@@ -40,6 +40,10 @@ def register() -> None:
         from .linear import mxfp4
         if mxfp4.patch():
             done.append("mxfp4_linear")
+    if not _disabled("fp8_linears"):
+        from .linear import fp8_unquant
+        if fp8_unquant.patch():
+            done.append("fp8_linears")
     if not _disabled("mtp"):
         from .spec import mtp_rocm
         if mtp_rocm.patch():
