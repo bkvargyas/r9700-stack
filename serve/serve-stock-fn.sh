@@ -36,6 +36,6 @@ sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --tensor-parallel-size 2 --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
   --max-num-batched-tokens 4096 --gpu-memory-utilization ${UTIL:-0.92} \
   --cpu-offload-gb ${OFFLOAD_GB:-24} --cpu-offload-params experts \
-  --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice \
+  --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice ${LMONLY---language-model-only} \
   "${ARGS[@]}" $EXTRA
 echo "started stock vLLM + r9700 plugin (offload ${OFFLOAD_GB:-24} GB/rank, maxlen ${MAXLEN:-32768})"
