@@ -28,6 +28,8 @@ def lib() -> ctypes.CDLL:
         L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
+        L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
+        L.r9k_silu_mul_quant_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 2 + [ctypes.c_long]
         assert L.r9k_moe_block() == MOE_BLOCK
         _LIB = L
     return _LIB
@@ -90,6 +92,18 @@ def quant_rows_fp8(x: torch.Tensor):
     rc = lib().r9k_quant_rows_fp8(x.data_ptr(), q.data_ptr(), s.data_ptr(), M, K, x.stride(0), _stream())
     if rc:
         raise RuntimeError(f"r9k_quant_rows_fp8 failed ({rc})")
+    return q, s
+
+
+def silu_mul_quant_fp8(gu: torch.Tensor):
+    """bf16 [M, 2I] (gate | up) -> (e4m3fn [M, I], fp32 [M]): silu(gate) * up with a per-row dynamic scale."""
+    assert gu.dtype == torch.bfloat16 and gu.is_contiguous() and gu.shape[1] % 2 == 0
+    M, I2 = gu.shape
+    q = torch.empty((M, I2 // 2), dtype=torch.float8_e4m3fn, device=gu.device)
+    s = torch.empty((M,), dtype=torch.float32, device=gu.device)
+    rc = lib().r9k_silu_mul_quant_fp8(gu.data_ptr(), q.data_ptr(), s.data_ptr(), M, I2 // 2, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_silu_mul_quant_fp8 failed ({rc})")
     return q, s
 
 

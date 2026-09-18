@@ -37,6 +37,7 @@ def _cfg(env: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
 # (WV, SK, NPW) launch configs; tuned defaults for Flash-Next TP2 shapes, overridable for sweeps.
 CFG_GATE_UP = _cfg("R9K_MOE_CFG1", (2, 4, 2))
 CFG_DOWN = _cfg("R9K_MOE_CFG2", (4, 2, 1))
+FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
 
 
 def r9k_available() -> bool:
@@ -134,9 +135,12 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
             K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *CFG_GATE_UP,
                        num_experts=global_num_experts, MT=MT)
 
-        act = torch.empty((numel, N1 // 2), dtype=torch.bfloat16, device=dev)
-        self.activation(activation, act, gate_up)
-        aq, as_ = K.quant_rows_fp8(act)
+        if FUSED_ACT:
+            aq, as_ = K.silu_mul_quant_fp8(gate_up)           # one launch: silu*mul + per-row fp8 quant
+        else:
+            act = torch.empty((numel, N1 // 2), dtype=torch.bfloat16, device=dev)
+            self.activation(activation, act, gate_up)
+            aq, as_ = K.quant_rows_fp8(act)
 
         down = torch.empty((numel, N2), dtype=torch.bfloat16, device=dev)
         if expert_map is not None:

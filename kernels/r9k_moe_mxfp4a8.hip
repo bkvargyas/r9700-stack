@@ -194,6 +194,49 @@ __global__ void r9k_quant_rows_fp8_kernel(const __hip_bfloat16* __restrict__ x, 
   }
 }
 
+// silu(gate) * up + per-row dynamic fp8 quant, fused: gu [M][2I] bf16 (gate | up halves, vLLM's gate_up
+// layout) -> q [M][I] e4m3 + s [M]. One workgroup per row; the activation is computed twice (max pass +
+// store pass) instead of staging I floats, which is cheaper than LDS at I = 320.
+__global__ void r9k_silu_mul_quant_fp8_kernel(const __hip_bfloat16* __restrict__ gu, unsigned char* __restrict__ q,
+                                              float* __restrict__ s, int I) {
+  const int row = blockIdx.x;
+  const __hip_bfloat16* g = gu + (size_t)row * 2 * I;
+  const __hip_bfloat16* u = g + I;
+  __shared__ float wmax[32];
+  float m = 0.f;
+  for (int k = threadIdx.x; k < I; k += blockDim.x) {
+    const float a = (float)g[k];
+    const float v = a / (1.f + __expf(-a)) * (float)u[k];
+    m = fmaxf(m, fabsf(v));
+  }
+  for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
+  if ((threadIdx.x & 31) == 0) wmax[threadIdx.x >> 5] = m;
+  __syncthreads();
+  if (threadIdx.x < 32) {
+    float v = threadIdx.x < (blockDim.x >> 5) ? wmax[threadIdx.x] : 0.f;
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor(v, o, 32));
+    if (threadIdx.x == 0) wmax[0] = v;
+  }
+  __syncthreads();
+  const float amax = fmaxf(wmax[0], 1e-12f);
+  const float inv = 448.f / amax;
+  if (threadIdx.x == 0) s[row] = amax / 448.f;
+  unsigned char* qr = q + (size_t)row * I;
+  for (int k = threadIdx.x; k < I; k += blockDim.x) {
+    const float a = (float)g[k];
+    const float v = a / (1.f + __expf(-a)) * (float)u[k];
+    __hip_fp8_e4m3 f(v * inv);
+    qr[k] = *reinterpret_cast<unsigned char*>(&f);
+  }
+}
+
+extern "C" int r9k_silu_mul_quant_fp8(long gu, long q, long s, int M, int I, long stream) {
+  if (M <= 0) return 0;
+  hipLaunchKernelGGL(r9k_silu_mul_quant_fp8_kernel, dim3(M), dim3(128), 0, (hipStream_t)stream,
+                     (const __hip_bfloat16*)gu, (unsigned char*)q, (float*)s, I);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
 extern "C" int r9k_moe_block(void) { return MOE_BLOCK; }   // rows per M tile; routing block = 16*MT
 
 // Returns 0 on success, negative on a shape error (the Python side raises).

@@ -113,6 +113,12 @@ if __name__ == "__main__":
     # multi-tile routing blocks (prefill-like: many rows per expert)
     for MT in (2, 4):
         allok &= run_case(16, 200, 4, 640, 2560, 2560, 320, 10 + MT, MT=MT)[0]
+    # fused silu*mul + fp8 quant vs torch
+    g = torch.Generator().manual_seed(5)
+    gu = (torch.randn(37, 640, generator=g) * 2).to(torch.bfloat16)
+    q, s = K.silu_mul_quant_fp8(gu.cuda())
+    a, b = gu.float()[:, :320], gu.float()[:, 320:]
+    allok &= check("silu_mul_quant_fp8 [37, 640]", (q.float() * s.unsqueeze(1)).cpu(), torch.nn.functional.silu(a) * b, tol=6e-2)
     print("-- perf (Flash-Next TP2 shapes, E=512)")
     for M in (1, 4, 16):
         allok &= bench(512, M, 10, 640, 2560, 2560, 320, (2, 4, 2), (4, 2, 1))
