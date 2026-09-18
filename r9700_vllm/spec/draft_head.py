@@ -102,7 +102,7 @@ def _wrap(cls, fmt: str, what: str) -> None:
             self._r9k_head = _shadow(head, fmt, what)
         return loaded
 
-    def compute_logits(self, hidden_states):
+    def compute_logits(self, hidden_states, *args, **kwargs):   # stock MTP also passes spec_step_idx
         head = getattr(self, "_r9k_head", None) or self.lm_head
         return self.logits_processor(head, hidden_states)
 

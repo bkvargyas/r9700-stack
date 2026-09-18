@@ -91,6 +91,7 @@ __global__ void r9k_moe_mxfp4a8_kernel(
   // This lane's A row in each M tile: the sorted flat index, clamped to the block's first row (always valid
   // for a live block) for padding entries.
   const int first = sorted_ids[by * BLK];
+  if (first < 0 || first >= numel) return;          // fully padded block: nothing valid to read or write
   const unsigned char* __restrict__ arow[MT];
 #pragma unroll
   for (int i = 0; i < MT; i++) {

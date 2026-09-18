@@ -50,16 +50,6 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         layer._r9k_nk = (N, 2 * Kh)
         logger.info_once("r9700: dense MXFP4 linears on libr9k (weight-only, fp8 activations)")
 
-    def _tables_unused(self, M: int, blk: int, dev):
-        mpad = (M + blk - 1) // blk * blk
-        t = self._ids.get((mpad, blk))
-        if t is None:
-            t = (torch.arange(mpad, dtype=torch.int32, device=dev),
-                 torch.zeros(mpad // blk, dtype=torch.int32, device=dev),
-                 torch.full((1,), mpad, dtype=torch.int32, device=dev))
-            self._ids[(mpad, blk)] = t
-        return t
-
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         from ..ops import mxfp4_linear
         N, Kd = layer._r9k_nk

@@ -24,7 +24,6 @@ _PATCHED = False
 def _requant_rowwise(w8: torch.Tensor, bs: torch.Tensor, block=(128, 128)):
     from ..kernels import fp8 as F8
     N, K = w8.shape
-    out_rows = []
     step = 4096
     q = torch.empty((N, K), dtype=torch.uint8, device=w8.device)
     s = torch.empty((N,), dtype=torch.float32, device=w8.device)
@@ -37,7 +36,6 @@ def _requant_rowwise(w8: torch.Tensor, bs: torch.Tensor, block=(128, 128)):
         rs = amax / F8.FP8_MAX
         q[r0:r1] = (x / rs[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
         s[r0:r1] = rs
-    del out_rows
     return F8.Fp8Weight(F8.permute_fp8(q), s, N, K)
 
 

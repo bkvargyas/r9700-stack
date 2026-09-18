@@ -19,7 +19,11 @@ def pinned_empty(shape, dtype) -> torch.Tensor:
     if n:
         rc = torch.cuda.cudart().cudaHostRegister(t.data_ptr(), n, _REGISTER_PORTABLE_MAPPED)
         if int(rc) != 0:  # fall back to torch's (rounding) allocator rather than fail
+            import warnings
+            warnings.warn(f"r9700: hipHostRegister failed ({int(rc)}); using torch pinned memory (rounds to 2^k)")
             t = torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    if n and not t.is_pinned():
+        raise RuntimeError("r9700: host buffer is not recognised as pinned; a UVA view would silently be a copy")
     _KEEP.append(t)       # registered memory must outlive every view; these are process-lifetime buffers
     return t
 

@@ -152,9 +152,8 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
             self.activation(activation, act, gate_up)
             aq, as_ = K.quant_rows_fp8(act)
 
-        down = torch.empty((numel, N2), dtype=torch.bfloat16, device=dev)
-        if expert_map is not None:
-            down.zero_()   # rows routed to experts on other ranks are never written
+        # zeroed: rows no pass writes (other EP ranks, or any routing edge case) must not feed moe_sum garbage
+        down = torch.zeros((numel, N2), dtype=torch.bfloat16, device=dev)
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *CFG_DOWN,

@@ -88,6 +88,7 @@ def _make_embedding_cls(base):
             rows = self.num_embeddings_per_partition
             from ..utils.hostmem import pinned_empty
             host = pinned_empty((rows, self.row_bytes), torch.uint8)   # exact size (torch pinning rounds to 2^k)
+            assert host.is_pinned(), "r9700: PLE host table not pinned; the UVA view would be a copy"
             view = get_accelerator_view_from_cpu_tensor(host)
             del self.weight
             self.weight = torch.nn.Parameter(view, requires_grad=False)
