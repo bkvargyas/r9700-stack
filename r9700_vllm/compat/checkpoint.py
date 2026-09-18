@@ -4,6 +4,7 @@
   checkpoints declare ``format: mxfp4-pack-quantized`` globally while their FP8-block groups (attention, GDN
   projections, MTP experts) carry no format, so stock dispatch looks for MXFP4 schemes and fails
   ("No compressed-tensors compatible scheme"). We set ``float-quantized`` on format-less 8-bit float groups.
+- Drops ``self_attn.q_scale`` (fork's fp8-attention query scales; no stock slot).
 - Drops ``mtp.lm_head.weight_q4 / weight_scale / weight_zero`` (the fork's private 4-bit draft head): stock remaps
   them to ``model.lm_head.*`` which the MTP predictor does not have, failing the load. The MTP head then loads
   from the checkpoint's bf16 ``lm_head.weight`` (the target head) exactly as stock intends; R9K_DRAFT_LMHEAD=mxfp4
@@ -20,6 +21,8 @@ from vllm.logger import init_logger
 logger = init_logger("vllm." + __name__)
 _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
+# fork-calibrated query scales for its fp8 attention path; stock QSA has no slot for them (k/v scales map fine)
+_DROP_MAIN = re.compile(r"\.self_attn\.q_scale$")
 
 
 def _fix_ct_formats() -> bool:
@@ -107,5 +110,17 @@ def patch() -> bool:
         return out
 
     cls.load_weights = load_weights
+
+    try:
+        from vllm.models.qwen4_exp.amd import model as Mdl
+        mcls = Mdl.Qwen4ExpModel
+        morig = mcls.load_weights
+
+        def model_load_weights(self, weights):
+            return morig(self, ((n, w) for n, w in weights if not _DROP_MAIN.search(n)))
+
+        mcls.load_weights = model_load_weights
+    except Exception as e:
+        logger.warning("r9700: q_scale compat not installed (%s)", e)
     _PATCHED = True
     return True
