@@ -36,4 +36,8 @@ def register() -> None:
         from .linear import mxfp4
         if mxfp4.patch():
             done.append("mxfp4_linear")
+    if not _disabled("mtp"):
+        from .spec import mtp_rocm
+        if mtp_rocm.patch():
+            done.append("mtp_k>1")
     log.info("r9700_vllm %s registered: %s", __version__, ", ".join(done) or "nothing")
