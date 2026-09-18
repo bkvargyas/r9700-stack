@@ -5,6 +5,9 @@
   projections, MTP experts) carry no format, so stock dispatch looks for MXFP4 schemes and fails
   ("No compressed-tensors compatible scheme"). We set ``float-quantized`` on format-less 8-bit float groups.
 - Renames ``*.weight_scale_inv`` -> ``*.weight_scale`` (fork stores CT FP8-block scales DeepSeek-style).
+- R9K_MTP_MLP=mxfp4 (default): the MTP layer's fp8 block-128 experts + shared expert cannot shard at TP2
+  (640/2 = 320 is not a multiple of 128); drop that CT group and re-quantize them to MXFP4 while loading, so our
+  kernels serve them. Draft-only: can change MTP acceptance, never output quality.
 - Drops ``self_attn.q_scale`` (fork's fp8-attention query scales; no stock slot).
 - Drops ``mtp.lm_head.weight_q4 / weight_scale / weight_zero`` (the fork's private 4-bit draft head): stock remaps
   them to ``model.lm_head.*`` which the MTP predictor does not have, failing the load. The MTP head then loads
@@ -13,6 +16,7 @@
 """
 from __future__ import annotations
 
+import os
 import re
 
 import torch
@@ -24,6 +28,23 @@ _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 # fork-calibrated query scales for its fp8 attention path; stock QSA has no slot for them (k/v scales map fine)
 _DROP_MAIN = re.compile(r"\.self_attn\.(attn\.)?[qkv]_scale$")   # bf16 KV: all unused (fp8-KV work will need k/v)
+
+
+_MTP_MLP_FP8 = re.compile(r"(^|\.)mtp\.layers\.\d+\.mlp\.(experts\.\d+|shared_expert)\.(gate|up|down)_proj\."
+                          r"weight(_scale_inv|_scale)?$")
+
+
+def _fp8_block_to_mxfp4(base: str, w: torch.Tensor, scale: torch.Tensor, block: int = 128):
+    """fp8 [N, K] with block scales [ceil(N/128), ceil(K/128)] -> CT MXFP4 (weight_packed [N, K/2] u8,
+    weight_scale [N, K/32] E8M0 u8), emitted under ``base``."""
+    from ..spec.draft_head import quantize_mxfp4
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    wf = w.to(dev).float()
+    N, K = wf.shape
+    s = scale.to(dev).float().repeat_interleave(block, 0)[:N].repeat_interleave(block, 1)[:, :K]
+    packed, e8m0 = quantize_mxfp4((wf * s).to(torch.bfloat16))
+    yield f"{base}.weight_packed", packed.cpu()
+    yield f"{base}.weight_scale", e8m0.cpu()
 
 
 def _rename_scale(name: str) -> str:
@@ -43,6 +64,14 @@ def _fix_ct_formats() -> bool:
     orig = CompressedTensorsConfig.from_config.__func__
 
     def from_config(cls, config):
+        if os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4":
+            groups = config.get("config_groups") or {}
+            for name in list(groups):
+                tg = groups[name].get("targets") or []
+                if tg and all(str(t).startswith("re:mtp") and ".mlp." in str(t) for t in tg):
+                    del groups[name]
+                    logger.info_once("r9700: CT group %s (MTP MLP, fp8 block-128) dropped: MTP experts/shared "
+                                     "expert are re-quantized to MXFP4 at load", name)
         gfmt = config.get("format")
         if gfmt and gfmt != "float-quantized":
             for name, grp in (config.get("config_groups") or {}).items():
@@ -100,16 +129,28 @@ def patch() -> bool:
         return False
     cls = M.Qwen4ExpMTP
     orig = cls.load_weights
+    mtp_mxfp4 = os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"
 
     def load_weights(self, weights):
         dropped = []
+        pend: dict[str, dict] = {}
 
         def filt():
             for name, w in weights:
                 if _DROP.search(name):
                     dropped.append(name)
                     continue
+                if mtp_mxfp4 and _MTP_MLP_FP8.search(name):
+                    base = name.rsplit(".", 1)[0]
+                    kind = "scale" if name.endswith(("weight_scale_inv", "weight_scale")) else "w"
+                    pend.setdefault(base, {})[kind] = w
+                    if len(pend[base]) == 2:
+                        d = pend.pop(base)
+                        yield from _fp8_block_to_mxfp4(base, d["w"], d["scale"])
+                    continue
                 yield _rename_scale(name), w
+            if pend:
+                logger.warning("r9700: unpaired MTP fp8 tensors left: %s", list(pend)[:4])
 
         out = orig(self, filt())
         if dropped:
