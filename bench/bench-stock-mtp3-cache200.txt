@@ -1,0 +1,10 @@
+10063
+[stock-mtp3-cache200] single-stream decode: 57.3 tok/s
+[stock-mtp3-cache200] aggregate @4 concurrent: 98.8 tok/s (4 ok)
+[stock-mtp3-cache200] aggregate @8 concurrent: 135.4 tok/s (8 ok)
+[stock-mtp3-cache200] aggregate @16 concurrent: 139.5 tok/s (16 ok)
+[stock-mtp3-cache200] prefill ~523 tok: 180 tok/s
+[stock-mtp3-cache200] prefill ~2023 tok: 503 tok/s
+[stock-mtp3-cache200] prefill ~8023 tok: 2887 tok/s
+Decoding metrics: Mean acceptance length: 2.73, Accepted throughput: 95.70 tokens/s, Drafted throughput: 165.90 tokens/s, Accepted: 957 tokens, Drafted: 1659 tokens, Per-position acceptance rate: 0.796
+Decoding metrics: Mean acceptance length: 2.84, Accepted throughput: 4.60 tokens/s, Drafted throughput: 7.50 tokens/s, Accepted: 46 tokens, Drafted: 75 tokens, Per-position acceptance rate: 0.720, 0.60
