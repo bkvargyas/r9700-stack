@@ -44,6 +44,10 @@ def register() -> None:
         from .linear import fp8_unquant
         if fp8_unquant.patch():
             done.append("fp8_linears")
+    if not _disabled("custom_ar"):
+        from .comm import custom_ar
+        if custom_ar.patch():
+            done.append("custom_ar_gfx12")
     if not _disabled("mtp"):
         from .spec import mtp_rocm
         if mtp_rocm.patch():
