@@ -50,7 +50,7 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         layer._r9k_nk = (N, 2 * Kh)
         logger.info_once("r9700: dense MXFP4 linears on libr9k (weight-only, fp8 activations)")
 
-    def _tables(self, M: int, blk: int, dev):
+    def _tables_unused(self, M: int, blk: int, dev):
         mpad = (M + blk - 1) // blk * blk
         t = self._ids.get((mpad, blk))
         if t is None:
@@ -61,23 +61,10 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         return t
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+        from ..ops import mxfp4_linear
         N, Kd = layer._r9k_nk
-        lead = x.shape[:-1]
-        x2 = x.reshape(-1, Kd)
-        if x2.dtype != torch.bfloat16:
-            x2 = x2.to(torch.bfloat16)
-        x2 = x2.contiguous()
-        M = x2.shape[0]
-        out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
-        if M:
-            xq, xs = K.quant_rows_fp8(x2)
-            MT = 4 if M >= 64 else (2 if M >= 32 else 1)
-            sid, eid, ntpp = self._tables(M, K.MOE_BLOCK * MT, x.device)
-            W = K.Mxfp4Experts(layer.weight, layer.weight_scale, N, Kd)
-            K.moe_gemm(xq, xs, W, out, sid, eid, ntpp, M, 1, None, *K.pick_cfg(N, Kd), num_experts=1, MT=MT)
-        if bias is not None:
-            out = out + bias
-        return out.reshape(*lead, N).to(x.dtype)
+        out = mxfp4_linear(x, layer.weight, layer.weight_scale, N, Kd).to(x.dtype)
+        return out + bias if bias is not None else out
 
 
 _PATCHED = False

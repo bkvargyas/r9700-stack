@@ -24,6 +24,8 @@ def register() -> None:
             return
     except Exception:
         return
+    from . import ops
+    ops.register()
     if not _disabled("compat"):
         from .compat import checkpoint
         if checkpoint.patch():

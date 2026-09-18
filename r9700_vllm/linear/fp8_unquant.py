@@ -60,15 +60,9 @@ def patch() -> bool:
         W = getattr(layer, "_r9k_fp8", None)
         if W is None:
             return orig_apply(self, layer, x, bias)
-        from ..kernels import fp8 as F8, moe as K
-        lead = x.shape[:-1]
-        x2 = x.reshape(-1, W.K)
-        x2 = (x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)).contiguous()
-        q, s = K.quant_rows_fp8(x2)
-        out = F8.gemm_fp8(q, s, W)
-        if bias is not None:
-            out = out + bias
-        return out.reshape(*lead, W.N).to(x.dtype)
+        from ..ops import fp8_linear
+        out = fp8_linear(x, W).to(x.dtype)
+        return out + bias if bias is not None else out
 
     UnquantizedLinearMethod.process_weights_after_loading = process_weights_after_loading
     UnquantizedLinearMethod.apply = apply
