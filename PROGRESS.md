@@ -62,6 +62,16 @@ Bring-up fixes needed (all in the plugin / launcher, no vLLM source patches):
 
 | same + Fable review P0 guards (commit 0f8af02) | 78.1 | | 203.4 | 187.9 | | 98/100 | 3/3 |
 
+Prefill investigation (2026-09-18 pm): warm prefill ~1,550 tok/s @2k, ~2,050 @8k-31k. Profile of a 31k prompt:
+43% of GPU time is expert gathers at ~14.5 GB/s = the Gen3 link. Every 4096-token chunk routes to nearly all 512
+experts/layer, so all ~240 non-resident experts cross PCIe once per chunk. Staging cold experts into VRAM
+(R9K_STAGE_COLD=1, bit-exact, tested) removes duplicate reads but gives no measurable prefill gain; bigger chunks do
+(NBT=8192 + 240 slots: +25% @31k, +11% @8k, -10% @2k, KV only 43k tokens) -> trade-off, not default.
+Real prefill fixes: Gen4 host link (~2x), more VRAM for experts (4 cards), or CPU-side compute of rarely-hit experts.
+BENCH CAVEAT: bench.py runs are single-shot and confounded by compile-cache state (servers that loaded a cached
+AOT graph (140 s startup) ran @4 at ~182 tok/s; fresh-compile starts (~470 s) ran ~118-121 with the same code).
+Need a repeated-run harness before trusting <15% differences.
+
 Launch (defaults now in serve-stock-fn.sh): `MTP=3 P2P=1 ~/serve-stock-fn.sh` then `python3 ~/warmup.py`
 (= OFFLOAD_GB=34, UTIL=0.94, R9K_EXPERT_CACHE_SLOTS=270, fp8 target+draft LM heads). 320 slots leaves no KV room.
 Opt-ins measured and left off: R9K_FP8_BLOCK=rowwise|block (acceptance drop / ~1 ms), R9K_FP8_LINEARS=hyper_connection

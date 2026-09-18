@@ -120,7 +120,7 @@ def _staging(dev, cap: int, shapes) -> dict:
 
 
 def staging_enabled() -> bool:
-    return os.environ.get("R9K_STAGE_COLD", "1") == "1"
+    return os.environ.get("R9K_STAGE_COLD", "0") == "1"   # opt-in: no measured prefill gain (PCIe-bound), decode A/B confounded
 
 
 class LayerCache:
