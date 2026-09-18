@@ -51,15 +51,22 @@ def main():
         r2 = torch.zeros(numel, N2, dtype=torch.bfloat16, device="cuda")
         gemm_pass(xq, xs, ref1, r1, topk_ids, E, None, numel, topk)
         gemm_pass(hq, hs, ref2, r2, topk_ids, E, None, numel, 1, tw)
-        # cached: LRU update, then hot pass over slots + cold pass over host
-        cache.update(topk_ids)
+        # cached: LRU update, then hot pass over slots + cold pass over host (alternate split / fused paths)
         (h1, h2), (c1, c2) = cache.hot(), cache.cold()
         o1 = torch.zeros(numel, N1, dtype=torch.bfloat16, device="cuda")
         o2 = torch.zeros(numel, N2, dtype=torch.bfloat16, device="cuda")
-        gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk)
-        gemm_pass(xq, xs, c1, o1, topk_ids, E, cache.map_cold, numel, topk)
-        gemm_pass(hq, hs, h2, o2, topk_ids, E, cache.table, numel, 1, tw)
-        gemm_pass(hq, hs, c2, o2, topk_ids, E, cache.map_cold, numel, 1, tw)
+        if step % 2:
+            (sh, eh, nh), (sc, ec, nc) = cache.update_fused(topk_ids, K.MOE_BLOCK)
+            for W, o, a, d, t in ((h1, o1, (xq, xs), topk, None), (h2, o2, (hq, hs), 1, tw)):
+                K.moe_gemm(a[0], a[1], W, o, sh, eh, nh, numel, d, t, num_experts=E)
+            for W, o, a, d, t in ((c1, o1, (xq, xs), topk, None), (c2, o2, (hq, hs), 1, tw)):
+                K.moe_gemm(a[0], a[1], W, o, sc, ec, nc, numel, d, t, num_experts=E)
+        else:
+            cache.update(topk_ids)
+            gemm_pass(xq, xs, h1, o1, topk_ids, E, cache.table, numel, topk)
+            gemm_pass(xq, xs, c1, o1, topk_ids, E, cache.map_cold, numel, topk)
+            gemm_pass(hq, hs, h2, o2, topk_ids, E, cache.table, numel, 1, tw)
+            gemm_pass(hq, hs, c2, o2, topk_ids, E, cache.map_cold, numel, 1, tw)
         torch.cuda.synchronize()
         same = torch.equal(o1, r1) and torch.equal(o2, r2)
         # invariants: table/map_cold complementary; slot_expert bijective with table

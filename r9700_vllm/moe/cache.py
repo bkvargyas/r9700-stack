@@ -38,6 +38,10 @@ def _L():
         L.r4d_lru_manage.restype = ctypes.c_int
         L.r4d_lru_manage.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                      ctypes.c_int] + [ctypes.c_void_p] * 8 + [ctypes.c_void_p]
+        L.r4d_lru_fused.restype = ctypes.c_int
+        L.r4d_lru_fused.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                    ctypes.c_int] + [ctypes.c_void_p] * 8 + [ctypes.c_int] * 3 + \
+            [ctypes.c_void_p] * 6 + [ctypes.c_void_p]
         L.r4d_lru_gather.restype = ctypes.c_int
         L.r4d_lru_gather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long] * 6 + \
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
@@ -132,6 +136,8 @@ class LayerCache:
         self.max_distinct = int(S * float(os.environ.get("R9K_LRU_THRESH", "0.5")))
         self.miss = torch.full((max(1, self.max_inserts), 2), -1, **i32)
         self.n_miss = torch.zeros((1,), **i32)
+        self.fused = os.environ.get("R9K_LRU_FUSED", "1") == "1" and E <= 1024
+        self._align: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
         g = os.environ.get("R9K_LRU_GATHER", "8,16").split(",")
         self.chunks, self.lanes = int(g[0]), int(g[1])
         self._warm_start()
@@ -188,6 +194,41 @@ class LayerCache:
         if rc:
             raise RuntimeError(f"r4d_lru_manage failed ({rc})")
         self._gather()
+
+    def _align_bufs(self, mk: int, bs: int):
+        """Persistent align outputs for (mk, bs), sized exactly as vLLM's moe_align_block_size would."""
+        key = (mk, bs)
+        b = self._align.get(key)
+        if b is None:
+            E = self.E
+            L = min(mk * bs, mk + E * (bs - 1)) if mk < E else mk + E * (bs - 1)
+            NB = (L + bs - 1) // bs
+            dev = self.table.device
+            i32 = dict(dtype=torch.int32, device=dev)
+            b = (L, NB, torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32),
+                 torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32))
+            self._align[key] = b
+        return b
+
+    def update_fused(self, topk_ids: torch.Tensor, bs: int):
+        """LRU manage + both moe_align outputs (hot over slots, cold over host) in one launch, then gather.
+        Returns ((sorted, eids, npad) hot, (sorted, eids, npad) cold)."""
+        ids = topk_ids.reshape(-1)
+        if ids.dtype != torch.int32:
+            ids = ids.to(torch.int32)
+        mk = ids.numel()
+        L, NB, sh, eh, nh, sc, ec, nc = self._align_bufs(mk, bs)
+        st = torch.cuda.current_stream().cuda_stream
+        rc = _L().r4d_lru_fused(ids.data_ptr(), mk, self.E, self.S, self.max_distinct, self.max_inserts,
+                                self.table.data_ptr(), self.map_cold.data_ptr(), self.slot_expert.data_ptr(),
+                                self.slot_stamp.data_ptr(), self.routed.data_ptr(), self.step.data_ptr(),
+                                self.miss.data_ptr(), self.n_miss.data_ptr(), bs, L, NB,
+                                sh.data_ptr(), eh.data_ptr(), nh.data_ptr(), sc.data_ptr(), ec.data_ptr(),
+                                nc.data_ptr(), st)
+        if rc:
+            raise RuntimeError(f"r4d_lru_fused failed ({rc})")
+        self._gather()
+        return (sh, eh, nh), (sc, ec, nc)
 
     def hot(self):
         return K.Mxfp4Experts(self.a_w13, self.a_s13, self.N1, self.K1), K.Mxfp4Experts(self.a_w2, self.a_s2, self.N2, self.K2)

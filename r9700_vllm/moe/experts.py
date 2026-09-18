@@ -124,10 +124,15 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
                        moe_align_block_size(topk_ids, blk, global_num_experts, expert_map))]
         else:
             assert expert_map is None, "r9k expert cache: expert parallelism not supported"
-            cache.update(topk_ids)          # LRU manage + gather misses host -> VRAM slots
             (h1, h2), (c1, c2) = cache.hot(), cache.cold()
-            passes = [(h1, h2, moe_align_block_size(topk_ids, blk, global_num_experts, cache.table)),
-                      (c1, c2, moe_align_block_size(topk_ids, blk, global_num_experts, cache.map_cold))]
+            if cache.fused:
+                # one launch: LRU manage + align over slots + align over host, then gather misses
+                hot_al, cold_al = cache.update_fused(topk_ids, blk)
+            else:
+                cache.update(topk_ids)          # LRU manage + gather misses host -> VRAM slots
+                hot_al = moe_align_block_size(topk_ids, blk, global_num_experts, cache.table)
+                cold_al = moe_align_block_size(topk_ids, blk, global_num_experts, cache.map_cold)
+            passes = [(h1, h2, hot_al), (c1, c2, cold_al)]
 
         xq, xs = K.quant_rows_fp8(hidden_states)
         gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
