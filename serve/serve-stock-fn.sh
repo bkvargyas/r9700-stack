@@ -6,9 +6,16 @@
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
 SDKLIB=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib
-RCCL=$HOME/rccl10/librccl-p2p.so.1.0
-MNT=(-v $REPO:/opt/r9700)
-[ "${P2P:-1}" = 1 ] && MNT+=(-v $RCCL:$SDKLIB/librccl.so.1:ro -e NCCL_PROTO=Simple) || MNT+=(-e NCCL_P2P_DISABLE=1)
+VLIB=/usr/local/lib/python3.12/dist-packages/vllm
+# Hostcall-free RCCL built IN this image (rccl/build-nightly.sh) + hostcall-metadata-patched copies of vLLM's
+# _rocm_C / _C_stable_libtorch (p2p/scanhc.sh finds them). Required on the emulated-switch VM topology, where any
+# kernel requesting hidden_hostcall_buffer fails with hipErrorIllegalState (PCIe atomics are dropped).
+RCCL=${RCCL:-$HOME/rccl10/rocm-systems/projects/rccl/build-nightly/librccl.so.1.0}
+PATCHED=${PATCHED:-$HOME/p2p-patched-nightly}
+MNT=(-v $REPO:/opt/r9700 -v $RCCL:$SDKLIB/librccl.so.1:ro)
+[ -d "$PATCHED" ] && MNT+=(-v $PATCHED/_rocm_C.abi3.so:$VLIB/_rocm_C.abi3.so:ro
+                           -v $PATCHED/_C_stable_libtorch.abi3.so:$VLIB/_C_stable_libtorch.abi3.so:ro)
+[ "${P2P:-1}" = 1 ] && MNT+=(-e NCCL_PROTO=Simple) || MNT+=(-e NCCL_P2P_DISABLE=1)
 # (re)build libr9k.so into the mounted repo when missing or older than any kernel source
 SO=$REPO/r9700_vllm/kernels/libr9k.so
 if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
