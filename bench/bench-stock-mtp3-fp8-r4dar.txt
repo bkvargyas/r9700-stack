@@ -1,0 +1,10 @@
+[stock-mtp3-fp8-r4dar] single-stream decode: 68.0 tok/s
+[stock-mtp3-fp8-r4dar] aggregate @4 concurrent: 105.8 tok/s (4 ok)
+[stock-mtp3-fp8-r4dar] aggregate @8 concurrent: 139.5 tok/s (8 ok)
+[stock-mtp3-fp8-r4dar] aggregate @16 concurrent: 139.6 tok/s (16 ok)
+[stock-mtp3-fp8-r4dar] prefill ~523 tok: 170 tok/s
+[stock-mtp3-fp8-r4dar] prefill ~2023 tok: 487 tok/s
+[stock-mtp3-fp8-r4dar] prefill ~8023 tok: 2807 tok/s
+conc 1: median ITL 35.3 ms, p90 42.3 ms
+conc 4: median ITL 55.6 ms, p90 66.9 ms
+Decoding metrics: Mean acceptance length: 2.97, Accepted throughput: 20.10 tokens/s, Drafted throughp
