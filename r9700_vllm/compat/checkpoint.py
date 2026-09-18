@@ -4,6 +4,7 @@
   checkpoints declare ``format: mxfp4-pack-quantized`` globally while their FP8-block groups (attention, GDN
   projections, MTP experts) carry no format, so stock dispatch looks for MXFP4 schemes and fails
   ("No compressed-tensors compatible scheme"). We set ``float-quantized`` on format-less 8-bit float groups.
+- Renames ``*.weight_scale_inv`` -> ``*.weight_scale`` (fork stores CT FP8-block scales DeepSeek-style).
 - Drops ``self_attn.q_scale`` (fork's fp8-attention query scales; no stock slot).
 - Drops ``mtp.lm_head.weight_q4 / weight_scale / weight_zero`` (the fork's private 4-bit draft head): stock remaps
   them to ``model.lm_head.*`` which the MTP predictor does not have, failing the load. The MTP head then loads
@@ -23,6 +24,12 @@ _PATCHED = False
 _DROP = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 # fork-calibrated query scales for its fp8 attention path; stock QSA has no slot for them (k/v scales map fine)
 _DROP_MAIN = re.compile(r"\.self_attn\.(attn\.)?[qkv]_scale$")   # bf16 KV: all unused (fp8-KV work will need k/v)
+
+
+def _rename_scale(name: str) -> str:
+    """DeepSeek-style block-FP8 scale names (``weight_scale_inv`` = dequant multiplier, same values/shape as
+    compressed-tensors' ``weight_scale``) -> the name the stock CT FP8 schemes register."""
+    return name[: -len("_inv")] if name.endswith(".weight_scale_inv") else name
 
 
 def _fix_ct_formats() -> bool:
@@ -102,7 +109,7 @@ def patch() -> bool:
                 if _DROP.search(name):
                     dropped.append(name)
                     continue
-                yield name, w
+                yield _rename_scale(name), w
 
         out = orig(self, filt())
         if dropped:
@@ -123,12 +130,14 @@ def patch() -> bool:
                 for n, w in weights:
                     if _DROP_MAIN.search(n):
                         continue
+                    n = _rename_scale(n)
                     last[:] = [n]
                     yield n, w
             try:
                 return morig(self, gen())
-            except ValueError as e:
-                raise ValueError(f"{e} [r9700: last checkpoint tensor fed: {last[:1]}]") from None
+            except Exception as e:
+                logger.error("r9700: weight load failed at checkpoint tensor %s: %s", last[:1], e)
+                raise
 
         mcls.load_weights = model_load_weights
     except Exception as e:
