@@ -26,6 +26,8 @@ def lib() -> ctypes.CDLL:
         L = ctypes.CDLL(path)
         L.r9k_moe_mxfp4a8.restype = ctypes.c_int
         L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
+        L.r9k_moe_nvfp4a8.restype = ctypes.c_int
+        L.r9k_moe_nvfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
@@ -49,6 +51,27 @@ class Mxfp4Experts:
     @property
     def estride(self) -> int:
         return (self.K // GROUP + 1) * self.N
+
+
+@dataclass
+class Nvfp4Experts:
+    """Native NVFP4 (e2m1 + e4m3 scale per 16 + fp32 global per row), same fragment-order codes as MXFP4."""
+    wq: torch.Tensor    # [E, N/16 * K/16 * 32] int32, fragment order
+    ws: torch.Tensor    # [E, K/16, N] uint8 (e4m3 bits), K-step-major
+    wg: torch.Tensor    # [E, N] fp32 per-row global multiplier (1 / CT's stored divisor)
+    N: int
+    K: int
+
+
+def prepare_nvfp4_weights(packed: torch.Tensor, scale16: torch.Tensor, row_mult: torch.Tensor) -> Nvfp4Experts:
+    """packed [E, N, K/2] u8, scale16 [E, N, K/16] e4m3, row_mult [E, N] fp32 -> Nvfp4Experts."""
+    E, N, Kh = packed.shape
+    K = Kh * 2
+    assert N % 16 == 0 and K % 16 == 0, (N, K)
+    assert scale16.shape == (E, N, K // 16), (scale16.shape, (E, N, K // 16))
+    ws = scale16.view(torch.uint8).transpose(1, 2).contiguous()
+    return Nvfp4Experts(permute_fragments(packed.view(torch.uint8)), ws,
+                        row_mult.float().reshape(E, N).contiguous(), N, K)
 
 
 def permute_fragments(packed: torch.Tensor) -> torch.Tensor:
@@ -122,6 +145,15 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     E = num_experts if num_experts is not None else w.wq.shape[0]
     blk = MOE_BLOCK * MT
     max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+    if isinstance(w, Nvfp4Experts):
+        rc = lib().r9k_moe_nvfp4a8(
+            a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.ws.data_ptr(), w.wg.data_ptr(), out.data_ptr(),
+            sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+            topk_w.data_ptr() if topk_w is not None else 0,
+            (w.K // 16) * w.N, w.N, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, MT, _stream())
+        if rc:
+            raise RuntimeError(f"r9k_moe_nvfp4a8 failed ({rc}) N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW} MT={MT}")
+        return out
     rc = lib().r9k_moe_mxfp4a8(
         a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
         w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
@@ -133,11 +165,11 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     return out
 
 
-def pick_cfg(N: int, K: int) -> tuple[int, int, int]:
-    """A legal (WV, SK, NPW) for any N % 16 == 0, K % 32 == 0: deep split-K for long K (weight streaming with few
+def pick_cfg(N: int, K: int, group: int = GROUP) -> tuple[int, int, int]:
+    """A legal (WV, SK, NPW) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
     N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320."""
     for WV, SK, NPW in ((2, 4, 2), (4, 2, 1), (2, 5, 2), (4, 1, 1)):
-        if K % (SK * GROUP) == 0 and (K >= 1024 or SK <= 2):
+        if K % (SK * group) == 0 and (K >= 1024 or SK <= 2):
             return WV, SK, NPW
     return 4, 1, 1
 

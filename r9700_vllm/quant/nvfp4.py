@@ -11,7 +11,10 @@ per tensor (per partition for fused qkv / gate_up). Conversion per 32-group:
                   keeping whichever has the lower squared error for that group.
 
 This is lossy (two 16-groups share one power-of-two scale, values are re-rounded) -- roughly the error of an
-RTN-MXFP4 quantization of the original weights, not better. Gate it with bench/quality.py per checkpoint.
+RTN-MXFP4 quantization of the original weights, not better (measured: relative weight error ~1.55x NVFP4's own).
+Dense linears therefore default to the NATIVE path (R9K_NVFP4=native): libr9k's NVFP4 kernel variant keeps the
+checkpoint bits exact. R9K_NVFP4=mxfp4 selects the conversion. MoE layers always convert for now (the expert
+cache moves MXFP4-layout scales).
 The NVFP4 activation scales (input_global_scale, W4A4 mode) are dropped: activations run in fp8 per row, as for
 MXFP4 checkpoints. Disable with R9K_DISABLE=nvfp4 (stock emulation for linears; NVFP4 MoE then fails on ROCm).
 """
@@ -43,7 +46,7 @@ def _encode(v: torch.Tensor, mid: torch.Tensor) -> torch.Tensor:
     return torch.bucketize(v.abs(), mid).to(torch.uint8) | ((v < 0).to(torch.uint8) << 3)
 
 
-def quantize_mxfp4_search(w: torch.Tensor):
+def quantize_mxfp4_search(w: torch.Tensor, candidates=(0, -1)):
     """fp32 [N, K] (K % 32 == 0) -> (packed [N, K/2] u8, e8m0 [N, K/32] u8), per-group best of {e, e-1}."""
     N, K = w.shape
     mid, lut = _MID.to(w.device), _E2M1.to(w.device)
@@ -51,7 +54,8 @@ def quantize_mxfp4_search(w: torch.Tensor):
     amax = x.abs().amax(-1, keepdim=True).clamp_min(2.0 ** -126)
     e0 = torch.ceil(torch.log2(amax / 6.0)).clamp(-126, 127)
     best_c, best_e, best_err = None, None, None
-    for e in (e0, (e0 - 1).clamp(-127, 127)):
+    for d in candidates:
+        e = (e0 + d).clamp(-127, 127)
         s = torch.exp2(e)
         c = _encode(x / s, mid)
         err = ((lut[c.long()] * s - x) ** 2).sum(-1, keepdim=True)
@@ -112,6 +116,40 @@ def make_dense_scheme_cls(base):
             return self.kernel.apply_weights(layer, x, bias)
 
     return R9kNvfp4AsMxfp4
+
+
+def make_native_dense_scheme_cls(base):
+    """Subclass of stock CompressedTensorsW4A4Fp4 served by libr9k's native NVFP4 kernel (R9K_NVFP4=native, the
+    default for dense linears): the checkpoint's e2m1 codes + e4m3 per-16 scales are kept bit-exact (fragment
+    permute + scale transpose only), the per-partition global scale becomes a per-row fp32 multiplier. Activations
+    run in fp8 per row (more precise than the checkpoint's NVFP4 activation quantization, which is dropped)."""
+    from ..kernels import moe as KM
+
+    class R9kNvfp4Native(base):
+
+        def process_weights_after_loading(self, layer) -> None:
+            w, s16 = layer.weight_packed.data, layer.weight_scale.data
+            N, Kh = w.shape
+            if N % 16 or (2 * Kh) % 16:
+                raise ValueError(f"r9700 native NVFP4: unsupported shape N={N} K={2 * Kh}")
+            mult = 1.0 / _row_div(layer.weight_global_scale.data, list(layer.logical_widths))
+            W = KM.prepare_nvfp4_weights(w[None], s16[None], mult[None].to(w.device))
+            for n in ("weight_packed", "weight_global_scale", "input_global_scale", "weight_scale"):
+                if hasattr(layer, n):
+                    delattr(layer, n)
+            layer.weight = Parameter(W.wq, requires_grad=False)
+            layer.weight_scale = Parameter(W.ws, requires_grad=False)
+            layer.weight_row_mult = Parameter(W.wg, requires_grad=False)
+            layer._r9k_nk = (N, 2 * Kh)
+            logger.info_once("r9700: NVFP4 linears on libr9k native NVFP4 kernel (exact weights, fp8 activations)")
+
+        def apply_weights(self, layer, x, bias=None):
+            from .. import ops
+            N, Kd = layer._r9k_nk
+            out = ops.nvfp4_linear(x, layer.weight, layer.weight_scale, layer.weight_row_mult, N, Kd).to(x.dtype)
+            return out + bias if bias is not None else out
+
+    return R9kNvfp4Native
 
 
 # -------------------------------------------------------------------------------------------------- MoE

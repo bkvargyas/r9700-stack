@@ -60,7 +60,20 @@ __device__ __forceinline__ v2i mxfp4_unpack8(unsigned int wv, int dsh) {
   return out;
 }
 
-template <int MT, int NPW>
+// OCP e4m3fn byte -> fp32 (NVFP4 per-16 scales; always finite, NaN 0x7f never produced by quantizers).
+__device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
+  const unsigned int em = b & 0x7Fu;
+  const float mag = em >= 0x08u ? __uint_as_float((em + (120u << 3)) << 20) : (float)em * 0x1p-9f;
+  return (b & 0x80u) ? -mag : mag;
+}
+
+// NV = false: OCP MXFP4 (E8M0 per 32, folded into the e4m3 exponent -- exact, no extra math).
+// NV = true:  NVFP4 (e4m3 scale per 16 = exactly one WMMA K step): the WMMA runs on the unscaled e2m1 values
+//             (kMag[0]) and its 16x16 partial is scaled into the accumulator -- in the WMMA C layout each lane
+//             holds 8 rows of ONE output column n, so the per-(n, kstep) scale is one scalar per lane: 8 FMAs per
+//             WMMA, exact NVFP4 weight math. Ws = e4m3 [K/16][N] per expert, Wref = fp32 per-row global
+//             multiplier [N] per expert (wref_estride in floats), applied in the epilogue.
+template <int MT, int NPW, bool NV>
 __global__ void r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
@@ -86,7 +99,8 @@ __global__ void r9k_moe_mxfp4a8_kernel(
 
   const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
   const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
-  const unsigned char* __restrict__ Wref = Wref_all + (size_t)e * wref_estride;
+  const unsigned char* __restrict__ Wref = NV ? nullptr : Wref_all + (size_t)e * wref_estride;
+  const float* __restrict__ Wg = NV ? (const float*)Wref_all + (size_t)e * wref_estride : nullptr;
 
   // This lane's A row in each M tile: the sorted flat index, clamped to the block's first row (always valid
   // for a live block) for padding entries.
@@ -114,7 +128,7 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     const int t = nt0 + j;
     wtile[j] = t < ntmax ? t : ntmax;
     wrow[j] = wtile[j] * 16 + nlane;
-    wref[j] = Wref[wrow[j]];
+    wref[j] = NV ? 0 : Wref[wrow[j]];
   }
 
   for (int k = 0; k < Ks; k += 16) {
@@ -131,12 +145,22 @@ __global__ void r9k_moe_mxfp4a8_kernel(
 #pragma unroll
     for (int j = 0; j < NPW; j++) {
       const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
-      int dsh = (int)wref[j] - (int)Ws[(size_t)blk * N + wrow[j]];
-      dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
-      const v2i wf = mxfp4_unpack8(wv, dsh);
+      if constexpr (NV) {
+        const v2i wf = mxfp4_unpack8(wv, 0);
+        const float sc = e4m3_to_f32(Ws[(size_t)kstep * N + wrow[j]]);
 #pragma unroll
-      for (int i = 0; i < MT; i++)
-        acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
+        for (int i = 0; i < MT; i++) {
+          const v8f t = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, (v8f)(0.f));
+          acc[j][i] += t * sc;
+        }
+      } else {
+        int dsh = (int)wref[j] - (int)Ws[(size_t)blk * N + wrow[j]];
+        dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
+        const v2i wf = mxfp4_unpack8(wv, dsh);
+#pragma unroll
+        for (int i = 0; i < MT; i++)
+          acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
+      }
     }
   }
 
@@ -161,7 +185,7 @@ __global__ void r9k_moe_mxfp4a8_kernel(
       if (fr >= numel) continue;                                  // padding row
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      float sc = __int_as_float((int)Wref[n] << 23) * As[fr / a_row_div];
+      float sc = (NV ? Wg[n] : __int_as_float((int)Wref[n] << 23)) * As[fr / a_row_div];
       if (topk_w) sc *= topk_w[fr];
       C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
     }
@@ -240,25 +264,24 @@ extern "C" int r9k_silu_mul_quant_fp8(long gu, long q, long s, int M, int I, lon
 
 extern "C" int r9k_moe_block(void) { return MOE_BLOCK; }   // rows per M tile; routing block = 16*MT
 
-// Returns 0 on success, negative on a shape error (the Python side raises).
-extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, long c,
-                               long sorted_ids, long expert_ids, long ntpp, long topk_w,
-                               long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div, int K, int N,
-                               int WV, int SK, int NPW, int MT, long stream) {
+static int moe_launch(bool nv, long a, long as, long wq, long ws, long wref, long c, long sorted_ids,
+                      long expert_ids, long ntpp, long topk_w, long ws_estride, long wref_estride, int max_blocks,
+                      int numel, int a_row_div, int K, int N, int WV, int SK, int NPW, int MT, long stream) {
   if (N % 16) return -1;
-  if (K % (SK * GROUP)) return -2;
+  if (K % (SK * (nv ? 16 : GROUP))) return -2;
   if (WV * SK * WAVE32 > 1024) return -3;
   const int ncols = WV * NPW;
   const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
   if (smem > 64 * 1024) return -4;
   dim3 grid((N / 16 + ncols - 1) / ncols, max_blocks), block(WV * SK * WAVE32);
   hipStream_t st = (hipStream_t)stream;
-#define L(MTv, NP) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP>), grid, block, smem, st,     \
+#define L(MTv, NP, NVv) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP, NVv>), grid, block, smem, st, \
       (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws, \
       (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids,                        \
       (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel,  \
       a_row_div, K, N, WV, SK)
-#define LM(MTv) switch (NPW) { case 1: L(MTv, 1); break; case 2: L(MTv, 2); break; case 4: L(MTv, 4); break; \
+#define LN(MTv, NP) do { if (nv) L(MTv, NP, true); else L(MTv, NP, false); } while (0)
+#define LM(MTv) switch (NPW) { case 1: LN(MTv, 1); break; case 2: LN(MTv, 2); break; case 4: LN(MTv, 4); break; \
                                default: return -5; }
   switch (MT) {
     case 1: LM(1); break;
@@ -267,8 +290,28 @@ extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, lon
     default: return -7;
   }
 #undef LM
+#undef LN
 #undef L
   return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Returns 0 on success, negative on a shape error (the Python side raises).
+extern "C" int r9k_moe_mxfp4a8(long a, long as, long wq, long ws, long wref, long c,
+                               long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                               long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div, int K, int N,
+                               int WV, int SK, int NPW, int MT, long stream) {
+  return moe_launch(false, a, as, wq, ws, wref, c, sorted_ids, expert_ids, ntpp, topk_w, ws_estride, wref_estride,
+                    max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream);
+}
+
+// NVFP4 weights: ws = e4m3 [E][K/16][N] (ws_estride bytes), wref = fp32 per-row global multiplier [E][N]
+// (wref_estride floats). Shape rule K % (SK*16) == 0.
+extern "C" int r9k_moe_nvfp4a8(long a, long as, long wq, long ws, long wg, long c,
+                               long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                               long ws_estride, long wg_estride, int max_blocks, int numel, int a_row_div, int K, int N,
+                               int WV, int SK, int NPW, int MT, long stream) {
+  return moe_launch(true, a, as, wq, ws, wg, c, sorted_ids, expert_ids, ntpp, topk_w, ws_estride, wg_estride,
+                    max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream);
 }
 
 extern "C" int r9k_quant_rows_fp8(long x, long q, long s, int M, int K, int ld, long stream) {

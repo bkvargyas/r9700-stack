@@ -13,6 +13,8 @@ changes what it hands out per layer, and only on ROCm gfx12 with libr9k availabl
     dequant emulation).
   * NVFP4 dense / MoE -> converted to MXFP4 at load, then the same libr9k paths (quant/nvfp4.py; stock ROCm has
     only NVFP4 emulation for linears and no NVFP4 MoE backend). R9K_DISABLE=nvfp4 opts out.
+  * per-channel fp8 + dynamic per-token activations -> `R9kW8A8Fp8` channel mode (exact, libr9k fp8 GEMM;
+    stock ROCm -> torch._scaled_mm). R9K_DISABLE=fp8_channel opts out.
   * opt-in R9K_FP8_BLOCK=block|rowwise: block-fp8 schemes -> `R9kW8A8Fp8` (libr9k split-K fp8 GEMM).
   * opt-in R9K_FP8_LINEARS=<regex>: matching unquantized linears -> `R9kFp8UnquantMethod`.
 Everything else is exactly the stock object.
@@ -93,8 +95,12 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
 
 # ------------------------------------------------------------------------------------------------ fp8 block
 class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
-    """Block-fp8 linears on libr9k's split-K fp8 GEMM. mode 'block' = exact block math (same bytes + scales,
-    fragment order); 'rowwise' = requantized per output row (faster to set up, lossier)."""
+    """fp8 linears on libr9k's split-K fp8 GEMMs.
+    mode 'channel' (default for per-channel weights + dynamic per-token activations): exact -- the checkpoint's
+      e4m3 bytes (fragment order) and per-row scales, r9k_gemm_fp8 (stock ROCm picks torch._scaled_mm, slow at
+      decode batch sizes);
+    mode 'block' (opt-in R9K_FP8_BLOCK=block): exact block math (same bytes + scales, fragment order);
+    mode 'rowwise' (opt-in R9K_FP8_BLOCK=rowwise): block weights requantized per output row (lossier)."""
 
     r9k_mode = "block"
 
@@ -102,6 +108,19 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         from ..kernels import fp8 as F8
         from compressed_tensors.quantization import QuantizationStrategy
         w, bs = layer.weight.data, layer.weight_scale.data
+        if self.r9k_mode == "channel":
+            if (self.strategy != QuantizationStrategy.CHANNEL or w.dim() != 2 or w.shape[0] % 16
+                    or w.shape[1] % 16 or w.dtype != torch.float8_e4m3fn):
+                return super().process_weights_after_loading(layer)
+            N, Kd = w.shape
+            layer._r9k_fp8 = F8.Fp8Weight(F8.permute_fp8(w.view(torch.uint8)), bs.float().reshape(-1).contiguous(),
+                                          N, Kd)
+            dev = w.device
+            layer.weight = Parameter(torch.empty((0,), dtype=w.dtype, device=dev), requires_grad=False)
+            layer.weight_scale = Parameter(torch.empty((0,), dtype=torch.float32, device=dev), requires_grad=False)
+            layer.input_scale = None
+            logger.info_once("r9700: per-channel fp8 linears -> libr9k fp8 GEMM (exact weights, per-token fp8 act)")
+            return
         blk = tuple(getattr(layer, "weight_block_size", None) or (128, 128))
         if (self.strategy != QuantizationStrategy.BLOCK or w.dim() != 2 or w.shape[0] % 16 or w.shape[1] % 16
                 or (self.r9k_mode == "block" and (blk != (128, 128) or w.shape[1] % 128))):
@@ -189,9 +208,16 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         elif isinstance(scheme, CompressedTensorsW4A4Fp4) and not _off("nvfp4"):
             from ..linear.mxfp4 import R9700Mxfp4LinearKernel
             from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
-            from .nvfp4 import make_dense_scheme_cls
-            scheme.__class__ = _cached(make_dense_scheme_cls, CompressedTensorsW4A4Fp4)   # this instance only
+            from .nvfp4 import make_dense_scheme_cls, make_native_dense_scheme_cls
+            if (_mode("R9K_NVFP4") or "native") == "native":
+                scheme.__class__ = _cached(make_native_dense_scheme_cls, CompressedTensorsW4A4Fp4)
+            else:
+                scheme.__class__ = _cached(make_dense_scheme_cls, CompressedTensorsW4A4Fp4)   # this instance only
             scheme.kernel = R9700Mxfp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=None))
+        elif isinstance(scheme, CompressedTensorsW8A8Fp8) and not _off("fp8_channel") \
+                and _strategy(scheme) == "channel" and not scheme.is_static_input_scheme:
+            scheme.__class__ = R9kW8A8Fp8                        # this instance only
+            scheme.r9k_mode = "channel"
         elif isinstance(scheme, CompressedTensorsW8A8Fp8) and _mode("R9K_FP8_BLOCK") in ("block", "rowwise"):
             scheme.__class__ = R9kW8A8Fp8                        # this instance only
             scheme.r9k_mode = _mode("R9K_FP8_BLOCK")
@@ -220,6 +246,11 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         self._add_fused_moe_to_target_scheme_map()
         sd = self.get_scheme_dict(layer, (prefix or "") + ".0.gate_proj")
         return bool(sd) and self._is_nvfp4_format(sd.get("weights"))
+
+
+def _strategy(scheme) -> str:
+    st = getattr(scheme, "strategy", "")
+    return str(getattr(st, "value", st)).lower()
 
 
 _CLS_CACHE: dict = {}

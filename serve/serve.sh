@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next GPTQ on STOCK vLLM (ROCm 10 nightly image) + the r9700_vllm plugin, 2x R9700 TP2.
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
-# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
+# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -26,7 +26,9 @@ if [ ! -f $SO ] || [ -n "$(find $REPO/kernels -name '*.hip' -newer $SO)" ]; then
 fi
 # torch.compile/AOT cache per plugin configuration: vLLM's cache key does not see R9K_* knobs, and a graph traced
 # with different weight layouts fails at runtime ("wrong number of dimensions").
-CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}") | md5sum | cut -c1-10)
+# The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
+PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
+CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC} $PSRC") | md5sum | cut -c1-10)
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
@@ -48,7 +50,12 @@ fi
 [ "${PROF:-0}" = 1 ] && { mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
   ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
 MTP=${MTP-3}
-[ -n "$MTP" ] && ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
+# DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP
+if [ -n "$DRAFT" ]; then
+  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}}")
+elif [ -n "$MTP" ]; then
+  ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
+fi
 sudo docker rm -f vllmstock 2>/dev/null
 sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \

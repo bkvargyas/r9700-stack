@@ -85,6 +85,23 @@ that gain is the fp8 LM heads alone. With fp8 HC + row-wise fp8 block projection
 acceptance 2.64 (vs ~3.0) -> worse; being A/B'd separately.
 Correction: the earlier "P2P gives nothing" A/B was flawed (tcclaviger's r4d AR kept using P2P IPC in both arms).
 
+### 2026-09-18 afternoon: extension points, overlay split, harness, NVFP4
+- **Plugin on official extension points** (a529442): `R9kCompressedTensorsConfig` registered over
+  "compressed-tensors"; `ModelRegistry` subclasses for Qwen4Exp CG/CausalLM/MTP; `R9700Platform` via
+  `vllm.platform_plugins` -> `R9kCommunicator` (libr4d AR). One class patch left (MTP allowlist, version-gated).
+  `tests/test_integration.py` covers every hook. Gate (MTP-3, TP2): 203.9 tok/s @8, 189.0 @16, prefill 8k 2727 tok/s,
+  GSM8K 98/100, needle 3/3 -- parity with pre-refactor.
+- **Overlay split** (cbffc52): `overlay/emulated-switch/` (hostcall-free RCCL, vLLM .so hostcall patcher, scanners),
+  `serve/serve.sh` stock by default, `OVERLAYS=emulated-switch` on VM100. MTP=3 now the default.
+- **Harness**: `bench/harness.py` (nonce prompts, streamed TTFT vs decode, repeats -> median/spread) + `bench/ab.sh`
+  (interleaved A/B with restarts).
+- **NVFP4**: (a) load-time NVFP4->MXFP4 conversion (dense + MoE; exact dequant, 2-candidate E8M0 search). Weight error
+  sits at the double-rounding floor, ~1.55x NVFP4's own (synthetic: 0.095 -> 0.149). Qwen3.8-27B-NVFP4: GSM8K-200
+  96.5% (GGZ14's conversion run on 09-16: 97.0%), decode 29.7 tok/s, 8-conc 210.7 tok/s.
+  (b) native NVFP4 kernel variant (`r9k_moe_nvfp4a8`, template NV): WMMA on unscaled e2m1, per-(row, 16-K) e4m3 scale
+  applied to the partial (8 FMAs/WMMA), per-row global in the epilogue -- exact weights; default for dense NVFP4
+  (`R9K_NVFP4=native|mxfp4`). NVFP4 MoE layers still convert (expert cache carries MXFP4-layout scales).
+
 ### Next
 1. Unit tests on GPU; VM100 RAM 128 -> 256 GB (host has 364 GB free) so experts (70 GB) + PLE (42 GB) fit pinned.
 2. Stock + plugin bring-up (eager), correctness (GSM8K subset, needle), then cudagraphs + MTP.
