@@ -1,0 +1,8 @@
+[base] warming up...
+[base] single-stream decode: 82.5 tok/s
+[base] aggregate @4 concurrent: 81.1 tok/s (4 ok)
+[base] aggregate @8 concurrent: 146.4 tok/s (8 ok)
+[base] aggregate @16 concurrent: 145.6 tok/s (16 ok)
+[base] prefill ~523 tok: 654 tok/s
+[base] prefill ~2023 tok: 2542 tok/s
+[base] prefill ~8023 tok: 4131 tok/s

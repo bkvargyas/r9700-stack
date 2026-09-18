@@ -1,0 +1,8 @@
+[no_r4d_ple] warming up...
+[no_r4d_ple] single-stream decode: 78.2 tok/s
+[no_r4d_ple] aggregate @4 concurrent: 80.4 tok/s (4 ok)
+[no_r4d_ple] aggregate @8 concurrent: 145.1 tok/s (8 ok)
+[no_r4d_ple] aggregate @16 concurrent: 147.0 tok/s (16 ok)
+[no_r4d_ple] prefill ~523 tok: 658 tok/s
+[no_r4d_ple] prefill ~2023 tok: 2654 tok/s
+[no_r4d_ple] prefill ~8023 tok: 4115 tok/s

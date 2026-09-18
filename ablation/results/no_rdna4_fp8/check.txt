@@ -1,0 +1,7 @@
+PASS 'What is 347*29? Reply with only the numb' -> '10063'
+PASS 'What is the capital of Australia? One wo' -> 'Canberra'
+FAIL 'Spell the word strawberry backwards. Rep' -> 'yrwarts'
+PASS 'Sort these numbers ascending, comma sepa' -> '3, 7, 19, 42, 88'
+PASS 'Write a Python function fib(n) returning' -> '```python\ndef fib(n):\n    if n <= 0:\n        return 0\n    if n == 1:\n        return 1\n    a, b = 0, 1\n    for _ in range(2, n + 1):\n        a, b = b, a + b\n    '
+PASS "How many r's are in 'strawberry'? Reply " -> '3'
+CHECKS 5/6

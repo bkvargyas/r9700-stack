@@ -1,0 +1,8 @@
+[no_clav_attn] warming up...
+[no_clav_attn] single-stream decode: 83.4 tok/s
+[no_clav_attn] aggregate @4 concurrent: 77.2 tok/s (4 ok)
+[no_clav_attn] aggregate @8 concurrent: 144.1 tok/s (8 ok)
+[no_clav_attn] aggregate @16 concurrent: 144.4 tok/s (16 ok)
+[no_clav_attn] prefill ~523 tok: 670 tok/s
+[no_clav_attn] prefill ~2023 tok: 2536 tok/s
+[no_clav_attn] prefill ~8023 tok: 4099 tok/s

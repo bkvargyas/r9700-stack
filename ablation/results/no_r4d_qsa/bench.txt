@@ -1,0 +1,8 @@
+[no_r4d_qsa] warming up...
+[no_r4d_qsa] single-stream decode: 78.1 tok/s
+[no_r4d_qsa] aggregate @4 concurrent: 70.4 tok/s (4 ok)
+[no_r4d_qsa] aggregate @8 concurrent: 130.2 tok/s (8 ok)
+[no_r4d_qsa] aggregate @16 concurrent: 126.4 tok/s (16 ok)
+[no_r4d_qsa] prefill ~523 tok: 641 tok/s
+[no_r4d_qsa] prefill ~2023 tok: 2514 tok/s
+[no_r4d_qsa] prefill ~8023 tok: 4095 tok/s

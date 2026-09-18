@@ -1,0 +1,8 @@
+[no_gdn_hip] warming up...
+[no_gdn_hip] single-stream decode: 81.7 tok/s
+[no_gdn_hip] aggregate @4 concurrent: 71.9 tok/s (4 ok)
+[no_gdn_hip] aggregate @8 concurrent: 136.8 tok/s (8 ok)
+[no_gdn_hip] aggregate @16 concurrent: 132.5 tok/s (16 ok)
+[no_gdn_hip] prefill ~523 tok: 658 tok/s
+[no_gdn_hip] prefill ~2023 tok: 2678 tok/s
+[no_gdn_hip] prefill ~8023 tok: 4046 tok/s

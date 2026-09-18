@@ -1,0 +1,8 @@
+[no_fp8hip] warming up...
+[no_fp8hip] single-stream decode: 77.0 tok/s
+[no_fp8hip] aggregate @4 concurrent: 73.4 tok/s (4 ok)
+[no_fp8hip] aggregate @8 concurrent: 127.3 tok/s (8 ok)
+[no_fp8hip] aggregate @16 concurrent: 146.7 tok/s (16 ok)
+[no_fp8hip] prefill ~523 tok: 628 tok/s
+[no_fp8hip] prefill ~2023 tok: 2685 tok/s
+[no_fp8hip] prefill ~8023 tok: 3885 tok/s

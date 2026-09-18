@@ -1,0 +1,8 @@
+[no_rdna4_fp8] warming up...
+[no_rdna4_fp8] single-stream decode: 82.6 tok/s
+[no_rdna4_fp8] aggregate @4 concurrent: 84.5 tok/s (4 ok)
+[no_rdna4_fp8] aggregate @8 concurrent: 148.0 tok/s (8 ok)
+[no_rdna4_fp8] aggregate @16 concurrent: 141.8 tok/s (16 ok)
+[no_rdna4_fp8] prefill ~523 tok: 614 tok/s
+[no_rdna4_fp8] prefill ~2023 tok: 2707 tok/s
+[no_rdna4_fp8] prefill ~8023 tok: 4112 tok/s
