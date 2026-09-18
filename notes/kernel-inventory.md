@@ -55,3 +55,12 @@ patch_tp3_pad.py), 3-rank exact AR kernel (libr4d extras rx6 + patch_ar_3rank.py
 (TP2-padded 97.8% = stock). Gotchas they hit: MXFP4 decode GEMM needs per-rank K % 128; GQA ratio is part
 of the trained weights (pad keeping GQA); drafter KV bytes/token must equal target's.
 Upstream vLLM rejected head padding (vllm-project/vllm#11797).
+
+## UPDATE 2026-09-18: the "private" r4d kernels are public in tcclaviger's libr4d fork
+https://codeberg.org/tcclaviger/libr4d (main 655f256d, 2026-09-13; no license file) is upstream libr4d + 13 files:
+r4d_gemm_moe_mxfp4a8_nt_b16_m64.hip (MoE grouped GEMM), r4d_moe_lru.hip (+test_moe_lru.py), r4d_attn_sparse_h256.hip,
+r4d_attn_sparse_score_h128_bf16.hip, r4d_attn_sparse_topk_expand.hip, r4d_qsa_index_prep_h128_bf16.hip (QSA),
+r4d_ple_dequant_i6g32_f16.hip (+test), r4d_moe_route_softmax_bf16.hip, r4d_ag_oneshot_Nrank_exact.hip, r4d_dflash2_prep_h128.hip,
+r4d_mxfp4a8_common.h. This is the best libr4d source tree: a superset of upstream (StillDeadcode 5dc6302). Other forks:
+Terrydaktal (GDN/attention fix branches 2026-09-17), ggz14 (older), goodman-b/castle-greybeard (= upstream). None licensed.
+Local clone: ~/src/libr4d-tcclaviger.
