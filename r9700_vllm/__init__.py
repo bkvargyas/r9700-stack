@@ -24,6 +24,10 @@ def register() -> None:
             return
     except Exception:
         return
+    if not _disabled("compat"):
+        from .compat import checkpoint
+        if checkpoint.patch():
+            done.append("ckpt_compat")
     if not _disabled("ple"):
         from .ple import int6
         if int6.patch():
