@@ -91,6 +91,10 @@ def make(kind, N, Kd):
     return (wq, torch.rand((N + 127) // 128, Kd // 128, device="cuda") + 0.5), 128, N * Kd
 
 
+def mt_for(M):
+    return 4 if M >= 64 else (2 if M >= 32 else 1)
+
+
 def runner(kind, Ws, N, Kd, M, cfg):
     """Cycles through the weight copies so every call streams from DRAM (R9700: ~64 MB of on-die cache would
     otherwise serve repeated calls on one small weight and inflate GB/s)."""
@@ -105,10 +109,10 @@ def runner(kind, Ws, N, Kd, M, cfg):
 
 def _runner(kind, W, N, Kd, M, cfg):
     x = torch.randn(M, Kd, device="cuda").to(torch.bfloat16)
-    WV, SK, NPW = cfg
+    WV, SK, NPW = cfg[:3]
     if kind in ("mxfp4", "nvfp4"):
         q, s = K.quant_rows_fp8(x)
-        MT = 4 if M >= 64 else (2 if M >= 32 else 1)
+        MT = cfg[3] if len(cfg) > 3 else mt_for(M)
         blk = 16 * MT
         mpad = (M + blk - 1) // blk * blk
         t = (torch.arange(mpad, dtype=torch.int32, device="cuda"), torch.zeros(mpad // blk, dtype=torch.int32,
@@ -146,8 +150,12 @@ def main():
                 continue
             W, group, nbytes = make(kind, N, Kd)
             Ws = [W] + [make(kind, N, Kd)[0] for _ in range(min(15, (256 << 20) // nbytes))]
-            cand = configs(Kd, group)
+            base = configs(Kd, group)
             for M in ms:
+                # 4-bit kernels: the M-tile count per routing block is tuned too (MT tiles share each weight
+                # fragment; fewer, wider blocks trade parallelism for weight re-reads)
+                cand = [c + (mt,) for c in base for mt in (1, 2, 4) if 16 * mt <= max(16, 2 * M)] \
+                    if kind in ("mxfp4", "nvfp4") else base
                 d = default_cfg(kind, N, Kd, M)
                 best, bcfg = 1e9, None
                 for cfg in cand:
@@ -161,6 +169,8 @@ def main():
                     dus = graph_time(runner(kind, Ws, N, Kd, M, d), reps=2 * len(Ws))
                 except RuntimeError:
                     dus = float("nan")
+                if dus == dus and dus <= best:          # the default wins (or ties): keep it
+                    best, bcfg = dus, tuple(d)
                 table.setdefault(kind, {}).setdefault(f"{N},{Kd}", {})[str(M)] = list(bcfg)
                 print(f"{kind:8s} N={N:6d} K={Kd:5d} M={M:3d}: best {bcfg} {best:7.1f} us {nbytes / best / 1e3:6.0f} GB/s"
                       f" | default {tuple(d)} {dus:7.1f} us ({dus / best:.2f}x)", flush=True)

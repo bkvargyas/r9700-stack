@@ -131,6 +131,12 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     wref[j] = NV ? 0 : Wref[wrow[j]];
   }
 
+  // MT == 1 (decode): K loop unrolled x4 so the next steps' weight loads issue before this step's WMMAs retire --
+  // each load is one coalesced 128 B wave request, so memory-level parallelism has to come from several in flight
+  // (+5-14% DRAM-fed on 27B / Flash-Next shapes). MT > 1: x1 (x4 spills the accumulator set: NVFP4 M=64
+  // 396 -> 1792 us). A plain loop, not a lambda: the lambda form lost the NVFP4 gain (90 -> 102 us).
+  constexpr int KU = MT == 1 ? 4 : 1;
+#pragma unroll KU
   for (int k = 0; k < Ks; k += 16) {
     const int kg = kbase + k;
     const int kstep = kg / 16;

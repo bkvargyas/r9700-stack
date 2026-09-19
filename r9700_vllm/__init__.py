@@ -9,6 +9,7 @@ register():
   * quantization config "compressed-tensors" -> R9kCompressedTensorsConfig    quant/ct.py
   * model classes for Qwen4Exp{ForConditionalGeneration,ForCausalLM,MTP}     models/qwen4_exp.py
   * DFlash/DFlash2 drafters with fp8 attention (context-KV dequant)          models/dflash.py
+  * attention backend CUSTOM = TRITON_ATTN + split-KV for spec verify      attn/triton3d.py
   * one version-gated monkeypatch: MTP k>1 attention-type allowlist          spec/mtp_rocm.py
 Only engages on ROCm. R9K_DISABLE=quant,models,mtp turns individual pieces off (R9K_PLATFORM=0 for the platform).
 """
@@ -44,6 +45,10 @@ def register() -> None:
         for arch, qualname in (ARCHS | DF_ARCHS).items():
             ModelRegistry.register_model(arch, qualname)
         done.append("models:" + ",".join(ARCHS | DF_ARCHS))
+    if not _disabled("attn"):
+        from .attn import triton3d
+        triton3d.register()
+        done.append("attn:CUSTOM(triton-3d)")
     if not _disabled("mtp"):
         from .spec import mtp_rocm
         if mtp_rocm.patch():

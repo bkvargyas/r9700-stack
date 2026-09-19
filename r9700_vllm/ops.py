@@ -34,9 +34,10 @@ def _fp8_block_linear(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: in
 _MX_TABLES: dict[tuple, tuple] = {}
 
 
-def _identity_tables(x, M):
+def _identity_tables(x, M, MT=None):
     from .kernels import moe as KM
-    MT = 4 if M >= 64 else (2 if M >= 32 else 1)
+    if MT is None:
+        MT = 4 if M >= 64 else (2 if M >= 32 else 1)
     blk = KM.MOE_BLOCK * MT
     mpad = (M + blk - 1) // blk * blk
     key = (x.device.index, mpad, blk)
@@ -57,9 +58,9 @@ def _nvfp4_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, wg: torch
     if M == 0:
         return out
     q, s = KM.quant_rows_fp8(x)
-    t, MT = _identity_tables(x, M)
-    KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K, 16, M=M, kind="nvfp4"),
-                num_experts=1, MT=MT)
+    cfg = KM.pick_cfg(N, K, 16, M=M, kind="nvfp4")
+    t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
+    KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT)
     return out
 
 
@@ -74,18 +75,9 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
     if M == 0:
         return out
     q, s = KM.quant_rows_fp8(x)
-    MT = 4 if M >= 64 else (2 if M >= 32 else 1)
-    blk = KM.MOE_BLOCK * MT
-    mpad = (M + blk - 1) // blk * blk
-    key = (x.device.index, mpad, blk)
-    t = _MX_TABLES.get(key)
-    if t is None:
-        t = (torch.arange(mpad, dtype=torch.int32, device=x.device),
-             torch.zeros(mpad // blk, dtype=torch.int32, device=x.device),
-             torch.full((1,), mpad, dtype=torch.int32, device=x.device))
-        _MX_TABLES[key] = t
-    KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *KM.pick_cfg(N, K, M=M, kind="mxfp4"), num_experts=1,
-                MT=MT)
+    cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4")
+    t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
+    KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT)
     return out
 
 
