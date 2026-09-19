@@ -45,6 +45,9 @@ def register() -> None:
         for arch, qualname in (ARCHS | DF_ARCHS).items():
             ModelRegistry.register_model(arch, qualname)
         done.append("models:" + ",".join(ARCHS | DF_ARCHS))
+    if not _disabled("gdn"):
+        from .models import gdn  # noqa: F401  (registers the QwenGatedDeltaNetAttention OOT override)
+        done.append("layer:QwenGatedDeltaNetAttention(in_proj merge)")
     if not _disabled("attn"):
         from .attn import triton3d
         triton3d.register()

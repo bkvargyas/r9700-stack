@@ -219,6 +219,26 @@ class R9kFp8UnquantMethod(UnquantizedLinearMethod):
         return out + bias if bias is not None else out
 
 
+class R9kMx4UnquantMethod(UnquantizedLinearMethod):
+    """bf16 linear requantized to MXFP4 at load (opt-in R9K_BF16_TO_MXFP4=<regex>; GGZ14 does this for the GDN
+    in_proj_ba so it can merge with the MXFP4 in_proj_qkvz -- see models/gdn.py)."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        super().process_weights_after_loading(layer)
+        w = getattr(layer, "weight", None)
+        if isinstance(w, torch.Tensor) and w.dim() == 2 and w.is_cuda and w.shape[0] % 16 == 0 \
+                and w.shape[1] % 32 == 0:
+            from .nvfp4 import mxfp4_linearize
+            layer._r9k_mx = mxfp4_linearize(layer, w.data.float())
+            logger.info_once("r9700: bf16 linears matching R9K_BF16_TO_MXFP4 requantized to MXFP4")
+
+    def apply(self, layer, x, bias=None):
+        mx = getattr(layer, "_r9k_mx", None)
+        if mx is None:
+            return super().apply(layer, x, bias)
+        return mx.apply_weights(layer, x, bias)
+
+
 # ------------------------------------------------------------------------------------------------- config
 @register_quantization_config("compressed-tensors")
 class R9kCompressedTensorsConfig(CompressedTensorsConfig):
@@ -285,6 +305,9 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         if isinstance(m, CompressedTensorsW4A4Mxfp4MoEMethod) and not isinstance(m, R9kMxfp4MoEMethod) \
                 and not getattr(m, "use_cutlass_mxfp4", False) and not _off("moe"):
             return R9kMxfp4MoEMethod(m.moe)
+        pat4 = os.environ.get("R9K_BF16_TO_MXFP4", "")
+        if pat4 and type(m) is UnquantizedLinearMethod and re.search(pat4, prefix or ""):
+            return R9kMx4UnquantMethod()
         pat = os.environ.get("R9K_FP8_LINEARS", "")
         if pat and type(m) is UnquantizedLinearMethod and re.search(pat, prefix or ""):
             return R9kFp8UnquantMethod()
