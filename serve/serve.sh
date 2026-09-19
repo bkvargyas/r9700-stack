@@ -28,16 +28,22 @@ fi
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
-CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
+CKEY=$( (env | grep -E '^(R9K|VLLM)_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
 # forward every R9K_* plugin knob from the caller's environment into the container
 for v in $(env | grep -o '^R9K_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
+# and every VLLM_* variable (stock vLLM env knobs, e.g. VLLM_KV_CACHE_LAYOUT)
+for v in $(env | grep -o '^VLLM_[A-Z0-9_]*'); do MNT+=(-e "$v=${!v}"); done
 ARGS=()
 # ATTN=<backend> (e.g. TRITON_ATTN) for the target; DRAFT_ATTN=<backend> for a separate drafter (must support
 # full cudagraphs or vLLM runs the draft eagerly)
 [ -n "$ATTN" ] && ARGS+=(--attention-backend "$ATTN")
+# ATTN=CUSTOM routes prefill / mixed batches to libr4d's paged kernels, which need K/V-packed contiguous slots per
+# head (LBHNC). Hybrid attention+GDN models otherwise end up slot-major and every prefill falls back to unified
+# attention (27B: 36 ms per 4096-token chunk vs 1.4 ms).
+[ "$ATTN" = CUSTOM ] && : ${VLLM_KV_CACHE_LAYOUT:=LBHNC} && export VLLM_KV_CACHE_LAYOUT
 # CHAT_TEMPLATE=/host/path.jinja: served chat template (mounted read-only). SPEC_EXTRA='"k": v, ...': extra
 # speculative-config fields, e.g. '"disable_padded_drafter_batch": true, "draft_sample_method": "greedy"'
 # (disable_padded_drafter_batch needs EXTRA=--no-async-scheduling).
