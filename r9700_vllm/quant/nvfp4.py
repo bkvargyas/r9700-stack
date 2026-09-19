@@ -85,6 +85,25 @@ def nvfp4_to_mxfp4(packed, scale16, row_div, rows_per_chunk: int = 2048):
     return out_p, out_s
 
 
+def mxfp4_linearize(layer, W: torch.Tensor, rows_per_chunk: int = 4096):
+    """Serve `layer` (a LinearBase) from the dequantized weight W [N, K] (fp32/bf16) as MXFP4 on libr9k: MSE-searched
+    E8M0 per 32, dense MXFP4 kernel. Returns the kernel object (its apply_weights(layer, x, bias) is the forward)."""
+    from ..linear.mxfp4 import R9700Mxfp4LinearKernel
+    from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
+    N, Kd = W.shape
+    packed = torch.empty((N, Kd // 2), dtype=torch.uint8, device=W.device)
+    e8 = torch.empty((N, Kd // 32), dtype=torch.uint8, device=W.device)
+    for r0 in range(0, N, rows_per_chunk):
+        p, s = quantize_mxfp4_search(W[r0:r0 + rows_per_chunk].float())
+        packed[r0:r0 + rows_per_chunk].copy_(p)
+        e8[r0:r0 + rows_per_chunk].copy_(s)
+    kern = R9700Mxfp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=None))
+    layer.weight = Parameter(packed, requires_grad=False)
+    layer.weight_scale = Parameter(e8, requires_grad=False)
+    kern.process_weights_after_loading(layer)
+    return kern
+
+
 def _row_div(global_scale: torch.Tensor, widths) -> torch.Tensor:
     g = global_scale.detach().float().reshape(-1)
     if g.numel() == 1:

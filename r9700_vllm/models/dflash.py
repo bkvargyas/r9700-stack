@@ -52,6 +52,19 @@ def _dequant_weight(lin, chunk: int = 2048) -> torch.Tensor:
     return torch.cat(cols, dim=0).t().contiguous()
 
 
+class _MxMethod:
+    """quant_method stand-in for drafter linears requantized to MXFP4 (R9K_DRAFT_W4=1)."""
+
+    def __init__(self, kern):
+        self.kern = kern
+
+    def apply(self, layer, x, bias=None):
+        return self.kern.apply_weights(layer, x, bias)
+
+    def process_weights_after_loading(self, layer):
+        pass
+
+
 class _BlockMethod:
     """quant_method stand-in for swapped block-fp8 linears (LinearBase.forward only calls .apply)."""
 
@@ -82,6 +95,15 @@ def swap_fp8_linears(root) -> int:
         W = _dequant_weight(lin)
         N, K = W.shape
         if N % 16 or K % 16:
+            continue
+        if os.environ.get("R9K_DRAFT_W4", "0") == "1" and K % 32 == 0:
+            # drafter-only 4-bit (GGZ14 serves its DFlash2 drafter W4): halves the drafter's weight stream; can
+            # only change acceptance, never the target's output
+            from ..quant.nvfp4 import mxfp4_linearize
+            from ..utils import note_shape
+            note_shape("mxfp4", N, K)
+            lin.quant_method = _MxMethod(mxfp4_linearize(lin, W))
+            n += 1
             continue
         bsc = getattr(lin, "weight_scale_inv", None)
         bsc = bsc if isinstance(bsc, torch.Tensor) else getattr(lin, "weight_scale", None)
@@ -135,7 +157,9 @@ def _finish(model) -> None:
     if os.environ.get("R9K_DRAFT_FP8", "1") == "1":
         n = swap_fp8_linears(model)
         if n:
-            logger.info_once("r9700: DFlash drafter: %d fp8 linears -> libr9k fp8 GEMM (exact bytes)", n)
+            logger.info_once("r9700: DFlash drafter: %d fp8 linears -> libr9k %s", n,
+                             "MXFP4 (R9K_DRAFT_W4=1)" if os.environ.get("R9K_DRAFT_W4", "0") == "1"
+                             else "fp8 GEMM (exact bytes)")
 
 
 class R9kDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):

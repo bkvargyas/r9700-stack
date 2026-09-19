@@ -32,7 +32,9 @@ SHAPES = {
     # Flash-Next shared expert (dense MXFP4) + 27B converted path (R9K_NVFP4=mxfp4)
     "mxfp4": [(640, 2560), (2560, 320), (17408, 5120), (5120, 8704),
               # R9K_FP8_TO_MXFP4: 27B attention / GDN, Flash-Next attention / GDN (block fp8 requantized)
-              (7168, 5120), (8192, 5120), (5120, 3072), (8192, 2560), (6656, 2560), (2560, 3072)],
+              (7168, 5120), (8192, 5120), (5120, 3072), (8192, 2560), (6656, 2560), (2560, 3072),
+              # R9K_DRAFT_W4: DFlash2 drafter qkv / o_proj
+              (3072, 5120), (5120, 2048)],
     # Flash-Next attention / GDN block-fp8 projections
     "fp8block": [(8192, 2560), (6656, 2560), (2560, 3072),
                  # DFlash2 drafter for the 27B (block fp8): qkv, o, gate_up, down per rank
