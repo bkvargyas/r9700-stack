@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next GPTQ on STOCK vLLM (ROCm 10 nightly image) + the r9700_vllm plugin, 2x R9700 TP2.
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
-# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
+# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -28,7 +28,7 @@ fi
 # with different weight layouts fails at runtime ("wrong number of dimensions").
 # The plugin's own source is part of the key too: a code change can change weight layouts under the same knobs.
 PSRC=$(find $REPO/r9700_vllm -name '*.py' -print0 | sort -z | xargs -0 cat | md5sum | cut -c1-8)
-CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
+CKEY=$( (env | grep '^R9K_' | sort; echo "${MTP-3}${MODEL:+ $MODEL}${DRAFT:+ $DRAFT $SPEC $DRAFT_ATTN $SPEC_EXTRA}${ATTN:+ $ATTN} $PSRC") | md5sum | cut -c1-10)
 # recommended defaults (VM with >=256 GB RAM): all experts in host memory, LRU cache on every layer, fp8 LM heads
 : ${R9K_EXPERT_CACHE_SLOTS:=270}; : ${R9K_TARGET_LMHEAD:=fp8}; : ${R9K_DRAFT_LMHEAD:=fp8}
 export R9K_EXPERT_CACHE_SLOTS R9K_TARGET_LMHEAD R9K_DRAFT_LMHEAD
@@ -38,6 +38,14 @@ ARGS=()
 # ATTN=<backend> (e.g. TRITON_ATTN) for the target; DRAFT_ATTN=<backend> for a separate drafter (must support
 # full cudagraphs or vLLM runs the draft eagerly)
 [ -n "$ATTN" ] && ARGS+=(--attention-backend "$ATTN")
+# CHAT_TEMPLATE=/host/path.jinja: served chat template (mounted read-only). SPEC_EXTRA='"k": v, ...': extra
+# speculative-config fields, e.g. '"disable_padded_drafter_batch": true, "draft_sample_method": "greedy"'
+# (disable_padded_drafter_batch needs EXTRA=--no-async-scheduling).
+# CHAT_TEMPLATE=qwen-fixed: the repo copy of GGZ14's qwen-fixed-v22.3 (see CREDITS.md). On Qwen3.8-27B + DFlash2 it
+# raised speculative acceptance 14% vs the checkpoint's template (code 3.34 -> 4.49 tok/step, BetterBench combined
+# 153 -> 175 tok/s) and is the template GGZ14 measured at 98% GSM8K.
+[ "$CHAT_TEMPLATE" = qwen-fixed ] && CHAT_TEMPLATE=$(dirname "$(realpath "$0")")/templates/qwen-fixed-v22.3.jinja
+if [ -n "$CHAT_TEMPLATE" ]; then MNT+=(-v "$CHAT_TEMPLATE:/opt/chat_template.jinja:ro"); ARGS+=(--chat-template /opt/chat_template.jinja); fi
 # KVMEM=<GiB>: fixed KV-cache budget instead of the utilization estimate. vLLM's profiling pass underestimates the
 # runtime footprint once load-time requantization / merges are on (27B: OOM at the first 1.7k-token prefill with
 # util 0.90-0.94; its own log suggests ~9.6 GiB); a fixed budget is exact.
@@ -59,7 +67,7 @@ fi
 MTP=${MTP-3}
 # DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP
 if [ -n "$DRAFT" ]; then
-  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}}")
+  ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 elif [ -n "$MTP" ]; then
   ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
 fi
