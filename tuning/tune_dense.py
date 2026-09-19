@@ -33,6 +33,8 @@ SHAPES = {
     "mxfp4": [(640, 2560), (2560, 320), (17408, 5120), (5120, 8704),
               # R9K_FP8_TO_MXFP4: 27B attention / GDN, Flash-Next attention / GDN (block fp8 requantized)
               (7168, 5120), (8192, 5120), (5120, 3072), (8192, 2560), (6656, 2560), (2560, 3072),
+              # GDN in_proj_qkvz + in_proj_ba merged (models/gdn.py), 27B
+              (8240, 5120),
               # R9K_DRAFT_W4: DFlash2 drafter qkv / o_proj
               (3072, 5120), (5120, 2048)],
     # Flash-Next attention / GDN block-fp8 projections
@@ -149,8 +151,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(os.path.dirname(K.__file__), "tuned.json"))
     ap.add_argument("--kinds", default=",".join(SHAPES))
     ap.add_argument("--shapes", default="", help="only these N,K pairs, e.g. 7168,5120;8192,5120")
+    ap.add_argument("--ms", default="", help="only these M values, e.g. 32,64")
     a = ap.parse_args()
-    ms = [1, 8, 64] if a.quick else MS
+    ms = [int(v) for v in a.ms.split(",")] if a.ms else ([1, 8, 64] if a.quick else MS)
     table = json.load(open(a.out)) if os.path.exists(a.out) else {}
     for kind in a.kinds.split(","):
         only = {tuple(int(v) for v in p.split(",")) for p in a.shapes.split(";") if p}
