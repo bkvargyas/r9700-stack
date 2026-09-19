@@ -76,6 +76,27 @@ class R4dAllReduce:
         self._peer_flags = ext.ar_ipc_open(fhs[peer])
         self._seq = torch.zeros(maxb, dtype=torch.int32, device=self.device)
         self.drain, self.acq = (3, 0) if fine else (3, 1)
+        # Optional compressed payload for large messages (R9K_AR_QUANT=1): libr4d's ar_oneshot_2rank_wht6 rotates
+        # each 64-element group by a Walsh-Hadamard transform and ships 6 bits + a bf16 scale (6.25 bits/elem),
+        # ~2.6x fewer bytes over PCIe; both ranks reduce the identical packed pair, so they stay bit-identical to
+        # each other (not to the exact sum). Same threshold as GGZ14's radiance default (128 KB): decode-size
+        # messages stay exact. Lossy -> opt-in, gated on GSM8K.
+        self._wht6 = None
+        if os.environ.get("R9K_AR_QUANT", "0") == "1":
+            try:
+                self._qgroup = int(ext.AR_WHT6_GROUP)
+                qname = ext.select("allreduce", world_size=2, exact=0, dtype="bf16", numel=self._qgroup)
+                if qname is None:
+                    raise RuntimeError("no lossy all-reduce kernel in this libr4d build")
+                self._wht6 = getattr(ext, qname)
+                self._qmin = int(float(os.environ.get("R9K_AR_QUANT_MIN_KB", "128")) * 1024)
+                self._locpk = torch.empty(self.max_bytes // 2 + self.max_bytes // 32 + 4096, dtype=torch.uint8,
+                                          device=self.device)
+                logger.info("r9700: libr4d wht6 compressed all-reduce for messages >= %d KB (%d-bit)",
+                            self._qmin >> 10, int(ext.AR_WHT6_BITS))
+            except Exception as e:
+                logger.warning("r9700: R9K_AR_QUANT requested but unavailable (%s); exact all-reduce only", e)
+                self._wht6 = None
         self.disabled = False
         logger.info("r9700: libr4d 2-rank P2P all-reduce installed (rank %d, max %d MiB, fine-grained=%s)",
                     self.rank, self.max_bytes >> 20, fine)
@@ -88,6 +109,15 @@ class R4dAllReduce:
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
+        nbytes = x.numel() * x.element_size()
+        if (self._wht6 is not None and x.dtype in (torch.bfloat16, torch.float16) and nbytes >= self._qmin
+                and x.numel() % self._qgroup == 0):
+            nb = max(self.min_nb, min(48, nbytes // (self.words_per_block * 16)))
+            self._wht6(self._peer_scratch, self._scratch, self._peer_flags, self._flags, self._seq.data_ptr(),
+                       self._locpk.data_ptr(), self.max_bytes, self.max_bytes // 2, x.data_ptr(), out.data_ptr(),
+                       x.numel(), _DTYPE[x.dtype], torch.cuda.current_stream().cuda_stream, nb, 1024, self.drain,
+                       self.acq)
+            return out
         n16 = x.numel() * x.element_size() // 16
         nb = max(self.min_nb, min(self.max_nb, n16 // self.words_per_block))
         nb = max(1, min(nb, n16))
