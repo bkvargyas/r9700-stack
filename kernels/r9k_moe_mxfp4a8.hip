@@ -29,6 +29,7 @@
 #include <hip/hip_bf16.h>
 #include <hip/hip_fp8.h>
 #include <cstdint>
+#include <cstdlib>
 
 #define WAVE32 32
 #define GROUP 32
@@ -67,14 +68,52 @@ __device__ __forceinline__ float e4m3_to_f32(unsigned int b) {
   return (b & 0x80u) ? -mag : mag;
 }
 
-// NV = false: OCP MXFP4 (E8M0 per 32, folded into the e4m3 exponent -- exact, no extra math).
-// NV = true:  NVFP4 (e4m3 scale per 16 = exactly one WMMA K step): the WMMA runs on the unscaled e2m1 values
-//             (kMag[0]) and its 16x16 partial is scaled into the accumulator -- in the WMMA C layout each lane
-//             holds 8 rows of ONE output column n, so the per-(n, kstep) scale is one scalar per lane: 8 FMAs per
-//             WMMA, exact NVFP4 weight math. Ws = e4m3 [K/16][N] per expert, Wref = fp32 per-row global
-//             multiplier [N] per expert (wref_estride in floats), applied in the epilogue.
-template <int MT, int NPW, bool NV>
-__global__ void r9k_moe_mxfp4a8_kernel(
+// NV = false: OCP MXFP4 (E8M0 per 32 = two WMMA K steps). Ws = E8M0 [K/32][N] per expert; Wref (the per-row max
+//             exponent) is no longer read by the kernel (kept in the layout / ABI), the scale is applied in fp32.
+// NV = true:  NVFP4 (e4m3 scale per 16 = exactly one WMMA K step). Ws = e4m3 [K/16][N] per expert, Wref = fp32
+//             per-row global multiplier [N] per expert (wref_estride in floats), applied in the epilogue.
+// Both: the WMMA runs on the unscaled e2m1 values (kMag[0]) and the group's 16x16 partial is scaled into the
+// accumulator -- in the WMMA C layout each lane holds 8 rows of ONE output column n, so the per-(n, group) scale
+// is one scalar per lane: 8 FMAs per group, exact weight math.
+// Loads: every global access is a uniform (SGPR) base plus a 32-bit per-lane offset, so the compiler emits
+// saddr-form global_load with one v_add per address instead of 64-bit VALU adds with carries (the old loop spent
+// ~25 of its ~200 instructions per K step on those plus the s_wait_alu they trigger). Requires every per-expert
+// tensor to be < 4 GB, which holds for any single expert / dense weight here.
+template <typename T>
+__device__ __forceinline__ T ld_u32off(const T* __restrict__ base, unsigned off) {
+  return *(const T*)((const unsigned char*)base + (size_t)off);
+}
+// Nontemporal load for streams read once per call. Only the MT == 1 (decode) path uses it: there every weight and
+// scale byte is read by exactly one workgroup. At MT > 1 (prefill / wide batches) several routing blocks of the same
+// expert re-read its weights, and the cache hit is worth more than the stream isolation (Flash-Next prefill 2000
+// -> 1525 tok/s with NT on every path). R9K_NT=0 disables it everywhere.
+#ifndef R9K_NT
+#define R9K_NT 1
+#endif
+template <bool NTL, typename T>
+__device__ __forceinline__ T ld_nt_u32off(const T* __restrict__ base, unsigned off) {
+  if constexpr (NTL && R9K_NT)
+    return __builtin_nontemporal_load((const T*)((const unsigned char*)base + (size_t)off));
+  else
+    return *(const T*)((const unsigned char*)base + (size_t)off);
+}
+
+// A-tile staging for MT > 1: the BLK x K activation slab of the block is read from L2 once per workgroup per
+// DBK-column slab into padded LDS (row stride DBK + 8 bytes: conflict-free ds_read_b64 for the 16 rows x 2
+// K-halves of a WMMA A fragment) instead of once per wave from global memory. Register-prefetched one slab ahead.
+// Workgroup barrier that only drains LDS traffic: __syncthreads() lowers to a workgroup release fence that also
+// waits for every outstanding global load (s_wait_loadcnt 0x0), which would serialize the slab prefetch (the
+// weight loads for slab s+1 are in flight across this barrier by design). Only LDS stores have to be visible.
+__device__ __forceinline__ void lds_barrier() {
+  asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+}
+
+#define LDSA_DBK 64
+#define LDSA_STR (LDSA_DBK + 8)
+#define LDSA_NCH 4          // max 16-byte chunks per thread per slab (launcher: needs WV*32 threads >= BLK)
+
+template <int MT, int NPW, bool NV, bool LDSA>
+__global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
     const unsigned char* __restrict__ Wref_all, __hip_bfloat16* __restrict__ C,
@@ -84,12 +123,14 @@ __global__ void r9k_moe_mxfp4a8_kernel(
   // One workgroup row = one routing block of BLK = 16*MT sorted rows (moe_align_block_size(block=16*MT)),
   // processed as MT WMMA M-tiles that share every weight fragment (MT x fewer weight reads per row).
   constexpr int BLK = 16 * MT;
+  static_assert(!(LDSA && MT == 1), "LDS A staging is for MT > 1");
   const int by = blockIdx.y;
   if (by * BLK >= ntpp[0]) return;
   const int e = expert_ids[by];
   if (e < 0) return;
 
   extern __shared__ float red[];
+  unsigned char* const sA = (unsigned char*)red;
   const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
   const int col_local = wave / SK, ksplit = wave % SK;
   const int nt0 = (blockIdx.x * WV + col_local) * NPW;
@@ -99,19 +140,41 @@ __global__ void r9k_moe_mxfp4a8_kernel(
 
   const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
   const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
-  const unsigned char* __restrict__ Wref = NV ? nullptr : Wref_all + (size_t)e * wref_estride;
   const float* __restrict__ Wg = NV ? (const float*)Wref_all + (size_t)e * wref_estride : nullptr;
 
   // This lane's A row in each M tile: the sorted flat index, clamped to the block's first row (always valid
   // for a live block) for padding entries.
   const int first = sorted_ids[by * BLK];
   if (first < 0 || first >= numel) return;          // fully padded block: nothing valid to read or write
-  const unsigned char* __restrict__ arow[MT];
+  unsigned aoff[MT];                                // byte offset of the lane's A row (+ K half) in A
+  if constexpr (!LDSA) {
 #pragma unroll
-  for (int i = 0; i < MT; i++) {
-    int flat = sorted_ids[by * BLK + i * 16 + nlane];
-    if (flat >= numel) flat = first;
-    arow[i] = A + (size_t)(flat / a_row_div) * K;
+    for (int i = 0; i < MT; i++) {
+      int flat = sorted_ids[by * BLK + i * 16 + nlane];
+      if (flat >= numel) flat = first;
+      aoff[i] = (unsigned)(flat / a_row_div) * (unsigned)K + mhalf;
+    }
+  }
+
+  // LDS staging bookkeeping (LDSA): this thread's 16-byte chunks of the SK x BLK x DBK slab.
+  const int nthreads = WV * SK * WAVE32;
+  unsigned sa_src[LDSA_NCH];                        // A byte offset of the chunk at slab 0
+  // chunks per thread = SK*BLK*CPR / nthreads = BLK/(8*WV): exact by the launcher's gate, SGPR-uniform (WV is a
+  // kernel argument) so the staging loops below are scalar-predicated, not exec-masked.
+  const int nch = LDSA ? (BLK / 8) / WV : 0;
+  if constexpr (LDSA) {
+    constexpr int CPR = LDSA_DBK / 16;              // chunks per row per slab
+    const int per_split = BLK * CPR;
+#pragma unroll
+    for (int q = 0; q < LDSA_NCH; q++) {
+      if (q < nch) {
+        const int c = tid + q * nthreads;
+        const int g = c / per_split, rem = c - g * per_split, r = rem / CPR, c16 = rem - r * CPR;
+        int flat = sorted_ids[by * BLK + r];
+        if (flat >= numel) flat = first;
+        sa_src[q] = (unsigned)(flat / a_row_div) * (unsigned)K + (unsigned)(g * Ks + c16 * 16);
+      }
+    }
   }
 
   v8f acc[NPW][MT];
@@ -121,54 +184,135 @@ __global__ void r9k_moe_mxfp4a8_kernel(
     for (int i = 0; i < MT; i++) acc[j][i] = (v8f)(0.f);
 
   const int ntmax = N / 16 - 1;
-  int wtile[NPW], wrow[NPW];
-  unsigned char wref[NPW];
+  unsigned woff[NPW], soff[NPW];                    // byte offsets: weight fragment stream, scale column
 #pragma unroll
   for (int j = 0; j < NPW; j++) {
     const int t = nt0 + j;
-    wtile[j] = t < ntmax ? t : ntmax;
-    wrow[j] = wtile[j] * 16 + nlane;
-    wref[j] = NV ? 0 : Wref[wrow[j]];
+    const int wt = t < ntmax ? t : ntmax;
+    woff[j] = ((unsigned)wt * (unsigned)ksteps * WAVE32 + lane) * 4u;
+    soff[j] = (unsigned)(wt * 16 + nlane);
   }
 
-  // MT == 1 (decode): K loop unrolled x4 so the next steps' weight loads issue before this step's WMMAs retire --
-  // each load is one coalesced 128 B wave request, so memory-level parallelism has to come from several in flight
-  // (+5-14% DRAM-fed on 27B / Flash-Next shapes). MT > 1: x1 (x4 spills the accumulator set: NVFP4 M=64
-  // 396 -> 1792 us). A plain loop, not a lambda: the lambda form lost the NVFP4 gain (90 -> 102 us).
-  constexpr int KU = MT == 1 ? 4 : 1;
+  // Weights stream through once: nontemporal (TH_LOAD_NT) loads keep the stream from displacing A, the scales
+  // and the split-K partials in L0/L2/MALL. Scale groups: NVFP4 = 16 K (one WMMA), MXFP4 = 32 K (two). The
+  // unscaled e2m1 products of a group accumulate in a temporary and are scaled into acc once per group (8 FMAs
+  // per lane), so no per-lane exponent table is needed: the old folded MXFP4 path issued a dependent kMag[dsh]
+  // global load after every Ws byte (two serial memory latencies per K step) and flushed blocks >2^-9 below the
+  // row max; the fp32 group scale is exact.
+  // The scales are streamed nontemporally too: they are read exactly once per step like the weights, and a
+  // cached scale stream flatters the rotating-copy benchmark (5 x 5.6 MB of NVFP4 scales stay in the 64 MB MALL:
+  // 82 us "612 GB/s" that is really 89 us) without helping the served model.
+  // Written as a macro, not a lambda: the lambda form makes the compiler wait for each K step's loads before
+  // issuing the next step's (measured 90 -> 102 us on NVFP4 17408x5120 @M=8).
+  constexpr int KG = NV ? 16 : GROUP, SPG = KG / 16;
+#define R9K_GROUP(KGV, AF, WVV)                                                                               \
+  {                                                                                                          \
+    const int g_ = (KGV) / KG;                                                                               \
+    _Pragma("unroll")                                                                                        \
+    for (int j = 0; j < NPW; j++) {                                                                          \
+      v8f t[MT];                                                                                             \
+      _Pragma("unroll")                                                                                      \
+      for (int i = 0; i < MT; i++) t[i] = (v8f)(0.f);                                                        \
+      _Pragma("unroll")                                                                                      \
+      for (int sidx = 0; sidx < SPG; sidx++) {                                                               \
+        const v2i wf = mxfp4_unpack8(WVV[j][sidx], 0);                                                       \
+        _Pragma("unroll")                                                                                    \
+        for (int i = 0; i < MT; i++)                                                                         \
+          t[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(AF[sidx][i], wf, t[i]);                \
+      }                                                                                                      \
+      const unsigned int sb = ld_nt_u32off<(MT == 1)>(Ws, (unsigned)g_ * (unsigned)N + soff[j]);                        \
+      const float sc = NV ? __builtin_amdgcn_cvt_f32_fp8((int)sb, 0) : __uint_as_float(sb << 23);            \
+      _Pragma("unroll")                                                                                      \
+      for (int i = 0; i < MT; i++)                                                                           \
+        _Pragma("unroll")                                                                                    \
+        for (int q = 0; q < 8; q++) acc[j][i][q] = fmaf(t[i][q], sc, acc[j][i][q]);   /* -ffp-contract=off */ \
+    }                                                                                                        \
+  }
+
+  if constexpr (!LDSA) {
+    // Direct path (MT == 1 decode, or K not a multiple of SK*DBK): A fragments straight from global (L0/L2
+    // resident at decode M). The loop is unrolled so 4 K steps' weight loads are in flight per wave (each load
+    // is one coalesced 128 B wave request; memory-level parallelism has to come from several in flight).
+    constexpr int KU = MT == 1 ? 4 / SPG : 1;
 #pragma unroll KU
-  for (int k = 0; k < Ks; k += 16) {
-    const int kg = kbase + k;
-    const int kstep = kg / 16;
-    const int blk = kg / GROUP;
-    v2i af[MT];
+    for (int k = 0; k < Ks; k += KG) {
+      const int kg = kbase + k;
+      unsigned int wv[NPW][SPG];
+      v2i af[SPG][MT];
 #pragma unroll
-    for (int i = 0; i < MT; i++) {
-      const unsigned int* pa = (const unsigned int*)(arow[i] + kg + mhalf);
-      af[i][0] = (int)pa[0];
-      af[i][1] = (int)pa[1];
-    }
+      for (int sidx = 0; sidx < SPG; sidx++) {
 #pragma unroll
-    for (int j = 0; j < NPW; j++) {
-      const unsigned int wv = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
-      if constexpr (NV) {
-        const v2i wf = mxfp4_unpack8(wv, 0);
-        const float sc = e4m3_to_f32(Ws[(size_t)kstep * N + wrow[j]]);
+        for (int j = 0; j < NPW; j++)
+          wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] + (unsigned)(kg / 16 + sidx) * (WAVE32 * 4));
 #pragma unroll
-        for (int i = 0; i < MT; i++) {
-          const v8f t = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, (v8f)(0.f));
-          acc[j][i] += t * sc;
-        }
-      } else {
-        int dsh = (int)wref[j] - (int)Ws[(size_t)blk * N + wrow[j]];
-        dsh = dsh < 0 ? 0 : (dsh > 15 ? 15 : dsh);
-        const v2i wf = mxfp4_unpack8(wv, dsh);
-#pragma unroll
-        for (int i = 0; i < MT; i++)
-          acc[j][i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af[i], wf, acc[j][i]);
+        for (int i = 0; i < MT; i++) af[sidx][i] = ld_u32off((const v2i*)A, aoff[i] + (unsigned)(kg + sidx * 16));
       }
+      R9K_GROUP(kg, af, wv)
+    }
+  } else {
+    constexpr int KSPS = LDSA_DBK / 16;             // K steps per slab
+    constexpr int CPR = LDSA_DBK / 16;              // 16 B chunks per row per slab
+    const int nslabs = Ks / LDSA_DBK;
+    uint4 pre[LDSA_NCH];
+    // Weight fragments for a slab are prefetched one slab ahead (KSPS x NPW registers), so the DRAM stream is
+    // never waiting on the barrier + staging of the slab that consumes it.
+    unsigned int wv[NPW][KSPS];
+    const unsigned char* const myA = sA + (size_t)ksplit * BLK * LDSA_STR + nlane * LDSA_STR + mhalf;
+#pragma unroll
+    for (int q = 0; q < LDSA_NCH; q++)
+      if (q < nch) pre[q] = ld_u32off((const uint4*)A, sa_src[q]);
+#pragma unroll
+    for (int sidx = 0; sidx < KSPS; sidx++)
+#pragma unroll
+      for (int j = 0; j < NPW; j++)
+        wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] + (unsigned)(kbase / 16 + sidx) * (WAVE32 * 4));
+    for (int slab = 0; slab < nslabs; slab++) {
+#pragma unroll
+      for (int q = 0; q < LDSA_NCH; q++) {
+        if (q < nch) {
+          const int c = tid + q * nthreads;
+          const int g = c / (BLK * CPR), rem = c - g * (BLK * CPR), r = rem / CPR, c16 = rem - r * CPR;
+          *(uint4*)(sA + (g * BLK + r) * LDSA_STR + c16 * 16) = pre[q];
+        }
+      }
+      lds_barrier();
+      const bool more = slab + 1 < nslabs;
+      if (more) {
+#pragma unroll
+        for (int q = 0; q < LDSA_NCH; q++)
+          if (q < nch) pre[q] = ld_u32off((const uint4*)A, sa_src[q] + (unsigned)(slab + 1) * LDSA_DBK);
+      }
+      unsigned int wcur[NPW][KSPS];
+#pragma unroll
+      for (int sidx = 0; sidx < KSPS; sidx++)
+#pragma unroll
+        for (int j = 0; j < NPW; j++) wcur[j][sidx] = wv[j][sidx];
+      if (more) {
+        const int ks0 = (kbase + (slab + 1) * LDSA_DBK) / 16;
+#pragma unroll
+        for (int sidx = 0; sidx < KSPS; sidx++)
+#pragma unroll
+          for (int j = 0; j < NPW; j++)
+            wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] + (unsigned)(ks0 + sidx) * (WAVE32 * 4));
+      }
+      const int kg0 = kbase + slab * LDSA_DBK;
+#pragma unroll
+      for (int k = 0; k < LDSA_DBK; k += KG) {
+        v2i af[SPG][MT];
+        unsigned int wg[NPW][SPG];
+#pragma unroll
+        for (int sidx = 0; sidx < SPG; sidx++) {
+#pragma unroll
+          for (int i = 0; i < MT; i++) af[sidx][i] = *(const v2i*)(myA + i * 16 * LDSA_STR + k + sidx * 16);
+#pragma unroll
+          for (int j = 0; j < NPW; j++) wg[j][sidx] = wcur[j][k / 16 + sidx];
+        }
+        R9K_GROUP(kg0 + k, af, wg)
+      }
+      lds_barrier();
     }
   }
+#undef R9K_GROUP
 
   // Reduce the SK partial sums in LDS, one M tile at a time (buffer stays WV*NPW*SK*256 floats).
   const int ncols = WV * NPW;
@@ -191,7 +335,7 @@ __global__ void r9k_moe_mxfp4a8_kernel(
       if (fr >= numel) continue;                                  // padding row
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      float sc = (NV ? Wg[n] : __int_as_float((int)Wref[n] << 23)) * As[fr / a_row_div];
+      float sc = (NV ? Wg[n] : 1.f) * As[fr / a_row_div];
       if (topk_w) sc *= topk_w[fr];
       C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
     }
@@ -277,22 +421,33 @@ static int moe_launch(bool nv, long a, long as, long wq, long ws, long wref, lon
   if (K % (SK * (nv ? 16 : GROUP))) return -2;
   if (WV * SK * WAVE32 > 1024) return -3;
   const int ncols = WV * NPW;
-  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  // MT bit 3 = stage A through LDS (a tuned per-config choice; R9K_LDSA=0/1 overrides for experiments). Legal
+  // when the per-wave K range is whole DBK slabs, the block is <= 8 waves (launch bound 256 -> 256 VGPRs) and
+  // the BLK x DBK slab splits evenly over the block's threads.
+  bool ldsa = (MT & 8) != 0;
+  MT &= 7;
+  static const int ldsa_env = [] { const char* v = getenv("R9K_LDSA"); return v ? (v[0] == '0' ? 0 : 1) : -1; }();
+  if (ldsa_env >= 0) ldsa = ldsa_env != 0;
+  // ...and each thread's share of the slab (2*MT/WV 16-byte chunks) must fit its LDSA_NCH staging registers --
+  // without this check WV=1, MT=4 staged half the tile and read uninitialized LDS (NaN at serving batch 64).
+  ldsa = ldsa && MT > 1 && K % (SK * LDSA_DBK) == 0 && WV * SK <= 8 && (2 * MT) % WV == 0 && (2 * MT) / WV <= LDSA_NCH;
+  if (ldsa) { const size_t s2 = (size_t)SK * 16 * MT * LDSA_STR; if (s2 > smem) smem = s2; }
   if (smem > 64 * 1024) return -4;
   dim3 grid((N / 16 + ncols - 1) / ncols, max_blocks), block(WV * SK * WAVE32);
   hipStream_t st = (hipStream_t)stream;
-#define L(MTv, NP, NVv) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP, NVv>), grid, block, smem, st, \
+#define L(MTv, NP, NVv, LD) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP, NVv, LD>), grid, block, smem, st, \
       (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws, \
       (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids,                        \
       (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel,  \
       a_row_div, K, N, WV, SK)
-#define LN(MTv, NP) do { if (nv) L(MTv, NP, true); else L(MTv, NP, false); } while (0)
-#define LM(MTv) switch (NPW) { case 1: LN(MTv, 1); break; case 2: LN(MTv, 2); break; case 4: LN(MTv, 4); break; \
-                               default: return -5; }
+#define LN(MTv, NP, LD) do { if (nv) L(MTv, NP, true, LD); else L(MTv, NP, false, LD); } while (0)
+#define LM(MTv, LD) switch (NPW) { case 1: LN(MTv, 1, LD); break; case 2: LN(MTv, 2, LD); break; \
+                                   case 4: LN(MTv, 4, LD); break; default: return -5; }
   switch (MT) {
-    case 1: LM(1); break;
-    case 2: LM(2); break;
-    case 4: LM(4); break;
+    case 1: LM(1, false); break;
+    case 2: if (ldsa) LM(2, true) else LM(2, false); break;
+    case 4: if (ldsa) LM(4, true) else LM(4, false); break;
     default: return -7;
   }
 #undef LM

@@ -133,11 +133,12 @@ def silu_mul_quant_fp8(gu: torch.Tensor):
 def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.Tensor,
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
              a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
-             num_experts: int | None = None, MT: int = 1):
+             num_experts: int | None = None, MT: int = 1, ldsa: bool = False):
     """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
 
     sorted_ids/expert_ids must come from moe_align_block_size(block_size=16*MT). MT M-tiles per workgroup share
-    each weight fragment (use MT>1 when experts see many rows: prefill / wide batches).
+    each weight fragment (use MT>1 when experts see many rows: prefill / wide batches). ldsa: stage the A tile
+    through LDS (MT > 1 only; a tuned per-config choice, passed to the kernel as MT | 8).
     The grid covers at most ceil(numel/BLK) + min(numel, E) blocks -- the most moe_align_block_size can fill
     with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
     launch stays cudagraph-safe."""
@@ -145,6 +146,7 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     E = num_experts if num_experts is not None else w.wq.shape[0]
     blk = MOE_BLOCK * MT
     max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+    MT = MT | (8 if ldsa and MT > 1 else 0)
     if isinstance(w, Nvfp4Experts):
         rc = lib().r9k_moe_nvfp4a8(
             a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.ws.data_ptr(), w.wg.data_ptr(), out.data_ptr(),
@@ -166,8 +168,8 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
 
 
 def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str | None = None
-             ) -> tuple[int, int, int]:
-    """A legal (WV, SK, NPW) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
+             ) -> tuple[int, ...]:
+    """A legal (WV, SK, NPW[, MT[, LDSA]]) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
     N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320."""
     if kind and M:
         from .tuned import lookup

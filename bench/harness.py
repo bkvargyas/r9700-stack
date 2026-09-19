@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import statistics
 import sys
@@ -119,6 +120,7 @@ def run(a):
         metrics[f"agg{c}_tok_s"] = [aggregate(base, c) for _ in range(max(2, reps // 2 + 1))]
     for w in ((2000,) if a.quick else (2000, 8000)):
         metrics[f"prefill{w}w_tok_s"] = [prefill(base, w) for _ in range(max(2, reps // 2 + 1))]
+    os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     with open(a.out, "a") as f:
         for k, xs in metrics.items():
             s = _stats(xs)

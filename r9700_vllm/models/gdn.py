@@ -137,4 +137,14 @@ class R9kQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             n1, n2 = W1.N, W2.N
             note_shape("fp8row", W.N, W.K)
         b.quant_method = _StashedBA(self)
+        # the merged copy is the only one used from here on: release the separate weights (~1 GB/rank on the 27B)
+        for lin in (q, b):
+            for name in ("weight", "weight_scale"):
+                t = getattr(lin, name, None)
+                if isinstance(t, torch.Tensor):
+                    setattr(lin, name, torch.nn.Parameter(t.new_empty((0,)), requires_grad=False))
+            for name in ("_r9k_fp8", "_r9k_mx"):
+                if name in lin.__dict__:
+                    lin.__dict__[name] = None
+        torch.cuda.empty_cache()     # load-time transients: don't leave them as fragmented reserve before profiling
         logger.info_once("r9700: GDN in_proj_qkvz + in_proj_ba merged into one %s GEMM (N=%d+%d)", fq[0], n1, n2)

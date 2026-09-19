@@ -93,6 +93,12 @@ def make(kind, N, Kd):
     return (wq, torch.rand((N + 127) // 128, Kd // 128, device="cuda") + 0.5), 128, N * Kd
 
 
+def ldsa_ok(cfg, mt, Kd, dbk=64):
+    """Mirror of the kernel's LDS-A eligibility rule (moe_launch)."""
+    WV, SK = cfg[0], cfg[1]
+    return Kd % (SK * dbk) == 0 and WV * SK <= 8 and (2 * mt) % WV == 0 and (2 * mt) // WV <= 4
+
+
 def mt_for(M):
     return 4 if M >= 64 else (2 if M >= 32 else 1)
 
@@ -115,12 +121,13 @@ def _runner(kind, W, N, Kd, M, cfg):
     if kind in ("mxfp4", "nvfp4"):
         q, s = K.quant_rows_fp8(x)
         MT = cfg[3] if len(cfg) > 3 else mt_for(M)
+        ldsa = bool(cfg[4]) if len(cfg) > 4 else False
         blk = 16 * MT
         mpad = (M + blk - 1) // blk * blk
         t = (torch.arange(mpad, dtype=torch.int32, device="cuda"), torch.zeros(mpad // blk, dtype=torch.int32,
              device="cuda"), torch.full((1,), mpad, dtype=torch.int32, device="cuda"))
         out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-        return lambda: K.moe_gemm(q, s, W, out, *t, M, 1, None, WV, SK, NPW, num_experts=1, MT=MT)
+        return lambda: K.moe_gemm(q, s, W, out, *t, M, 1, None, WV, SK, NPW, num_experts=1, MT=MT, ldsa=ldsa)
     if kind == "fp8row":
         q, s = K.quant_rows_fp8(x)
         out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
@@ -155,8 +162,10 @@ def main():
             base = configs(Kd, group)
             for M in ms:
                 # 4-bit kernels: the M-tile count per routing block is tuned too (MT tiles share each weight
-                # fragment; fewer, wider blocks trade parallelism for weight re-reads)
-                cand = [c + (mt,) for c in base for mt in (1, 2, 4) if 16 * mt <= max(16, 2 * M)] \
+                # fragment; fewer, wider blocks trade parallelism for weight re-reads), and for MT > 1 whether
+                # the A tile is staged through LDS (kernel-legal configs only)
+                cand = [c + (mt, ld) for c in base for mt in (1, 2, 4) if 16 * mt <= max(16, 2 * M)
+                        for ld in ((0, 1) if mt > 1 and ldsa_ok(c, mt, Kd) else (0,))] \
                     if kind in ("mxfp4", "nvfp4") else base
                 d = default_cfg(kind, N, Kd, M)
                 best, bcfg = 1e9, None

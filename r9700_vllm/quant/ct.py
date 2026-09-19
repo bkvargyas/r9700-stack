@@ -138,6 +138,8 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         layer.input_scale = None
         kern.process_weights_after_loading(layer)
         layer._r9k_mx = kern
+        del packed, e8, bsf
+        torch.cuda.empty_cache()     # fp32 requant transients (~350 MB per big layer) would fragment the pool
         logger.info_once("r9700: fp8 linears requantized to MXFP4 (R9K_FP8_TO_MXFP4=%s)", pat)
         return True
 

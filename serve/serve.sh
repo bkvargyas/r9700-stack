@@ -2,7 +2,7 @@
 # Qwen3.8-Flash-Next GPTQ on STOCK vLLM (ROCm 10 nightly image) + the r9700_vllm plugin, 2x R9700 TP2.
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
-# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
+# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, UTIL, NBT, NSEQ, P2P=1, OVERLAYS=..., EXTRA="...",
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -38,6 +38,10 @@ ARGS=()
 # ATTN=<backend> (e.g. TRITON_ATTN) for the target; DRAFT_ATTN=<backend> for a separate drafter (must support
 # full cudagraphs or vLLM runs the draft eagerly)
 [ -n "$ATTN" ] && ARGS+=(--attention-backend "$ATTN")
+# KVMEM=<GiB>: fixed KV-cache budget instead of the utilization estimate. vLLM's profiling pass underestimates the
+# runtime footprint once load-time requantization / merges are on (27B: OOM at the first 1.7k-token prefill with
+# util 0.90-0.94; its own log suggests ~9.6 GiB); a fixed budget is exact.
+[ -n "$KVMEM" ] && ARGS+=(--kv-cache-memory "$(python3 -c "print(int($KVMEM * 2**30))")")
 # OFFLOAD_GB=0: no expert offload (models that fit in VRAM, e.g. the dense 27B checkpoints)
 OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts)
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
