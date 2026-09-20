@@ -122,7 +122,9 @@ ATTN=CUSTOM DRAFT_ATTN=CUSTOM CHAT_TEMPLATE=qwen-fixed NSEQ=8 OVERLAYS=emulated-
 | + GGZ14 chat template (acceptance +14%) | 118 | 416 | - | 25.3 |
 | + libr4d prefill attention (LBHNC + fp8 descales) | - | - | 2048 | - |
 | + wht6 compressed all-reduce (>=128 KB, opt-in) | - | - | 2250 | - |
-| + large-M prefill GEMM (Fable) | 114 | 437 | **3450** | 26.0 |
+| + large-M prefill GEMM (Fable pass 1+2) | 114 | 437 | 3450 | 26.0 |
+| + NVFP4->MXFP4 conversion at load (R9K_NVFP4=mxfp4) | 124 | 472 | 3740 | 25.5 |
+| + folded-exponent MXFP4 (R9K_FOLD=1, bit-exact here) | 114 | 487 | **3932** | 25.3 |
 
 Quality: GSM8K-200 96.5-97.0%, HumanEval 96.3%, 8/8 concurrent sanity answers.
 
@@ -141,6 +143,28 @@ at every step (the prefill GEMM gave conc-8 +13%).
 KVMEM=); a stale `tuned.json` sync silently reverted the M=32/64 rows; LDS-A with WV=1,MT=4 staged half its tile
 (NaN at batch 64) -- tests/test_tuned_cfgs.py now gates every tuned row.
 
+
+**FINAL BetterBench 2026-09-20** (20 passes, same box, same settings as the GGZ14 baseline), ours vs GGZ14:
+combined decode **189.3 vs 196.5 (96%)**, conc 165/274/404/522 vs 177/294/428/549 (93-95%), prefill sweep
+3838/3902/3843/3649 vs 4776/4950/4906/4745 (~79%), step p50 24.4 vs 23.5 ms, TTFT 99 vs 65 ms, per-category
+acceptance at parity (code 4.69 vs 4.64, file_edit 6.10 vs 6.03). Serve config: `R9K_FOLD=1 R9K_NVFP4=mxfp4
+R9K_AR_QUANT=1 R9K_FP8_TO_MXFP4=1 R9K_BF16_TO_MXFP4=in_proj_ba VLLM_KV_CACHE_LAYOUT=LBHNC KVMEM=9 ATTN=CUSTOM
+DRAFT_ATTN=CUSTOM CHAT_TEMPLATE=qwen-fixed DRAFT=.../Qwen3.8-27B-DFlash2-FP8 SPEC=7`.
+Flash-Next on the same build: single 84.5, conc-8 206, prefill 2165, MTP acceptance 2.75 (all >= its pre-week numbers).
+
+**Remaining prefill gap is GEMM only** (9k prompt, GPU-busy): ours 1361 ms / 768 calls vs GGZ14 930 ms / 484;
+all-reduce 373 vs 360, attention 92 vs 58, glue comparable. Their edge: activations arrive WMMA-fragment-tiled
+(256 B per 16x16 fp8 fragment) from their fused norm+quant, so their GEMM never stages A through LDS.
+
+**Measurement discipline (learned the hard way this week):**
+- ALWAYS check `results.json` `env.endpoint` before quoting a baseline: ~/bb-prod.log is the PRODUCTION box.
+- Never start a run while another is live (two servers on the same GPUs produced 30% CVs and nonsense numbers);
+  `pgrep -f "[g]sm8k|[b]atch|[q]fn"` + `docker ps` before starting.
+- Cold single-shot kernel timings overstate by ~15%: the card sits at 2.2-2.4 GHz / 222 W under sustained load
+  (decode sees 2.82 GHz). Use tuning/prefill_ab.py (warmed, interleaved).
+- GSM8K-500 CANNOT separate these configs: six runs scatter 95.6-97.4% with no consistent ordering. Quality claims
+  need several thousand questions or a different eval.
+- Kernel gates that call the inner op miss served-path breakage: exercise r9700_vllm/ops.py's public wrappers too.
 ### Next
 1. Unit tests on GPU; VM100 RAM 128 -> 256 GB (host has 364 GB free) so experts (70 GB) + PLE (42 GB) fit pinned.
 2. Stock + plugin bring-up (eager), correctness (GSM8K subset, needle), then cudagraphs + MTP.
