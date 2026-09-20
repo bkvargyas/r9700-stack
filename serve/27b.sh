@@ -4,6 +4,10 @@
 #   GSM8K-500 ~96.6-97.4%, HumanEval ~96-98%. Same-box GGZ14 radiance: 196.5 / 177-549 / 4776-4950.
 # Every knob below is measured; see PROGRESS.md for what each one bought and what was rejected.
 exec env \
+  OVERLAYS=${OVERLAYS-emulated-switch} `# host overlay, not the product: VM100 on the .100 PLX box
+                                        # needs the hostcall-free RCCL or every collective fails at
+                                        # launch ("operation cannot be performed in the present state").
+                                        # OVERLAYS= (empty) on a host that does not need it.` \
   R9K_FOLD=1 `                   # folded-exponent MXFP4 (bit-exact on this checkpoint): +5% prefill` \
   R9K_NVFP4=mxfp4 `              # NVFP4 -> MXFP4 at load: +6% everywhere (R9K_NVFP4=native keeps the checkpoint format)` \
   R9K_FP8_TO_MXFP4=1 `           # fp8 attention/GDN/last-8-MLP layers -> MXFP4` \

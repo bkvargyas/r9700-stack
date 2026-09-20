@@ -80,9 +80,15 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
     if M == 0:
         return out
-    q, s = KM.quant_rows_fp8(x)
-    cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4")
+    cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4", fold=fold)
     W = KM.Mxfp4Experts(wq, wsr, N, K, fold)
+    if KM.is_atiled_cfg(cfg):
+        # fragment-tiled activation straight into the WMMA registers (no LDS A staging); folded weights only
+        q, s = KM.quant_rows_fp8(x, tiled=True)
+        t, _ = _identity_tables(x, M, KM.atiled_block(cfg[1]) // KM.MOE_BLOCK)
+        KM.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1], a_tiled=True)
+        return out
+    q, s = KM.quant_rows_fp8(x)
     if KM.is_prefill_cfg(cfg):
         t, _ = _identity_tables(x, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
         KM.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1])

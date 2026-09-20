@@ -945,6 +945,253 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
 
+// ---------------------------------------------------------------- A-tiled prefill kernel (fragment-tiled activations)
+// Same tile family, W staging (folded unpack through LDS, register-prefetched a slab ahead, one LDS-only barrier per
+// slab) and epilogue as the folded prefill kernel above, but the activation comes in WMMA-FRAGMENT-TILED layout
+// (r9k_quant_rows_fp8_tiled): fragment (mt, ks) of the 16-row block mt and K step ks is 256 contiguous bytes at
+// (mt * K/16 + ks) * 256, lane l holding A[mt*16 + l%16][ks*16 + (l/16)*8 .. +8] -- exactly the bytes the WMMA
+// wants in the lane's register. So a wave reads each of its TM x (BK/16) A fragments with ONE coalesced 256-byte
+// global_load_b64 straight into the af[] register the WMMA consumes: no A slab in LDS, no per-fragment ds_read,
+// no staging stores, and the LDS footprint drops from 2 x 26 KB (256x128 tile) to 2 x 8 KB, so more workgroups
+// fit a CU. The price is that the WN waves sharing an M row read the same A fragments WN times from L2 (the LDS
+// version read them once per workgroup), which is why the default tiles use WN = 2.
+// The tiled buffer is indexed by SORTED POSITION (row p of routing block by = position by*BM + r), never through
+// sorted_ids: dense callers pass identity tables so position = row; a routed caller has to write the tiled buffer
+// in sorted order itself. Rows past the buffer's last 16-row block (mt_count) clamp to it (tile-granular, never
+// predicated: they only reach accumulators the epilogue drops through sRow).
+// Folded weights only (nv = 2): the fp32-per-group variant would need the scale staging back and the reference
+// kernel measured the fold as a prerequisite of the win.
+template <int TM, int TN, int WM, int WN, int BK, bool DB>
+__global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kernel(
+    const unsigned char* __restrict__ AT, const float* __restrict__ As,
+    const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
+    const unsigned char* __restrict__ Wref_all, __hip_bfloat16* __restrict__ C,
+    const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
+    const int* __restrict__ ntpp, const float* __restrict__ topk_w,
+    long ws_estride, long wref_estride, int numel, int a_row_div, int mt_count, int K, int N) {
+  constexpr int BM = WM * TM * 16, BN = WN * TN * 16, NT = WM * WN * WAVE32;
+  constexpr int KSPS = BK / 16;                             // WMMA K steps per slab
+  constexpr int SPG = GROUP / 16, G = BK / GROUP;           // K steps per scale group, groups per slab
+  static_assert(G >= 1, "slab must hold a whole scale group");
+  constexpr int WSL = BN * (BK / 8) / NT;                   // uint32 weight slots per thread per slab
+  static_assert(WSL * NT == BN * (BK / 8) && (WSL == 1 || WSL == 2 || WSL == 4), "W slab must split evenly");
+  constexpr int SW_BYTES = BN * BK, NBUF = DB ? 2 : 1;
+  extern __shared__ __align__(16) unsigned char pf_smem[];
+  int* const sRow = (int*)(pf_smem + NBUF * SW_BYTES);
+
+  const int bx = blockIdx.x, by = blockIdx.y;
+  if (by * BM >= ntpp[0]) return;
+  const int e = expert_ids[by];
+  if (e < 0) return;
+  const int first = sorted_ids[by * BM];
+  if (first < 0 || first >= numel) return;
+
+  const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
+  const int wm = wave / WN, wn = wave % WN;
+  const int nlane = lane & 15, mhalf = (lane >> 4) * 8;
+  const int ksteps = K / 16, ntmax = N / 16 - 1;
+  const int nt0 = bx * (BN / 16);
+  const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
+  const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
+  const unsigned char* __restrict__ Wref = Wref_all + (size_t)e * wref_estride;
+
+  for (int r = tid; r < BM; r += NT) {
+    const int fl = sorted_ids[by * BM + r];
+    sRow[r] = (fl < 0 || fl >= numel) ? -1 : fl;            // -1: padding row (computed, never stored)
+  }
+  __syncthreads();
+
+  // A fragment bases: one wave-uniform (SGPR) byte pointer per M fragment, lane part an unsigned 32-bit offset
+  // (saddr-form loads: no 64-bit VALU address chains). Clamped to the last block of the tiled buffer.
+  const unsigned char* abase[TM];
+#pragma unroll
+  for (int i = 0; i < TM; i++) {
+    int mt = by * (BM / 16) + wm * TM + i;
+    mt = mt < mt_count - 1 ? mt : mt_count - 1;
+    abase[i] = AT + (size_t)__builtin_amdgcn_readfirstlane(mt * ksteps * 256);
+  }
+  const unsigned aoff = (unsigned)lane * 8u;
+
+  // Weight slots s = tid*WSL + q (contiguous, never straddling a 32-lane fragment): slot -> (n tile, K step, lane).
+  unsigned w_src, w_dst, ws_own;
+  int wref_own[WSL];
+  FoldTab ftab;
+  {
+    const int s0 = tid * WSL, lane_ = s0 & 31, rest = s0 >> 5, ks = rest % KSPS, ntl = rest / KSPS;
+    const int ntg = nt0 + ntl < ntmax ? nt0 + ntl : ntmax;   // clamped: garbage columns are never stored
+    w_src = (unsigned)(((ntg * ksteps + ks) * WAVE32 + lane_) * 4);
+    w_dst = (unsigned)(((ntl * KSPS + ks) * WAVE32 + lane_) * 8);
+    const int col0 = ntg * 16 + (lane_ & 15);                // lane_ % WSL == 0: the WSL columns are aligned
+    ws_own = (unsigned)((ks / SPG) * N + col0);
+    _Pragma("unroll")
+    for (int q = 0; q < WSL; q++) wref_own[q] = Wref[col0 + q];
+    ftab = fold_tab_load();
+  }
+
+  v8f acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; i++)
+#pragma unroll
+    for (int j = 0; j < TN; j++) acc[i][j] = (v8f)(0.f);
+
+  unsigned int pw[WSL];
+  unsigned int psw = 0;
+  const int nslabs = K / BK;
+#define AT_LOADW(SLAB)                                                                                  \
+  {                                                                                                     \
+    const int slab_ = (SLAB);                                                                           \
+    if constexpr (WSL == 4) {                                                                           \
+      const uint4 v = ld_u32off((const uint4*)Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));      \
+      pw[0] = v.x; pw[1] = v.y; pw[2] = v.z; pw[3] = v.w;                                               \
+    } else if constexpr (WSL == 2) {                                                                    \
+      const uint2 v = ld_u32off((const uint2*)Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));      \
+      pw[0] = v.x; pw[1] = v.y;                                                                         \
+    } else {                                                                                            \
+      pw[0] = ld_u32off(Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));                            \
+    }                                                                                                   \
+    psw = ld_scale_bytes<WSL>(Ws, ws_own + (unsigned)(slab_ * G) * (unsigned)N);                        \
+  }
+#define AT_STOREW(BUF)                                                                                  \
+  {                                                                                                     \
+    unsigned char* const sb_ = pf_smem + (BUF) * SW_BYTES;                                              \
+    _Pragma("unroll")                                                                                   \
+    for (int q = 0; q < WSL; q++)                                                                       \
+      *(v2i*)(sb_ + w_dst + q * 8) =                                                                    \
+          mxfp4_unpack8_fold(pw[q], ftab, fold_dsh(wref_own[q], (int)((psw >> (8 * q)) & 0xFFu)));     \
+  }
+  // A fragments of a slab: TM x KSPS coalesced 256-byte wave reads, issued before the slab's W store + barrier so
+  // their latency overlaps that work; consumed only by the WMMAs.
+#define AT_LOADA(SLAB, AF)                                                                              \
+  {                                                                                                     \
+    const unsigned ko_ = aoff + (unsigned)((SLAB) * KSPS * 256);                                        \
+    _Pragma("unroll")                                                                                   \
+    for (int i = 0; i < TM; i++)                                                                        \
+      _Pragma("unroll")                                                                                 \
+      for (int st = 0; st < KSPS; st++) AF[i][st] = *(const v2i*)(abase[i] + ko_ + (unsigned)(st * 256)); \
+  }
+  const unsigned char* const myW = pf_smem + (wn * TN * KSPS * WAVE32 + lane) * 8;
+#define AT_COMPUTE(OFF, AF)                                                                              \
+  {                                                                                                      \
+    v2i wf[KSPS][TN];                                                                                    \
+    _Pragma("unroll")                                                                                    \
+    for (int st = 0; st < KSPS; st++)                                                                    \
+      _Pragma("unroll")                                                                                  \
+      for (int j = 0; j < TN; j++) wf[st][j] = *(const v2i*)(myW + (OFF) + (j * KSPS + st) * (WAVE32 * 8)); \
+    _Pragma("unroll")                                                                                    \
+    for (int st = 0; st < KSPS; st++)                                                                    \
+      _Pragma("unroll")                                                                                  \
+      for (int j = 0; j < TN; j++)                                                                       \
+        _Pragma("unroll")                                                                                \
+        for (int i = 0; i < TM; i++) {                                                                   \
+          if (R9K_PF_ABL & 2) { acc[i][j][0] += __int_as_float(AF[i][st][0] ^ wf[st][j][1]); continue; } \
+          acc[i][j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(AF[i][st], wf[st][j], acc[i][j]); \
+        }                                                                                                \
+  }
+  v2i af[TM][KSPS];
+  AT_LOADW(0)
+  if constexpr (!DB) {
+    for (int slab = 0; slab < nslabs; slab++) {
+      AT_LOADA(slab, af)
+      AT_STOREW(0)
+      if (!(R9K_PF_ABL & 4)) lds_barrier();
+      if (!(R9K_PF_ABL & 1) && slab + 1 < nslabs) AT_LOADW(slab + 1)
+      AT_COMPUTE(0, af)
+      if (!(R9K_PF_ABL & 4)) lds_barrier();
+    }
+  } else {
+    // One barrier per slab (as in the folded kernel): the store of slab s overwrites buffer s&1, last read during
+    // slab s-2; every wave stores slab s only after passing barrier s-1, which it reaches only after finishing its
+    // slab s-2 WMMAs, so no wave can still be reading that buffer.
+    for (int slab = 0; slab < nslabs; slab++) {
+      const int buf = slab & 1;
+      AT_LOADA(slab, af)
+      AT_STOREW(buf)
+      if (!(R9K_PF_ABL & 4)) lds_barrier();
+      if (!(R9K_PF_ABL & 1) && slab + 1 < nslabs) AT_LOADW(slab + 1)
+      AT_COMPUTE(buf * SW_BYTES, af)
+    }
+  }
+#undef AT_COMPUTE
+#undef AT_LOADA
+#undef AT_STOREW
+#undef AT_LOADW
+
+  // Epilogue: lane holds rows mhalf..+8 of column nlane in every 16x16 tile; rows scatter through sRow.
+#pragma unroll
+  for (int j = 0; j < TN; j++) {
+    const int n = (nt0 + wn * TN + j) * 16 + nlane;
+    if (n >= N) continue;
+    const float wg = __uint_as_float((unsigned)Wref[n] << 23);
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+#pragma unroll
+      for (int q = 0; q < 8; q++) {
+        const int fr = sRow[wm * TM * 16 + i * 16 + mhalf + q];
+        if (fr < 0) continue;
+        float sc = wg * As[fr / a_row_div];
+        if (topk_w) sc *= topk_w[fr];
+        C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
+      }
+    }
+  }
+}
+
+// Tile table of the A-tiled kernel (cfg index -> TM, TN, WM, WN, BK, DB); BM = WM*TM*16, BN = WN*TN*16.
+static const PfCfg kAtCfgs[] = {
+  {4, 2, 4, 2, 64, 1},    // 0: 256 x 64,  8 waves, BK=64
+  {4, 4, 4, 2, 64, 1},    // 1: 256 x 128, 8 waves, BK=64
+  {4, 2, 4, 2, 128, 1},   // 2: 256 x 64,  8 waves, BK=128 (half the barriers per K; 64 A VGPRs)
+  {4, 2, 4, 4, 64, 1},    // 3: 256 x 128, 16 waves (the LDS kernel's cfg-12 geometry)
+  {4, 2, 2, 4, 64, 1},    // 4: 128 x 128, 8 waves
+  {2, 2, 4, 2, 64, 1},    // 5: 128 x 64,  8 waves (small M / grid fill)
+  {4, 4, 4, 2, 64, 0},    // 6: 256 x 128, 8 waves, single-buffered (two barriers per slab)
+  {4, 2, 4, 2, 64, 0},    // 7: 256 x 64,  8 waves, single-buffered
+  {2, 4, 4, 2, 64, 1},    // 8: 128 x 128, 8 waves, TM=2 TN=4
+};
+#define AT_NCFG ((int)(sizeof(kAtCfgs) / sizeof(kAtCfgs[0])))
+
+extern "C" int r9k_moe_atiled_bm(int cfg) {      // rows per routing block of an A-tiled cfg (-1: no such cfg)
+  if (cfg < 0 || cfg >= AT_NCFG) return -1;
+  return kAtCfgs[cfg].WM * kAtCfgs[cfg].TM * 16;
+}
+
+// A-tiled prefill entry: operands as r9k_moe_4bit_prefill with nv = 2 (folded MXFP4), `a` the fragment-tiled
+// activation of mt_count 16-row blocks (r9k_quant_rows_fp8_tiled) in sorted-position order. K % BK == 0.
+extern "C" int r9k_moe_4bit_prefill_at(long a, long as, long wq, long ws, long wref, long c,
+                                       long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                                       long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div,
+                                       int mt_count, int K, int N, int cfg, long stream) {
+  if (N % 16) return -1;
+  if (cfg < 0 || cfg >= AT_NCFG) return -7;
+  if (K % kAtCfgs[cfg].BK) return -2;
+  if (mt_count <= 0) return -9;
+  hipStream_t st = (hipStream_t)stream;
+#define AL(TMv, TNv, WMv, WNv, BKv, DBv)                                                                  \
+  {                                                                                                        \
+    constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
+    const size_t smem = (DBv ? 2 : 1) * (size_t)BN * BKv + (size_t)BM * 4;                                 \
+    dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
+    hipLaunchKernelGGL((r9k_moe_4bit_prefill_at_kernel<TMv, TNv, WMv, WNv, BKv, DBv>), grid, block, smem, st, \
+        (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \
+        (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids, (const int*)expert_ids,    \
+        (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel, a_row_div, mt_count, K, N); \
+  }
+  switch (cfg) {
+    case 0: AL(4, 2, 4, 2, 64, true); break;
+    case 1: AL(4, 4, 4, 2, 64, true); break;
+    case 2: AL(4, 2, 4, 2, 128, true); break;
+    case 3: AL(4, 2, 4, 4, 64, true); break;
+    case 4: AL(4, 2, 2, 4, 64, true); break;
+    case 5: AL(2, 2, 4, 2, 64, true); break;
+    case 6: AL(4, 4, 4, 2, 64, false); break;
+    case 7: AL(4, 2, 4, 2, 64, false); break;
+    case 8: AL(2, 4, 4, 2, 64, true); break;
+    default: return -7;
+  }
+#undef AL
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
 // Vectorized single-pass variant: each thread keeps its 16-byte chunks of the row in registers (one DRAM read),
 // block max via wave shuffles + LDS, then hardware OCP-e4m3 conversion (v_cvt_pk_fp8_f32) and 8-byte stores.
 // Needs K % 8 == 0, 16-byte aligned rows and K <= RQ_THREADS * RQ_VEC * 8. ~4x fewer instructions than the
@@ -954,6 +1201,11 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
 __device__ __forceinline__ float bf16lo(unsigned int w) { return __uint_as_float(w << 16); }
 __device__ __forceinline__ float bf16hi(unsigned int w) { return __uint_as_float(w & 0xFFFF0000u); }
 
+// TILED: the fp8 bytes go to the WMMA-fragment-tiled layout of r9k_moe_4bit_prefill_at (8-element group c of row
+// r = uint2 slot ((r/16) * K/16 + c/2) * 32 + r%16 + 16 * (c%2)); same 8-byte store per group, only its address
+// differs (K % 16 == 0). Rows the caller pads (M .. 16*ceil(M/16)) are never written: the GEMM computes on them
+// and drops them.
+template <bool TILED>
 __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
     const __hip_bfloat16* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ s, int K, int ld) {
   const int row = blockIdx.x, tid = threadIdx.x, nvec = K / 8;
@@ -981,7 +1233,7 @@ __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
   const float amax = fmaxf(wmax[0], 1e-12f);
   const float inv = 448.f / amax;
   if (tid == 0) s[row] = amax / 448.f;
-  uint2* qr = (uint2*)(q + (size_t)row * K);
+  uint2* qr = TILED ? (uint2*)q + (size_t)(row >> 4) * (K / 16) * 32 + (row & 15) : (uint2*)(q + (size_t)row * K);
 #pragma unroll
   for (int i = 0; i < RQ_VEC; i++) {
     const int c = tid + i * RQ_THREADS;
@@ -990,17 +1242,27 @@ __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
     lo = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].y) * inv, bf16hi(v[i].y) * inv, lo, true);
     int hi = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].z) * inv, bf16hi(v[i].z) * inv, 0, false);
     hi = __builtin_amdgcn_cvt_pk_fp8_f32(bf16lo(v[i].w) * inv, bf16hi(v[i].w) * inv, hi, true);
-    qr[c] = make_uint2((unsigned int)lo, (unsigned int)hi);
+    qr[TILED ? (c >> 1) * 32 + 16 * (c & 1) : c] = make_uint2((unsigned int)lo, (unsigned int)hi);
   }
 }
 
 extern "C" int r9k_quant_rows_fp8(long x, long q, long s, int M, int K, int ld, long stream) {
   if (M <= 0) return 0;
   if (K % 8 == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && K <= RQ_THREADS * RQ_VEC * 8)
-    hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
+    hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel<false>, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
                        (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
   else
     hipLaunchKernelGGL(r9k_quant_rows_fp8_kernel, dim3(M), dim3(256), 0, (hipStream_t)stream,
                        (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Fragment-tiled variant (see r9k_quant_rows_fp8_v2_kernel<true>): q must hold 16*ceil(M/16) * K bytes. Needs
+// K % 16 == 0 and the vectorized kernel's limits (K <= 20480, 16-byte aligned rows); -3 otherwise.
+extern "C" int r9k_quant_rows_fp8_tiled(long x, long q, long s, int M, int K, int ld, long stream) {
+  if (M <= 0) return 0;
+  if (!(K % 16 == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && K <= RQ_THREADS * RQ_VEC * 8)) return -3;
+  hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel<true>, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
+                     (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }

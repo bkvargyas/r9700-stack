@@ -81,6 +81,8 @@ def graph_time(fn, reps=20, iters=5):
 
 def make(kind, N, Kd):
     g = torch.Generator(device="cuda").manual_seed(0)
+    if kind == "quant":                    # no weight: the "shape" is (rows M, K) of the activation, see _runner
+        return None, 16, 1 << 20
     if kind in ("mxfp4", "nvfp4"):
         packed = torch.randint(0, 256, (1, N, Kd // 2), dtype=torch.uint8, device="cuda", generator=g)
         if kind == "mxfp4":
@@ -122,6 +124,17 @@ def runner(kind, Ws, N, Kd, M, cfg, fold=False):
 
 def _runner(kind, W, N, Kd, M, cfg):
     x = torch.randn(M, Kd, device="cuda").to(torch.bfloat16)
+    if kind == "quant":                                          # activation quantizer alone: cfg "row" / "tiled"
+        tiled = cfg == "tiled"
+        return lambda: K.quant_rows_fp8(x, tiled=tiled)
+    if kind == "mxfp4" and K.is_atiled_cfg(cfg):                 # ("A", cfg): A-tiled prefill kernel (folded W)
+        q, s = K.quant_rows_fp8(x, tiled=True)
+        blk = K.atiled_block(cfg[1])
+        mpad = (M + blk - 1) // blk * blk
+        t = (torch.arange(mpad, dtype=torch.int32, device="cuda"), torch.zeros(mpad // blk, dtype=torch.int32,
+             device="cuda"), torch.full((1,), mpad, dtype=torch.int32, device="cuda"))
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        return lambda: K.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1], a_tiled=True)
     if kind in ("mxfp4", "nvfp4") and K.is_prefill_cfg(cfg):   # ("P", tile cfg): LDS-tiled prefill kernel
         q, s = K.quant_rows_fp8(x)
         blk = K.prefill_block(cfg[1])

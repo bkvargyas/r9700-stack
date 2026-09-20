@@ -39,6 +39,13 @@ def lib() -> ctypes.CDLL:
         assert L.r9k_moe_block() == MOE_BLOCK
         if hasattr(L, "r9k_fold_supported"):          # older libr9k.so builds have no folded kernels
             L.r9k_fold_supported.restype = ctypes.c_int
+        if hasattr(L, "r9k_moe_4bit_prefill_at"):     # ... or no A-tiled kernels
+            L.r9k_moe_4bit_prefill_at.restype = ctypes.c_int
+            L.r9k_moe_4bit_prefill_at.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 7 + [ctypes.c_long]
+            L.r9k_moe_atiled_bm.restype = ctypes.c_int
+            L.r9k_moe_atiled_bm.argtypes = [ctypes.c_int]
+            L.r9k_quant_rows_fp8_tiled.restype = ctypes.c_int
+            L.r9k_quant_rows_fp8_tiled.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         _LIB = L
     return _LIB
 
@@ -46,6 +53,10 @@ def lib() -> ctypes.CDLL:
 def fold_supported() -> bool:
     L = lib()
     return hasattr(L, "r9k_fold_supported") and bool(L.r9k_fold_supported())
+
+
+def atiled_supported() -> bool:
+    return hasattr(lib(), "r9k_moe_4bit_prefill_at")
 
 
 def _stream() -> int:
@@ -229,16 +240,39 @@ def _default_log(msg: str) -> None:
         print(msg)
 
 
-def quant_rows_fp8(x: torch.Tensor):
-    """bf16 [M, K] -> (e4m3fn [M, K], fp32 [M]) with a per-row dynamic scale."""
+def quant_rows_fp8(x: torch.Tensor, tiled: bool = False):
+    """bf16 [M, K] -> (e4m3fn [M, K], fp32 [M]) with a per-row dynamic scale.
+
+    tiled: the fp8 bytes in the WMMA-fragment-tiled layout the A-tiled prefill kernel reads (16*ceil(M/16) rows;
+    fragment (row//16, k//16) = 256 contiguous bytes, see r9k_quant_rows_fp8_tiled); returned as a [16*Mt, K]
+    e4m3fn tensor whose bytes are NOT row-major (only moe_gemm(..., a_tiled=True) may consume it). Same values and
+    scales as the row-major quant, only the store addresses differ."""
     assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(1) == 1
     M, K = x.shape
-    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     s = torch.empty((M,), dtype=torch.float32, device=x.device)
+    if tiled:
+        mt = (M + 15) // 16
+        q = torch.empty((mt * 16, K), dtype=torch.float8_e4m3fn, device=x.device)
+        rc = lib().r9k_quant_rows_fp8_tiled(x.data_ptr(), q.data_ptr(), s.data_ptr(), M, K, x.stride(0), _stream())
+        if rc:
+            raise RuntimeError(f"r9k_quant_rows_fp8_tiled failed ({rc}) M={M} K={K}")
+        return q, s
+    q = torch.empty((M, K), dtype=torch.float8_e4m3fn, device=x.device)
     rc = lib().r9k_quant_rows_fp8(x.data_ptr(), q.data_ptr(), s.data_ptr(), M, K, x.stride(0), _stream())
     if rc:
         raise RuntimeError(f"r9k_quant_rows_fp8 failed ({rc})")
     return q, s
+
+
+def tile_fp8_ref(q: torch.Tensor) -> torch.Tensor:
+    """Pure-torch re-layout of a row-major e4m3 [M, K] into the fragment-tiled [16*ceil(M/16), K] buffer (tests):
+    fragment (mt, ks) -> 32 lanes x 8 bytes, lane l = row mt*16 + l%16, bytes ks*16 + 8*(l//16) .. +8."""
+    M, K = q.shape
+    mt = (M + 15) // 16
+    b = torch.zeros((mt * 16, K), dtype=torch.uint8, device=q.device)
+    b[:M] = q.view(torch.uint8)
+    b = b.reshape(mt, 16, K // 16, 2, 8).permute(0, 2, 3, 1, 4)     # [mt, ks, half, row, 8] -> lane = half*16 + row
+    return b.contiguous().reshape(mt * 16, K).view(torch.float8_e4m3fn)
 
 
 def silu_mul_quant_fp8(gu: torch.Tensor):
@@ -276,10 +310,52 @@ def is_prefill_cfg(cfg) -> bool:
     return bool(cfg) and cfg[0] == "P"
 
 
+# A-tiled prefill kernel (r9k_moe_4bit_prefill_at: fragment-tiled activations straight from global, folded weights
+# through LDS). cfg -> (BM, BN, BK); mirrors kAtCfgs in the kernel (atiled_block() asks it). Selected by pick_cfg as
+# ("A", cfg) for folded dense MXFP4 GEMMs at prefill M when R9K_ATILED=1 and K % BK == 0; the caller then quantizes
+# with quant_rows_fp8(x, tiled=True) and runs moe_gemm(..., a_tiled=True). Everything else keeps the LDS-A tiles.
+ATILED_TILES = {0: (256, 64, 64), 1: (256, 128, 64), 2: (256, 64, 128), 3: (256, 128, 64), 4: (128, 128, 64),
+                5: (128, 64, 64), 6: (256, 128, 64), 7: (256, 64, 64), 8: (128, 128, 64)}
+ATILED = os.environ.get("R9K_ATILED", "1") == "1"
+# Untuned shapes, by M band (measured 2026-09-20 on the five served 27B shapes, steady state, vs the folded LDS-A
+# tiles: 0.83-0.92x at M >= 2048 on the 256x128 8-wave tile, 0.74-0.83x at 512 on 256x64, 0.74-0.86x at 128-256
+# on 128x64; the 256-row tiles lose at M=128 where half the tile is padding).
+ATILED_DEFAULT = int(os.environ.get("R9K_ATILED_CFG", "1"))              # M >= 2048: 256 x 128, 8 waves
+ATILED_DEFAULT_MID = int(os.environ.get("R9K_ATILED_CFG_MID", "0"))      # 512 <= M < 2048: 256 x 64
+ATILED_DEFAULT_SMALL = int(os.environ.get("R9K_ATILED_CFG_SMALL", "5"))  # M < 512: 128 x 64
+# The tiled quantizer has no scalar fallback (r9k_quant_rows_fp8_tiled returns -3 past the vectorized kernel's
+# reach), so a K it cannot serve must not pick this path at all: RQ_THREADS * RQ_VEC * 8 in the kernel.
+ATILED_MAX_K = 20480
+
+
+def atiled_block(cfg: int) -> int:
+    bm = lib().r9k_moe_atiled_bm(cfg)
+    if bm <= 0:
+        raise ValueError(f"unknown A-tiled cfg {cfg}")
+    return bm
+
+
+def is_atiled_cfg(cfg) -> bool:
+    return bool(cfg) and cfg[0] == "A"
+
+
+def pick_atiled(N: int, K: int, M: int) -> tuple[str, int] | None:
+    """("A", cfg) for a folded dense MXFP4 GEMM at M >= PREFILL_MIN_M when the tiled path is on and legal."""
+    if not ATILED or M < PREFILL_MIN_M or K % 64 or K > ATILED_MAX_K or not atiled_supported():
+        return None
+    from .tuned import lookup
+    t = lookup("mxfp4_at", N, K, M)
+    if t and is_atiled_cfg(t) and K % ATILED_TILES[t[1]][2] == 0:
+        return ("A", t[1])
+    cfg = ATILED_DEFAULT if M >= 2048 else (ATILED_DEFAULT_MID if M >= 512 else ATILED_DEFAULT_SMALL)
+    return ("A", cfg) if K % ATILED_TILES[cfg][2] == 0 else None
+
+
 def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.Tensor,
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
              a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
-             num_experts: int | None = None, MT: int = 1, ldsa: bool = False, prefill: int | None = None):
+             num_experts: int | None = None, MT: int = 1, ldsa: bool = False, prefill: int | None = None,
+             a_tiled: bool = False):
     """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
 
     sorted_ids/expert_ids must come from moe_align_block_size(block_size=16*MT). MT M-tiles per workgroup share
@@ -289,9 +365,24 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     from moe_align_block_size(block_size=prefill_block(cfg)) and WV/SK/NPW/MT/ldsa are ignored.
     The grid covers at most ceil(numel/BLK) + min(numel, E) blocks -- the most moe_align_block_size can fill
     with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
-    launch stays cudagraph-safe."""
+    launch stays cudagraph-safe.
+    a_tiled: a_q is the fragment-tiled buffer of quant_rows_fp8(tiled=True) in sorted-position order (dense:
+    identity tables) and `prefill` is an A-tiled cfg (atiled_block(cfg) rows per block); folded MXFP4 only."""
     assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     E = num_experts if num_experts is not None else w.wq.shape[0]
+    if a_tiled:
+        assert prefill is not None and isinstance(w, Mxfp4Experts) and w.fold, "a_tiled: folded MXFP4 prefill only"
+        blk = atiled_block(prefill)
+        max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+        rc = lib().r9k_moe_4bit_prefill_at(
+            a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
+            w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
+            sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+            topk_w.data_ptr() if topk_w is not None else 0,
+            w.estride, w.estride, max_blocks, numel, a_row_div, a_q.shape[0] // 16, w.K, w.N, prefill, _stream())
+        if rc:
+            raise RuntimeError(f"r9k_moe_4bit_prefill_at failed ({rc}) N={w.N} K={w.K} cfg={prefill}")
+        return out
     if prefill is not None:
         blk = prefill_block(prefill)
         max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
@@ -331,12 +422,17 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     return out
 
 
-def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str | None = None
-             ) -> tuple[int, ...]:
+def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str | None = None,
+             fold: bool = False) -> tuple[int, ...]:
     """A legal (WV, SK, NPW[, MT[, LDSA]]) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
     N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320.
     Large M (dense prefill) returns ("P", cfg): the LDS-tiled prefill kernel (tuned.json rows ["P", cfg], else
-    PREFILL_DEFAULT from M >= PREFILL_MIN_M when K % 64 == 0)."""
+    PREFILL_DEFAULT from M >= PREFILL_MIN_M when K % 64 == 0); or ("A", cfg), the A-tiled kernel, for folded
+    MXFP4 (fold=True) when R9K_ATILED is on (pick_atiled)."""
+    if kind == "mxfp4" and M and fold:
+        t = pick_atiled(N, K, M)
+        if t:
+            return t
     if kind and M:
         from .tuned import lookup
         t = lookup(kind, N, K, M)
