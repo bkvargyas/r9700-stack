@@ -100,6 +100,15 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         """(N, K) of one GEMM from its packed scale tensor [E, K/32 + 1, N]."""
         return ws.shape[2], (ws.shape[1] - 1) * K.GROUP
 
+    # folded-exponent kernels per GEMM (quant/ct.py decides per tensor at weight prep: layer._r9k_fold)
+    fold = (False, False)
+
+    def process_weights_after_loading(self, layer) -> None:
+        sup = getattr(super(), "process_weights_after_loading", None)
+        if sup is not None:
+            sup(layer)
+        self.fold = tuple(getattr(layer, "_r9k_fold", (False, False)))
+
     def moe_problem_size(self, a1, w1, w2, topk_ids):
         N1, _ = self._dims(self.w1_scale)
         return w1.size(0), a1.size(0), N1 // 2, a1.size(-1), topk_ids.size(1)
@@ -130,7 +139,8 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         pf_gate = K.pick_moe_prefill(MT, K1, gate_up=True)
         cache = getattr(self, "r9k_cache", None)
         if cache is None:
-            passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1), K.Mxfp4Experts(w2, self.w2_scale, N2, K2),
+            passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1, self.fold[0]),
+                       K.Mxfp4Experts(w2, self.w2_scale, N2, K2, self.fold[1]),
                        moe_align_block_size(topk_ids, blk, global_num_experts, expert_map))]
         else:
             assert expert_map is None, "r9k expert cache: expert parallelism not supported"

@@ -53,10 +53,12 @@ class R9700Mxfp4LinearKernel(MxFp4LinearKernel):
         layer.weight = Parameter(K.permute_fragments(w.view(torch.uint8)[None]), requires_grad=False)
         layer.weight_scale = Parameter(K.pack_scales(s.view(torch.uint8)[None]), requires_grad=False)
         layer._r9k_nk = (N, 2 * Kh)
+        layer._r9k_fold = K.fold_decide(layer.weight_scale.data, getattr(layer, "prefix", "") or f"mxfp4 {N}x{2 * Kh}",
+                                        logger.info)
         logger.info_once("r9700: dense MXFP4 linears on libr9k (weight-only, fp8 activations)")
 
     def apply_weights(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         from ..ops import mxfp4_linear
         N, Kd = layer._r9k_nk
-        out = mxfp4_linear(x, layer.weight, layer.weight_scale, N, Kd).to(x.dtype)
+        out = mxfp4_linear(x, layer.weight, layer.weight_scale, N, Kd, getattr(layer, "_r9k_fold", False)).to(x.dtype)
         return out + bias if bias is not None else out

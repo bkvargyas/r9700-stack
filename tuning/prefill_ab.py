@@ -8,6 +8,7 @@ harness loads the libraries side by side (ctypes, same ABI), warms the GPU to a 
 
 usage: prefill_ab.py --libs head=/opt/r9700/kernels_head/libr9k.so,new=/opt/r9700/kernels/libr9k.so
                      --cases "nvfp4:17408,5120:2048:head/P8,new/P8,new/P12" [--rounds 6] [--warm 10]
+cfg names: P<n> prefill tile n, F<n> the same tile with folded exponents (MXFP4), old the MT kernel, foldold folded MT.
 """
 import argparse
 import ctypes
@@ -58,11 +59,13 @@ def main():
         runners = []
         for c in cfgs.split(","):
             lname, cfg = c.split("/")
-            if cfg == "old":
-                cc = (2, 4, 2, 4, 1) if T.ldsa_ok((2, 4, 2), 4, Kd) else (2, 4, 2, 4, 0)
+            fold = cfg.startswith("F") or cfg == "foldold"
+            if cfg in ("old", "foldold"):
+                mt = T.mt_for(M)
+                cc = (2, 4, 2, mt, 1) if mt > 1 and T.ldsa_ok((2, 4, 2), mt, Kd) else (2, 4, 2, mt, 0)
             else:
                 cc = ("P", int(cfg[1:]))
-            runners.append((f"{kind} {N}x{Kd} M={M} {lname}/{cfg}", lname, T.runner(kind, Ws, N, Kd, M, cc),
+            runners.append((f"{kind} {N}x{Kd} M={M} {lname}/{cfg}", lname, T.runner(kind, Ws, N, Kd, M, cc, fold),
                             2.0 * M * N * Kd, len(Ws), (kind, f"{N},{Kd}", str(M), cfg)))
         # steady state: hammer the GPU for --warm seconds before the first shape, a few seconds before the others
         K._LIB = libs[runners[0][1]]

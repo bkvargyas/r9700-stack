@@ -38,6 +38,7 @@ def main():
     ap.add_argument("--iters", type=int, default=5)
     ap.add_argument("--warm", type=float, default=0.0, help="seconds of load before timing (steady-state clocks)")
     ap.add_argument("--rounds", type=int, default=1, help="interleaved timing rounds per cfg (min reported)")
+    ap.add_argument("--fold", default="", help="cfgs (comma list, same names as --cfgs) also timed with folded exponents")
     a = ap.parse_args()
     E, topk = a.E, a.topk
     g = torch.Generator(device="cuda").manual_seed(0)
@@ -47,6 +48,9 @@ def main():
     p2 = torch.randint(0, 256, (E, N2, K2 // 2), dtype=torch.uint8, device="cuda", generator=g)
     s2 = torch.randint(118, 128, (E, N2, K2 // 32), dtype=torch.uint8, device="cuda", generator=g)
     W1, W2 = K.prepare_mxfp4_weights(p1, s1), K.prepare_mxfp4_weights(p2, s2)
+    import dataclasses
+    W1f, W2f = dataclasses.replace(W1, fold=True), dataclasses.replace(W2, fold=True)
+    cfg_list = [(c, False) for c in a.cfgs.split(",")] + [(c, True) for c in a.fold.split(",") if c]
     b1 = E * (N1 * K1 // 2 + N1 * K1 // 32)
     b2 = E * (N2 * K2 // 2 + N2 * K2 // 32)
     for M in (int(v) for v in a.tokens.split(",")):
@@ -64,20 +68,21 @@ def main():
         o2 = torch.empty(numel, N2, dtype=torch.bfloat16, device="cuda")
         flop1, flop2 = 2.0 * numel * N1 * K1, 2.0 * numel * N2 * K2
         fns = []
-        for c in a.cfgs.split(","):
+        for c, fold in cfg_list:
+            Wa, Wb = (W1f, W2f) if fold else (W1, W2)
             if c == "old":
                 MT = K.pick_mt(numel, E)
                 blk = 16 * MT
                 sid, eid, ntpp = align(topk_ids, blk, E)
-                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT: K.moe_gemm(xq, xs, W1, o1, sid, eid, ntpp, numel, topk, None, 2, 4, 2, num_experts=E, MT=MT)
-                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT: K.moe_gemm(hq, hs, W2, o2, sid, eid, ntpp, numel, 1, tw, 4, 2, 1, num_experts=E, MT=MT)
+                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wa=Wa: K.moe_gemm(xq, xs, Wa, o1, sid, eid, ntpp, numel, topk, None, 2, 4, 2, num_experts=E, MT=MT)
+                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wb=Wb: K.moe_gemm(hq, hs, Wb, o2, sid, eid, ntpp, numel, 1, tw, 4, 2, 1, num_experts=E, MT=MT)
             else:
                 cfg = int(c[1:])
                 blk = K.prefill_block(cfg)
                 sid, eid, ntpp = align(topk_ids, blk, E)
-                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg: K.moe_gemm(xq, xs, W1, o1, sid, eid, ntpp, numel, topk, None, num_experts=E, prefill=cfg)
-                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg: K.moe_gemm(hq, hs, W2, o2, sid, eid, ntpp, numel, 1, tw, num_experts=E, prefill=cfg)
-            fns.append((c, blk, int(ntpp.item()) // blk, f1, f2))
+                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg, Wa=Wa: K.moe_gemm(xq, xs, Wa, o1, sid, eid, ntpp, numel, topk, None, num_experts=E, prefill=cfg)
+                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg, Wb=Wb: K.moe_gemm(hq, hs, Wb, o2, sid, eid, ntpp, numel, 1, tw, num_experts=E, prefill=cfg)
+            fns.append((c + ("+fold" if fold else ""), blk, int(ntpp.item()) // blk, f1, f2))
         if a.warm > 0:
             import time
             t0 = time.time()
@@ -94,7 +99,7 @@ def main():
                 b[0], b[1] = min(b[0], u1), min(b[1], u2)
         for c, blk, nblk, f1, f2 in fns:
             u1, u2 = best[c]
-            print(f"tokens={M:5d} rows={numel:6d} {c:4s} blk={blk:3d} blocks={nblk:5d} pad={nblk * blk / numel:.2f}x | "
+            print(f"tokens={M:5d} rows={numel:6d} {c:9s} blk={blk:3d} blocks={nblk:5d} pad={nblk * blk / numel:.2f}x | "
                   f"gate_up {u1:7.1f} us {flop1 / u1 / 1e6:5.1f} TF {b1 / u1 / 1e3:4.0f} GB/s | "
                   f"down {u2:7.1f} us {flop2 / u2 / 1e6:5.1f} TF {b2 / u2 / 1e3:4.0f} GB/s", flush=True)
 

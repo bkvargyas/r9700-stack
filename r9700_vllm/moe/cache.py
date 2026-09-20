@@ -130,6 +130,7 @@ class LayerCache:
         E = w13.shape[0]
         self.E, self.S, self.layer_idx = E, min(slots, E, 1024), layer_idx
         self.N1, self.K1, self.N2, self.K2 = N1, K1, N2, K2
+        self.fold = (False, False)          # folded-exponent kernels per GEMM (prep.maybe_attach_cache sets it)
         # host backing store (all E): weights already UVA (caller guarantees), scales moved to host
         self.h_w13, self.h_w2 = w13, w2
         self.h_s13, self.h_s2 = _uva_empty(s13.shape, torch.uint8), _uva_empty(s2.shape, torch.uint8)
@@ -295,14 +296,16 @@ class LayerCache:
             self._stage_miss.data_ptr(), self._stage_n.data_ptr(), self.chunks, max(self.lanes, 32), stream)
         if rc:
             raise RuntimeError(f"r4d_lru_gather (staging) failed ({rc})")
-        return (K.Mxfp4Experts(st["w13"], st["s13"], self.N1, self.K1),
-                K.Mxfp4Experts(st["w2"], st["s2"], self.N2, self.K2), self._stage_map)
+        return (K.Mxfp4Experts(st["w13"], st["s13"], self.N1, self.K1, self.fold[0]),
+                K.Mxfp4Experts(st["w2"], st["s2"], self.N2, self.K2, self.fold[1]), self._stage_map)
 
     def hot(self):
-        return K.Mxfp4Experts(self.a_w13, self.a_s13, self.N1, self.K1), K.Mxfp4Experts(self.a_w2, self.a_s2, self.N2, self.K2)
+        return (K.Mxfp4Experts(self.a_w13, self.a_s13, self.N1, self.K1, self.fold[0]),
+                K.Mxfp4Experts(self.a_w2, self.a_s2, self.N2, self.K2, self.fold[1]))
 
     def cold(self):
-        return K.Mxfp4Experts(self.h_w13, self.h_s13, self.N1, self.K1), K.Mxfp4Experts(self.h_w2, self.h_s2, self.N2, self.K2)
+        return (K.Mxfp4Experts(self.h_w13, self.h_s13, self.N1, self.K1, self.fold[0]),
+                K.Mxfp4Experts(self.h_w2, self.h_s2, self.N2, self.K2, self.fold[1]))
 
 
 def slots_per_layer(bytes_per_expert: int) -> int:

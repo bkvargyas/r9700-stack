@@ -37,8 +37,15 @@ def lib() -> ctypes.CDLL:
         L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
         L.r9k_silu_mul_quant_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 2 + [ctypes.c_long]
         assert L.r9k_moe_block() == MOE_BLOCK
+        if hasattr(L, "r9k_fold_supported"):          # older libr9k.so builds have no folded kernels
+            L.r9k_fold_supported.restype = ctypes.c_int
         _LIB = L
     return _LIB
+
+
+def fold_supported() -> bool:
+    L = lib()
+    return hasattr(L, "r9k_fold_supported") and bool(L.r9k_fold_supported())
 
 
 def _stream() -> int:
@@ -51,6 +58,7 @@ class Mxfp4Experts:
     wsr: torch.Tensor   # [E, K/32 + 1, N] uint8: E8M0 exponents K-block-major, last row = per-row reference
     N: int
     K: int
+    fold: bool = False  # folded-exponent kernels (fold_decide() per tensor at weight prep; layout is unchanged)
 
     @property
     def estride(self) -> int:
@@ -108,6 +116,117 @@ def pack_scales(scale: torch.Tensor) -> torch.Tensor:
     out[:, :nb].copy_(scale.transpose(1, 2))
     out[:, nb] = scale.max(dim=2).values
     return out
+
+
+# ------------------------------------------------------------------------------------ folded-exponent MXFP4
+# The kernels can fold each block's E8M0 into the e2m1 -> e4m3 unpack (kMag table: value * 2^-d, d = row reference
+# exponent - block exponent) and apply only 2^(ref - 127) per row in the epilogue: no per-group fp32 scaling in the
+# inner loop. e4m3 reaches 2^-9 below the row's largest block, so the fold is
+#   exact     for d <= FOLD_EXACT (8): every e2m1 value (0.5 .. 6) is representable, subnormals included;
+#   rounded   for 9 <= d <= FOLD_REACH (12): mantissa bits fall off the bottom of the subnormal range (kMag rounds);
+#   flushed   for d >= 13: the block reads as zero (its weights are < 2^-12 of the row's largest block).
+# A flushed weight errs by at most 2^-10 * 2^ref, i.e. < 1/6000 of the row's largest weight; the damage is bounded
+# per weight but a tensor whose rows are dominated by such blocks would silently lose them, so folding is decided
+# per weight tensor from the d distribution (fold_stats) against explicit thresholds (fold_ok), logged at load.
+# R9K_FOLD: 0 (default) never fold; 1 fold when the tensor passes the guard; force fold regardless (measurements).
+FOLD_EXACT, FOLD_REACH = 8, 12
+FOLD_MODE = os.environ.get("R9K_FOLD", "0").lower()
+FOLD_MAX_INEXACT = float(os.environ.get("R9K_FOLD_MAX_INEXACT", "0.05"))   # max fraction of blocks with d > 8
+FOLD_MAX_FLUSH = float(os.environ.get("R9K_FOLD_MAX_FLUSH", "0.001"))      # max fraction of blocks with d > 12
+# Short-K tensors are not FMA-bound (few slabs, weight-stream / launch bound) and the fold's per-slab scale load +
+# lane permutes cost more than the FMAs they remove: measured on the Flash-Next routed down GEMM (K=320, cfg 11:
+# 1010 -> 1048 us @2048 tokens, 1659 -> 1696 @4096), while every K >= 2560 shape gained 6-16%.
+FOLD_MIN_K = int(os.environ.get("R9K_FOLD_MIN_K", "1024"))
+
+
+@dataclass
+class FoldStats:
+    blocks: int
+    hist: list            # hist[d] = blocks with d = ref - block exponent (d clamped to 0..16; 16 = ">15")
+    max_d: int
+    K: int = 0            # the GEMM's K (folding is not worth it below FOLD_MIN_K)
+
+    @property
+    def p_inexact(self) -> float:
+        return sum(self.hist[FOLD_EXACT + 1:]) / max(1, self.blocks)
+
+    @property
+    def p_flush(self) -> float:
+        return sum(self.hist[FOLD_REACH + 1:]) / max(1, self.blocks)
+
+    @property
+    def mean_d(self) -> float:
+        return sum(d * n for d, n in enumerate(self.hist)) / max(1, self.blocks)
+
+    def __str__(self):
+        return (f"K={self.K} blocks={self.blocks} mean_d={self.mean_d:.2f} max_d={self.max_d} "
+                f"inexact(d>{FOLD_EXACT})={100 * self.p_inexact:.3f}% flushed(d>{FOLD_REACH})={100 * self.p_flush:.4f}%")
+
+
+def fold_stats(wsr: torch.Tensor, chunk: int = 64 << 20) -> FoldStats:
+    """Distribution of d = row reference exponent - block exponent over a packed [E, K/32 + 1, N] scale tensor
+    (pack_scales layout; the last row is the reference). Chunked over experts, any device."""
+    E, nb1, N = wsr.shape
+    hist = torch.zeros(17, dtype=torch.int64)
+    step = max(1, chunk // (nb1 * N))
+    for e0 in range(0, E, step):
+        w = wsr[e0:e0 + step].to(torch.int16)
+        d = (w[:, -1:, :] - w[:, :-1, :]).clamp_(0, 16)
+        hist += torch.bincount(d.reshape(-1), minlength=17).cpu()
+    h = hist.tolist()
+    return FoldStats(E * (nb1 - 1) * N, h, max(i for i, n in enumerate(h) if n) if any(h) else 0, (nb1 - 1) * GROUP)
+
+
+def fold_ok(st: FoldStats) -> bool:
+    return fold_why(st) == ""
+
+
+def fold_why(st: FoldStats) -> str:
+    """'' when the tensor may fold, else the reason it stays on the exact kernels."""
+    if st.p_inexact > FOLD_MAX_INEXACT or st.p_flush > FOLD_MAX_FLUSH:
+        return "exceeds R9K_FOLD_MAX_INEXACT/FLUSH"
+    if st.K < FOLD_MIN_K:
+        return f"K={st.K} < R9K_FOLD_MIN_K={FOLD_MIN_K}: no gain on short K"
+    return ""
+
+
+_FOLD_LOG: list[tuple[str, bool, FoldStats]] = []
+
+
+def fold_decide(wsr: torch.Tensor, name: str = "", log=None) -> bool:
+    """Whether the MXFP4 tensor `wsr` (pack_scales layout) is served with the folded-exponent kernels: R9K_FOLD off
+    -> False without looking; on -> fold_ok(fold_stats); force -> True. Every decision is logged (with the stats and
+    running totals) so a checkpoint that folds badly is visible at load rather than silently degraded."""
+    if FOLD_MODE in ("", "0", "off", "no"):
+        return False
+    if not fold_supported():
+        return False
+    st = fold_stats(wsr)
+    why = fold_why(st)
+    fold = not why or FOLD_MODE == "force"
+    _FOLD_LOG.append((name, fold, st))
+    n_on = sum(1 for _, f, _ in _FOLD_LOG if f)
+    msg = (f"r9700: fold {'ON ' if fold else 'OFF'} {name or 'mxfp4'}: {st}"
+           f"{'' if not why else ' (' + why + (', forced)' if fold else ')')}"
+           f" [tensors so far: {n_on} folded / {len(_FOLD_LOG) - n_on} exact]")
+    (log or _default_log)(msg)
+    return fold
+
+
+def fold_summary() -> str:
+    on = [x for x in _FOLD_LOG if x[1]]
+    off = [x for x in _FOLD_LOG if not x[1]]
+    worst = max(_FOLD_LOG, key=lambda x: x[2].p_flush, default=None)
+    return (f"fold: {len(on)} tensors folded, {len(off)} kept exact"
+            + (f"; worst flush {100 * worst[2].p_flush:.4f}% ({worst[0]})" if worst else ""))
+
+
+def _default_log(msg: str) -> None:
+    try:
+        from vllm.logger import init_logger
+        init_logger("vllm." + __name__).info(msg)
+    except Exception:
+        print(msg)
 
 
 def quant_rows_fp8(x: torch.Tensor):
@@ -178,7 +297,7 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
         max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
         nv = isinstance(w, Nvfp4Experts)
         rc = lib().r9k_moe_4bit_prefill(
-            int(nv), a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(),
+            1 if nv else (2 if w.fold else 0), a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(),
             w.ws.data_ptr() if nv else w.wsr.data_ptr(),
             w.wg.data_ptr() if nv else w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
             sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
@@ -205,7 +324,8 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
         w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
         sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
         topk_w.data_ptr() if topk_w is not None else 0,
-        w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, MT, _stream())
+        w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, MT | (16 if w.fold else 0),
+        _stream())
     if rc:
         raise RuntimeError(f"r9k_moe_mxfp4a8 failed ({rc}) N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW} MT={MT}")
     return out

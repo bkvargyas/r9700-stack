@@ -75,6 +75,7 @@ def maybe_attach_cache(method, layer) -> None:
         layer.w2_weight = as_param(w2, layer.w2_weight)
         layer.w2_weight._vllm_is_uva_offloaded = True
     cache = C.LayerCache(idx, w13, w2, s13.data, s2.data, N1, K1, N2, K2, slots)
+    cache.fold = tuple(getattr(layer, "_r9k_fold", (False, False)))
     # the host copies of the scales now back the cold pass; drop the device ones (keep shapes for _dims)
     layer.w13_weight_scale = torch.nn.Parameter(cache.h_s13, requires_grad=False)
     layer.w2_weight_scale = torch.nn.Parameter(cache.h_s2, requires_grad=False)

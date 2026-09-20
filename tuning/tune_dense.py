@@ -105,9 +105,12 @@ def mt_for(M):
     return 4 if M >= 64 else (2 if M >= 32 else 1)
 
 
-def runner(kind, Ws, N, Kd, M, cfg):
+def runner(kind, Ws, N, Kd, M, cfg, fold=False):
     """Cycles through the weight copies so every call streams from DRAM (R9700: ~64 MB of on-die cache would
-    otherwise serve repeated calls on one small weight and inflate GB/s)."""
+    otherwise serve repeated calls on one small weight and inflate GB/s). fold: folded-exponent MXFP4 kernels."""
+    if fold:
+        import dataclasses
+        Ws = [dataclasses.replace(W, fold=True) for W in Ws]
     fns = [_runner(kind, W, N, Kd, M, cfg) for W in Ws]
     it = [0]
 

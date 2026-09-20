@@ -73,7 +73,8 @@ def _nvfp4_linear_fake(x, wq, ws, wg, N: int, K: int) -> torch.Tensor:
     return x.new_empty((x.shape[0], N))
 
 
-def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int) -> torch.Tensor:
+def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int, fold: bool = False
+                  ) -> torch.Tensor:
     from .kernels import moe as KM
     M = x.shape[0]
     out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
@@ -81,17 +82,19 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
         return out
     q, s = KM.quant_rows_fp8(x)
     cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4")
+    W = KM.Mxfp4Experts(wq, wsr, N, K, fold)
     if KM.is_prefill_cfg(cfg):
         t, _ = _identity_tables(x, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
-        KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
+        KM.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
         return out
     t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
-    KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT,
+    KM.moe_gemm(q, s, W, out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT,
                 ldsa=bool(cfg[4]) if len(cfg) > 4 else False)
     return out
 
 
-def _mxfp4_linear_fake(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int) -> torch.Tensor:
+def _mxfp4_linear_fake(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int, fold: bool = False
+                       ) -> torch.Tensor:
     return x.new_empty((x.shape[0], N))
 
 
@@ -117,12 +120,13 @@ def fp8_linear(x: torch.Tensor, W) -> torch.Tensor:
     return torch.ops.r9700.fp8_linear(x2, W.wq, W.ws, W.N, W.K).reshape(*lead, W.N)
 
 
-def mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int) -> torch.Tensor:
+def mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int, fold: bool = False
+                 ) -> torch.Tensor:
     register()
     lead = x.shape[:-1]
     x2 = x.reshape(-1, K)
     x2 = (x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)).contiguous()
-    return torch.ops.r9700.mxfp4_linear(x2, wq, wsr, N, K).reshape(*lead, N)
+    return torch.ops.r9700.mxfp4_linear(x2, wq, wsr, N, K, fold).reshape(*lead, N)
 
 
 def nvfp4_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, wg: torch.Tensor, N: int, K: int

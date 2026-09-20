@@ -32,7 +32,7 @@ def _format(lin):
     mx = getattr(lin, "_r9k_mx", None)
     if mx is not None and getattr(lin, "_r9k_nk", None):
         N, K = lin._r9k_nk
-        return ("mxfp4", lin.weight.data, lin.weight_scale.data, N, K)
+        return ("mxfp4", lin.weight.data, lin.weight_scale.data, N, K, getattr(lin, "_r9k_fold", False))
     W = getattr(lin, "_r9k_fp8", None)
     if W is not None:
         return ("fp8", W)
@@ -74,8 +74,8 @@ class _MergedQKVZ(QuantizeMethodBase):
     def apply(self, layer, x, bias=None):
         from .. import ops
         if self.kind == "mxfp4":
-            wq, wsr, N, K = self.payload
-            out = ops.mxfp4_linear(x, wq, wsr, N, K).to(x.dtype)
+            wq, wsr, N, K, fold = self.payload
+            out = ops.mxfp4_linear(x, wq, wsr, N, K, fold).to(x.dtype)
         else:
             out = ops.fp8_linear(x, self.payload).to(x.dtype)
         qkvz, ba = out.split([self.nq, self.nb], dim=-1)
@@ -118,13 +118,13 @@ class R9kQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             return
         from ..utils import note_shape
         if fq[0] == "mxfp4":
-            _, wq1, ws1, n1, k1 = fq
-            _, wq2, ws2, n2, k2 = fb
+            _, wq1, ws1, n1, k1, f1 = fq
+            _, wq2, ws2, n2, k2, f2 = fb
             if k1 != k2:
                 return
             wq = torch.cat([wq1.reshape(1, -1), wq2.reshape(1, -1)], dim=1).contiguous()
             wsr = torch.cat([ws1, ws2], dim=2).contiguous()
-            q.quant_method = _MergedQKVZ(self, "mxfp4", (wq, wsr, n1 + n2, k1), n1, n2)
+            q.quant_method = _MergedQKVZ(self, "mxfp4", (wq, wsr, n1 + n2, k1, f1 and f2), n1, n2)
             note_shape("mxfp4", n1 + n2, k1)
         else:
             from ..kernels.fp8 import Fp8Weight

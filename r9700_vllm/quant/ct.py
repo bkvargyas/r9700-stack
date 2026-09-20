@@ -13,6 +13,8 @@ changes what it hands out per layer, and only on ROCm gfx12 with libr9k availabl
     dequant emulation).
   * NVFP4 dense / MoE -> converted to MXFP4 at load, then the same libr9k paths (quant/nvfp4.py; stock ROCm has
     only NVFP4 emulation for linears and no NVFP4 MoE backend). R9K_DISABLE=nvfp4 opts out.
+  * R9K_LM_HEAD=bf16: the fp8 LM head dequantized to bf16 at load (GGZ14's radiance default; costs bandwidth,
+    may be worth it for logits precision -- gate on GSM8K).
   * per-channel fp8 + dynamic per-token activations -> `R9kW8A8Fp8` channel mode (exact, libr9k fp8 GEMM;
     stock ROCm -> torch._scaled_mm). R9K_DISABLE=fp8_channel opts out.
   * opt-in R9K_FP8_BLOCK=block|rowwise: block-fp8 schemes -> `R9kW8A8Fp8` (libr9k split-K fp8 GEMM).
@@ -84,6 +86,9 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
         delattr(layer, "w2_weight_packed")
         layer.w13_weight_scale = Parameter(s13, requires_grad=False)
         layer.w2_weight_scale = Parameter(s2, requires_grad=False)
+        from ..kernels.moe import fold_decide
+        name = getattr(layer, "layer_name", "") or "moe"
+        layer._r9k_fold = (fold_decide(s13, name + ".w13", logger.info), fold_decide(s2, name + ".w2", logger.info))
         self.moe_quant_config = mxfp4_w4a16_moe_quant_config(w1_scale=layer.w13_weight_scale,
                                                              w2_scale=layer.w2_weight_scale)
         self.moe_kernel = make_mxfp4_moe_kernel(
@@ -221,6 +226,27 @@ class R9kFp8UnquantMethod(UnquantizedLinearMethod):
         return out + bias if bias is not None else out
 
 
+class R9kBf16Fp8Method(CompressedTensorsW8A8Fp8):
+    """Serve an fp8 per-channel linear in bf16: dequantize once at load (R9K_LM_HEAD=bf16 for the LM head).
+    GGZ14's radiance does this for the 27B's lm_head by default; it doubles that layer's weight stream (1.27 GB vs
+    636 MB per rank on the 27B) in exchange for bf16 logits."""
+
+    def process_weights_after_loading(self, layer) -> None:
+        w, sc = layer.weight.data, layer.weight_scale.data
+        if w.dtype != torch.float8_e4m3fn or w.dim() != 2:
+            return super().process_weights_after_loading(layer)
+        layer.weight = Parameter((w.float() * sc.float().reshape(-1, 1)).to(torch.bfloat16), requires_grad=False)
+        layer.weight_scale = Parameter(torch.empty((0,), dtype=torch.float32, device=w.device), requires_grad=False)
+        layer.input_scale = None
+        logger.info_once("r9700: fp8 %s dequantized to bf16 at load (R9K_LM_HEAD=bf16)", tuple(w.shape))
+
+    def apply_weights(self, layer, x, bias=None):
+        if layer.weight.dtype != torch.bfloat16:
+            return super().apply_weights(layer, x, bias)
+        out = torch.nn.functional.linear(x.to(torch.bfloat16), layer.weight)
+        return out + bias if bias is not None else out
+
+
 class R9kMx4UnquantMethod(UnquantizedLinearMethod):
     """bf16 linear requantized to MXFP4 at load (opt-in R9K_BF16_TO_MXFP4=<regex>; GGZ14 does this for the GDN
     in_proj_ba so it can merge with the MXFP4 in_proj_qkvz -- see models/gdn.py)."""
@@ -284,6 +310,9 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
             else:
                 scheme.__class__ = _cached(make_dense_scheme_cls, CompressedTensorsW4A4Fp4)   # this instance only
             scheme.kernel = R9700Mxfp4LinearKernel(MxFp4LinearLayerConfig(activation_quant_key=None))
+        elif (isinstance(scheme, CompressedTensorsW8A8Fp8) and _mode("R9K_LM_HEAD") == "bf16"
+                and "lm_head" in (layer_name or "")):
+            scheme.__class__ = R9kBf16Fp8Method
         elif isinstance(scheme, CompressedTensorsW8A8Fp8) and not _off("fp8_channel") \
                 and _strategy(scheme) == "channel" and not scheme.is_static_input_scheme:
             scheme.__class__ = R9kW8A8Fp8                        # this instance only
