@@ -126,7 +126,8 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
 
         MT = K.pick_mt(numel, global_num_experts)
         blk = K.MOE_BLOCK * MT
-        pf_down = K.pick_moe_prefill(MT, K2)      # LDS-tiled kernel for the down GEMM of wide (MT=4) steps
+        pf_down = K.pick_moe_prefill(MT, K2)      # LDS-tiled kernel for both GEMMs of wide (MT=4) steps
+        pf_gate = K.pick_moe_prefill(MT, K1, gate_up=True)
         cache = getattr(self, "r9k_cache", None)
         if cache is None:
             passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1), K.Mxfp4Experts(w2, self.w2_scale, N2, K2),
@@ -156,7 +157,7 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
         for W1, _, (sid, eid, ntpp) in passes:
             K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *CFG_GATE_UP,
-                       num_experts=global_num_experts, MT=MT)
+                       num_experts=global_num_experts, MT=MT, prefill=pf_gate)
 
         if FUSED_ACT:
             aq, as_ = K.silu_mul_quant_fp8(gate_up)           # one launch: silu*mul + per-row fp8 quant

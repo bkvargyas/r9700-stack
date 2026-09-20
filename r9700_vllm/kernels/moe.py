@@ -137,10 +137,11 @@ def silu_mul_quant_fp8(gu: torch.Tensor):
 # Prefill (LDS-tiled, large-M) kernel tile table: cfg -> (rows per routing block BM, columns BN); mirrors
 # kPfCfgs in r9k_moe_mxfp4a8.hip (the kernel is the source of truth: prefill_block() asks it).
 PREFILL_TILES = {0: (256, 64), 1: (256, 128), 2: (128, 128), 3: (128, 64), 4: (128, 64), 5: (256, 32),
-                 6: (64, 64), 7: (256, 128), 8: (256, 128), 9: (256, 128), 10: (128, 128), 11: (64, 64)}
+                 6: (64, 64), 7: (256, 128), 8: (256, 128), 9: (256, 128), 10: (128, 128), 11: (64, 64),
+                 12: (256, 128), 13: (128, 128), 14: (64, 64), 15: (64, 128), 16: (256, 128)}
 PREFILL_MIN_M = int(os.environ.get("R9K_PREFILL_MIN_M", "128"))   # dense calls at M >= this use the prefill path
-# Untuned shapes: 256x128 double-buffered (cfg 8) from M >= 512, 128x128 double-buffered (cfg 10) below (grid fill).
-PREFILL_DEFAULT = int(os.environ.get("R9K_PREFILL_CFG", "8"))
+# Untuned shapes: 256x128 BK=64 double-buffered (cfg 12) from M >= 512, 128x128 double-buffered (cfg 10) below (grid fill).
+PREFILL_DEFAULT = int(os.environ.get("R9K_PREFILL_CFG", "12"))
 PREFILL_DEFAULT_SMALL = int(os.environ.get("R9K_PREFILL_CFG_SMALL", "10"))
 
 
@@ -236,16 +237,21 @@ def pick_mt(numel: int, num_experts: int) -> int:
 
 
 MOE_PREFILL_CFG = int(os.environ.get("R9K_MOE_PREFILL_CFG", "11"))     # -1: routed MoE never uses the prefill tile
+MOE_PREFILL_CFG_GATE_UP = int(os.environ.get("R9K_MOE_PREFILL_CFG1", "15"))   # -1: gate_up stays on the MT kernel
 
 
-def pick_moe_prefill(MT: int, K_down: int) -> int | None:
-    """Prefill tile for the routed-MoE DOWN GEMM of a step whose routing block is 16*MT rows: the 64x64
-    double-buffered tile (cfg 11) shares block 64 with MT=4, and at K=320 it is 1.6-1.7x faster than the split-K
-    decode kernel (Flash-Next 2048/4096-token chunks: 1618 -> 1010 / 2777 -> 1633 us); gate_up stays on the MT
-    kernel (measured a wash to -10%). None: keep the MT kernel."""
-    if MOE_PREFILL_CFG < 0 or K_down % 64 or 16 * MT != prefill_block(MOE_PREFILL_CFG):
+def pick_moe_prefill(MT: int, K_down: int, gate_up: bool = False) -> int | None:
+    """Prefill tile for the routed-MoE GEMMs of a step whose routing block is 16*MT rows (None: keep the MT kernel).
+    Both tiles share block 64 with MT=4, so one moe_align_block_size table serves both GEMMs:
+      * down (K=320): the 64x64 double-buffered tile (cfg 11), 1.6-1.7x faster than the split-K decode kernel
+        (Flash-Next 2048/4096-token chunks: 1631 -> 1023 / 2802 -> 1669 us steady-state);
+      * gate_up (N=640, K=2560): the 64x128 BK=64 double-buffered tile (cfg 15: five column tiles instead of ten,
+        half the barriers per K), 1347 -> 1230 / 2282 -> 1907 us at 2048 / 4096 tokens (the 64x64 tiles were a
+        wash to -10% against the MT kernel, which is why the first pass left gate_up on it)."""
+    cfg = MOE_PREFILL_CFG_GATE_UP if gate_up else MOE_PREFILL_CFG
+    if cfg < 0 or K_down % 64 or 16 * MT != prefill_block(cfg):
         return None
-    return MOE_PREFILL_CFG
+    return cfg
 
 
 def align_block_size_ref(topk_ids: torch.Tensor, num_experts: int, block: int = MOE_BLOCK):

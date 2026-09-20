@@ -88,7 +88,7 @@ for kind in ("mxfp4", "nvfp4"):
 
 # ---- routed MoE (Flash-Next shapes): E experts, many rows per expert, padding blocks, a_row_div = topk, topk_w
 E, M, topk = 16, 1200, 4
-for cfg in (0, 2, 3, 6, 11):          # 11 = the tile experts.py uses for the routed down GEMM (block 64)
+for cfg in (0, 2, 3, 6, 11, 15):      # 11 / 15 = the tiles experts.py uses for the routed down / gate_up GEMMs (block 64)
     W1, wd1 = make_w("mxfp4", 640, 2560, E)
     W2, wd2 = make_w("mxfp4", 2560, 320, E)
     blk = K.prefill_block(cfg)
