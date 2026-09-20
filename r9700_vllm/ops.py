@@ -59,6 +59,10 @@ def _nvfp4_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, wg: torch
         return out
     q, s = KM.quant_rows_fp8(x)
     cfg = KM.pick_cfg(N, K, 16, M=M, kind="nvfp4")
+    if KM.is_prefill_cfg(cfg):
+        t, _ = _identity_tables(x, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
+        KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
+        return out
     t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
     KM.moe_gemm(q, s, KM.Nvfp4Experts(wq, ws, wg, N, K), out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT,
                 ldsa=bool(cfg[4]) if len(cfg) > 4 else False)
@@ -77,6 +81,10 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
         return out
     q, s = KM.quant_rows_fp8(x)
     cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4")
+    if KM.is_prefill_cfg(cfg):
+        t, _ = _identity_tables(x, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
+        KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
+        return out
     t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
     KM.moe_gemm(q, s, KM.Mxfp4Experts(wq, wsr, N, K), out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT,
                 ldsa=bool(cfg[4]) if len(cfg) > 4 else False)

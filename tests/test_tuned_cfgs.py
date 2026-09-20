@@ -36,14 +36,20 @@ for kind in ("mxfp4", "nvfp4"):
             M = int(Ms)
             x = torch.randn(M, Kd, device="cuda", generator=g).to(torch.bfloat16)
             q, s = K.quant_rows_fp8(x)
-            MT = cfg[3] if len(cfg) > 3 else (4 if M >= 64 else 2 if M >= 32 else 1)
-            ld = bool(cfg[4]) if len(cfg) > 4 else False
-            blk = 16 * MT
+            if K.is_prefill_cfg(cfg):                       # ["P", tile]: LDS-tiled prefill kernel
+                blk, MT, ld = K.prefill_block(cfg[1]), None, False
+            else:
+                MT = cfg[3] if len(cfg) > 3 else (4 if M >= 64 else 2 if M >= 32 else 1)
+                ld = bool(cfg[4]) if len(cfg) > 4 else False
+                blk = 16 * MT
             mpad = (M + blk - 1) // blk * blk
             t = (torch.arange(mpad, dtype=torch.int32, device="cuda"), torch.zeros(mpad // blk, dtype=torch.int32,
                  device="cuda"), torch.full((1,), mpad, dtype=torch.int32, device="cuda"))
             out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
-            K.moe_gemm(q, s, W, out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT, ldsa=ld)
+            if MT is None:
+                K.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
+            else:
+                K.moe_gemm(q, s, W, out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT, ldsa=ld)
             ref = (q.float() * s[:, None]) @ wd.T
             r = ((out.float() - ref).norm() / ref.norm()).item()
             good = r < 5e-3

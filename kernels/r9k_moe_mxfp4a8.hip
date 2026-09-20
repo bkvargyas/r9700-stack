@@ -475,6 +475,314 @@ extern "C" int r9k_moe_nvfp4a8(long a, long as, long wq, long ws, long wg, long 
                     max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream);
 }
 
+// ---------------------------------------------------------------- prefill path (large M)
+// The decode-shaped kernel above computes a 16*MT (<= 64) x 16*WV*NPW tile per workgroup: at prefill M every
+// weight fragment is re-read M/64 times and the A slab is re-read once per 64-column block, and the per-wave
+// inner loop carries MT A-fragment loads per NPW WMMAs. This path is a classic LDS-tiled GEMM: one workgroup =
+// one routing block of BM = WM*TM*16 rows (up to 256) x BN = WN*TN*16 columns, WM x WN waves each owning a
+// TM x TN grid of 16x16 accumulators, K in slabs of BK (64, or 32 double-buffered) staged through LDS:
+//   * A rows (gathered through sorted_ids like the decode kernel, so routed MoE blocks work unchanged) as
+//     e4m3 bytes, row stride BK + 8 (conflict-free ds_read_b64 of a 16x16 fragment);
+//   * weights unpacked ONCE per workgroup from the 4-bit fragment-order stream to e4m3 B fragments, kept in
+//     fragment order in LDS (lane l of tile (nt, ks) at slot ((nt*4 + ks)*32 + l): a wave's B read is 256
+//     contiguous bytes, no padding needed), so the e2m1 -> e4m3 v_perm work is done by NT threads per slab
+//     instead of by every wave for every fragment;
+//   * the per-(n, K-group) scales for the slab (BN x 64/KG bytes) in LDS as well.
+// The next slab's global loads are issued right after the barrier that publishes the current one, so they are
+// in flight during the slab's WMMAs (register cost: ACH uint4 + WSL uint32 + SCH bytes per thread).
+// Numerics are those of the decode kernel: unscaled e2m1 WMMA partials per scale group, scaled into the fp32
+// accumulator with explicit fmaf (exact weight math, no folded / flushed exponents), epilogue
+// bf16(acc * (Wg[n] *) As[row] (* topk_w[row])). Split-K is not used (K is walked whole by one workgroup).
+#ifndef R9K_PF_ABL
+#define R9K_PF_ABL 0      // timing ablations (never in production builds): 1 no reloads, 2 no WMMA, 4 no barriers
+#endif
+
+// BK: K per LDS slab. DB: double-buffered slabs -- the next slab is written to the other buffer right after this
+// slab's WMMAs and ONE barrier per slab publishes it (single-buffered slabs need a second barrier before the
+// buffer may be overwritten). BK=32 double-buffered costs the same LDS as BK=64 single-buffered.
+template <int TM, int TN, int WM, int WN, bool NV, int BK, bool DB>
+__global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
+    const unsigned char* __restrict__ A, const float* __restrict__ As,
+    const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
+    const unsigned char* __restrict__ Wref_all, __hip_bfloat16* __restrict__ C,
+    const int* __restrict__ sorted_ids, const int* __restrict__ expert_ids,
+    const int* __restrict__ ntpp, const float* __restrict__ topk_w,
+    long ws_estride, long wref_estride, int numel, int a_row_div, int K, int N) {
+  constexpr int BM = WM * TM * 16, BN = WN * TN * 16, NT = WM * WN * WAVE32;
+  constexpr int ASTR = BK + 8;                              // padded A row stride: conflict-free fragment reads
+  constexpr int KSPS = BK / 16;                             // WMMA K steps per slab
+  constexpr int KG = NV ? 16 : GROUP, SPG = KG / 16, G = BK / KG;   // scale groups per slab
+  static_assert(G >= 1, "slab must hold a whole scale group");
+  constexpr int ACH = BM * (BK / 16) / NT;                  // 16 B A chunks per thread per slab
+  constexpr int WSL = BN * (BK / 8) / NT;                   // uint32 weight slots per thread per slab
+  constexpr int SCH = (BN * G + NT - 1) / NT;               // scale bytes per thread per slab (guarded)
+  static_assert(ACH * NT == BM * (BK / 16) && ACH >= 1 && ACH <= 8, "A slab must split evenly");
+  static_assert(WSL * NT == BN * (BK / 8) && (WSL == 1 || WSL == 2 || WSL == 4), "W slab must split evenly");
+  constexpr int SA_BYTES = BM * ASTR, SW_BYTES = BN * BK, SS_BYTES = (BN * G + 15) & ~15;
+  constexpr int BUF_BYTES = SA_BYTES + SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
+  extern __shared__ __align__(16) unsigned char pf_smem[];
+  int* const sRow = (int*)(pf_smem + NBUF * BUF_BYTES);
+
+  const int by = blockIdx.y;
+  if (by * BM >= ntpp[0]) return;
+  const int e = expert_ids[by];
+  if (e < 0) return;
+  const int first = sorted_ids[by * BM];
+  if (first < 0 || first >= numel) return;
+
+  const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
+  const int wm = wave / WN, wn = wave % WN;
+  const int nlane = lane & 15, mhalf = (lane >> 4) * 8;
+  const int ksteps = K / 16, ntmax = N / 16 - 1;
+  const int nt0 = blockIdx.x * (BN / 16);
+  const unsigned int* __restrict__ Wp = Wp_all + (size_t)e * (N / 16) * ksteps * WAVE32;
+  const unsigned char* __restrict__ Ws = Ws_all + (size_t)e * ws_estride;
+  const float* __restrict__ Wg = NV ? (const float*)Wref_all + (size_t)e * wref_estride : nullptr;
+
+  for (int r = tid; r < BM; r += NT) {
+    const int fl = sorted_ids[by * BM + r];
+    sRow[r] = (fl < 0 || fl >= numel) ? -1 : fl;            // -1: padding row (loaded as `first`, never stored)
+  }
+  __syncthreads();
+
+  // Staging geometry, hoisted: A chunk c = tid + q*NT -> (row c / (BK/16), 16 B column c % (BK/16)).
+  unsigned a_src[ACH];
+  int a_dst[ACH];
+#pragma unroll
+  for (int q = 0; q < ACH; q++) {
+    const int c = tid + q * NT, r = c / (BK / 16), c16 = c % (BK / 16);
+    const int fl = sRow[r];
+    a_src[q] = (unsigned)((fl < 0 ? first : fl) / a_row_div) * (unsigned)K + (unsigned)(c16 * 16);
+    a_dst[q] = r * ASTR + c16 * 16;
+  }
+  // Weight slots s = tid*WSL + q (contiguous, never straddling a 32-lane fragment): slot -> (n tile, K step, lane).
+  unsigned w_src, w_dst;
+  {
+    const int s0 = tid * WSL, lane_ = s0 & 31, rest = s0 >> 5, ks = rest % KSPS, ntl = rest / KSPS;
+    const int ntg = nt0 + ntl < ntmax ? nt0 + ntl : ntmax;   // clamped: garbage columns are never stored
+    w_src = (unsigned)(((ntg * ksteps + ks) * WAVE32 + lane_) * 4);
+    w_dst = (unsigned)(SA_BYTES + ((ntl * KSPS + ks) * WAVE32 + lane_) * 8);
+  }
+  // Scale bytes t = tid + it*NT -> (group t / BN, local column t % BN), Ws is [K/KG][N] per expert.
+  unsigned s_src[SCH];
+#pragma unroll
+  for (int it = 0; it < SCH; it++) {
+    const int t = tid + it * NT, g = t / BN, nl = t % BN;
+    const int ntg = nt0 + nl / 16 < ntmax ? nt0 + nl / 16 : ntmax;
+    s_src[it] = (unsigned)(g * N + ntg * 16 + (nl & 15));
+  }
+
+  v8f acc[TM][TN];
+#pragma unroll
+  for (int i = 0; i < TM; i++)
+#pragma unroll
+    for (int j = 0; j < TN; j++) acc[i][j] = (v8f)(0.f);
+
+  uint4 pa[ACH];
+  unsigned int pw[WSL];
+  unsigned char ps[SCH];
+  const int nslabs = K / BK;
+#define PF_LOAD(SLAB)                                                                                   \
+  {                                                                                                     \
+    const int slab_ = (SLAB);                                                                           \
+    _Pragma("unroll")                                                                                   \
+    for (int q = 0; q < ACH; q++) pa[q] = ld_u32off((const uint4*)A, a_src[q] + (unsigned)(slab_ * BK)); \
+    if constexpr (WSL == 4) {                                                                           \
+      const uint4 v = ld_u32off((const uint4*)Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));      \
+      pw[0] = v.x; pw[1] = v.y; pw[2] = v.z; pw[3] = v.w;                                               \
+    } else if constexpr (WSL == 2) {                                                                    \
+      const uint2 v = ld_u32off((const uint2*)Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));      \
+      pw[0] = v.x; pw[1] = v.y;                                                                         \
+    } else {                                                                                            \
+      pw[0] = ld_u32off(Wp, w_src + (unsigned)(slab_ * KSPS * WAVE32 * 4));                            \
+    }                                                                                                   \
+    _Pragma("unroll")                                                                                   \
+    for (int it = 0; it < SCH; it++)                                                                    \
+      if (tid + it * NT < BN * G) ps[it] = ld_u32off(Ws, s_src[it] + (unsigned)(slab_ * G) * (unsigned)N); \
+  }
+#define PF_STORE(BUF)                                                                                   \
+  {                                                                                                     \
+    unsigned char* const sb_ = pf_smem + (BUF) * BUF_BYTES;                                             \
+    _Pragma("unroll")                                                                                   \
+    for (int q = 0; q < ACH; q++) *(uint4*)(sb_ + a_dst[q]) = pa[q];                                    \
+    _Pragma("unroll")                                                                                   \
+    for (int q = 0; q < WSL; q++) *(v2i*)(sb_ + w_dst + q * 8) = mxfp4_unpack8(pw[q], 0);               \
+    _Pragma("unroll")                                                                                   \
+    for (int it = 0; it < SCH; it++)                                                                    \
+      if (tid + it * NT < BN * G) sb_[SA_BYTES + SW_BYTES + tid + it * NT] = ps[it];                    \
+  }
+  // Fragments (A: TM x SPG, B: TN x SPG, scales: TN bytes) are read from LDS one scale group ahead of the WMMAs
+  // that consume them: left to the compiler every ds_load pair was followed by its s_wait_dscnt (12 exposed LDS
+  // latencies per slab against 32 WMMAs; 3156 -> 2785 us on NVFP4 17408x5120 @M=2048 with the 256x128 tile).
+#define PF_FRAG_LOAD(OFF, GV, AF, WF, SB)                                                                \
+    {                                                                                                    \
+      _Pragma("unroll")                                                                                  \
+      for (int sidx = 0; sidx < SPG; sidx++) {                                                           \
+        _Pragma("unroll")                                                                                \
+        for (int i = 0; i < TM; i++)                                                                     \
+          AF[sidx][i] = *(const v2i*)(myA + (OFF) + i * 16 * ASTR + ((GV) * SPG + sidx) * 16);           \
+        _Pragma("unroll")                                                                                \
+        for (int j = 0; j < TN; j++)                                                                     \
+          WF[sidx][j] = *(const v2i*)(myW + (OFF) + (j * KSPS + (GV) * SPG + sidx) * (WAVE32 * 8));      \
+      }                                                                                                  \
+      _Pragma("unroll")                                                                                  \
+      for (int j = 0; j < TN; j++) SB[j] = myS[(OFF) + (GV) * BN + j * 16];                              \
+    }
+  const unsigned char* const myA = pf_smem + (wm * TM * 16 + nlane) * ASTR + mhalf;
+  const unsigned char* const myW = pf_smem + SA_BYTES + (wn * TN * KSPS * WAVE32 + lane) * 8;
+  const unsigned char* const myS = pf_smem + SA_BYTES + SW_BYTES + wn * TN * 16 + nlane;
+
+  // Loop shape (kept from the single-buffered version, which the compiler allocates in ~140 VGPRs; a rotated
+  // "load; compute; store; barrier" form of the same loop spilled hundreds of VGPRs):
+  //   store slab s (into buffer s&1 under DB); barrier; issue global loads of s+1; WMMAs of s; [barrier if !DB]
+  // Under DB the trailing barrier goes: the next store targets the buffer read in slab s-1, and every wave passed
+  // this slab's barrier only after finishing slab s-1.
+  PF_LOAD(0)
+  for (int slab = 0; slab < nslabs; slab++) {
+    const int buf = DB ? (slab & 1) : 0;
+    const int off = buf * BUF_BYTES;
+    PF_STORE(buf)
+    if (!(R9K_PF_ABL & 4)) lds_barrier();
+    const bool more = slab + 1 < nslabs;
+    if (!(R9K_PF_ABL & 1) && more) PF_LOAD(slab + 1)
+    v2i afc[SPG][TM], wfc[SPG][TN], afn[SPG][TM], wfn[SPG][TN];
+    unsigned int sbc[TN], sbn[TN];
+    PF_FRAG_LOAD(off, 0, afc, wfc, sbc)
+    if constexpr (DB) __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+    for (int g = 0; g < G; g++) {
+      if (g + 1 < G) {
+        PF_FRAG_LOAD(off, g + 1, afn, wfn, sbn)
+        // Keep the prefetch above this group's WMMAs (the scheduler otherwise sinks each ds_load pair next to its
+        // s_wait_dscnt). Measured NVFP4 17408x5120 @M=2048: double-buffered 256x128 3127 -> 2983 us; the fence
+        // costs the single-buffered tiles ~10% (3156 -> 3511), so it is only applied under DB.
+        if constexpr (DB) __builtin_amdgcn_sched_barrier(0);
+      }
+#pragma unroll
+      for (int j = 0; j < TN; j++) {
+        v8f t[TM];
+#pragma unroll
+        for (int i = 0; i < TM; i++) t[i] = (v8f)(0.f);
+#pragma unroll
+        for (int sidx = 0; sidx < SPG; sidx++) {
+#pragma unroll
+          for (int i = 0; i < TM; i++) {
+            if (R9K_PF_ABL & 2) { t[i][0] += __int_as_float(afc[sidx][i][0] ^ wfc[sidx][j][1]); continue; }
+            t[i] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(afc[sidx][i], wfc[sidx][j], t[i]);
+          }
+        }
+        const float sc = NV ? __builtin_amdgcn_cvt_f32_fp8((int)sbc[j], 0) : __uint_as_float(sbc[j] << 23);
+#pragma unroll
+        for (int i = 0; i < TM; i++)
+#pragma unroll
+          for (int q = 0; q < 8; q++) acc[i][j][q] = fmaf(t[i][q], sc, acc[i][j][q]);   /* -ffp-contract=off */
+      }
+      if (g + 1 < G) {
+#pragma unroll
+        for (int sidx = 0; sidx < SPG; sidx++) {
+#pragma unroll
+          for (int i = 0; i < TM; i++) afc[sidx][i] = afn[sidx][i];
+#pragma unroll
+          for (int j = 0; j < TN; j++) wfc[sidx][j] = wfn[sidx][j];
+        }
+#pragma unroll
+        for (int j = 0; j < TN; j++) sbc[j] = sbn[j];
+      }
+    }
+    if (!DB && !(R9K_PF_ABL & 4)) lds_barrier();          // everyone is done reading before the overwrite
+  }
+#undef PF_FRAG_LOAD
+#undef PF_STORE
+#undef PF_LOAD
+
+  // Epilogue: lane holds rows mhalf..+8 of column nlane in every 16x16 tile; rows scatter through sRow.
+#pragma unroll
+  for (int j = 0; j < TN; j++) {
+    const int n = (nt0 + wn * TN + j) * 16 + nlane;
+    if (n >= N) continue;
+    const float wg = NV ? Wg[n] : 1.f;
+#pragma unroll
+    for (int i = 0; i < TM; i++) {
+#pragma unroll
+      for (int q = 0; q < 8; q++) {
+        const int fr = sRow[wm * TM * 16 + i * 16 + mhalf + q];
+        if (fr < 0) continue;
+        float sc = wg * As[fr / a_row_div];
+        if (topk_w) sc *= topk_w[fr];
+        C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
+      }
+    }
+  }
+}
+
+// Tile table (cfg index -> TM, TN, WM, WN, BK, DB); BM = WM*TM*16 rows per routing block, BN = WN*TN*16 columns.
+struct PfCfg { int TM, TN, WM, WN, BK, DB; };
+static const PfCfg kPfCfgs[] = {
+  {4, 2, 4, 2, 64, 0},   // 0: 256 x 64,  8 waves
+  {4, 4, 4, 2, 64, 0},   // 1: 256 x 128, 8 waves
+  {4, 2, 2, 4, 64, 0},   // 2: 128 x 128, 8 waves
+  {4, 2, 2, 2, 64, 0},   // 3: 128 x 64,  4 waves
+  {2, 2, 4, 2, 64, 0},   // 4: 128 x 64,  8 waves
+  {4, 1, 4, 2, 64, 0},   // 5: 256 x 32,  8 waves
+  {2, 2, 2, 2, 64, 0},   // 6: 64 x 64,   4 waves
+  {4, 2, 4, 4, 64, 0},   // 7: 256 x 128, 16 waves
+  {4, 2, 4, 4, 32, 1},   // 8: 256 x 128, 16 waves, BK=32 double-buffered
+  {4, 4, 4, 2, 32, 1},   // 9: 256 x 128, 8 waves,  BK=32 double-buffered
+  {4, 2, 2, 4, 32, 1},   // 10: 128 x 128, 8 waves, BK=32 double-buffered
+  {2, 2, 2, 2, 32, 1},   // 11: 64 x 64,  4 waves,  BK=32 double-buffered
+};
+#define PF_NCFG ((int)(sizeof(kPfCfgs) / sizeof(kPfCfgs[0])))
+
+extern "C" int r9k_moe_prefill_bm(int cfg) {     // rows per routing block of a prefill cfg (-1: no such cfg)
+  if (cfg < 0 || cfg >= PF_NCFG) return -1;
+  return kPfCfgs[cfg].WM * kPfCfgs[cfg].TM * 16;
+}
+
+// Prefill entry: same operands / routing tables as r9k_moe_mxfp4a8 / r9k_moe_nvfp4a8 (nv selects the scale
+// format), routing block = r9k_moe_prefill_bm(cfg) rows, tile = cfg. Shape rules: N % 16 == 0, K % 64 == 0.
+extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, long wref, long c,
+                                    long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                                    long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div,
+                                    int K, int N, int cfg, long stream) {
+  if (N % 16) return -1;
+  if (K % 64) return -2;
+  if (cfg < 0 || cfg >= PF_NCFG) return -7;
+  hipStream_t st = (hipStream_t)stream;
+#define PL(TMv, TNv, WMv, WNv, NVv, BKv, DBv)                                                              \
+  {                                                                                                        \
+    constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
+    constexpr int G = BKv / (NVv ? 16 : GROUP);                                                            \
+    constexpr size_t buf = (size_t)BM * (BKv + 8) + (size_t)BN * BKv + (((size_t)BN * G + 15) & ~(size_t)15); \
+    const size_t smem = (DBv ? 2 : 1) * buf + (size_t)BM * 4;                                              \
+    if (smem > 64 * 1024) return -4;                                                                       \
+    dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
+    hipLaunchKernelGGL((r9k_moe_4bit_prefill_kernel<TMv, TNv, WMv, WNv, NVv, BKv, DBv>), grid, block, smem, st, \
+        (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \
+        (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids, (const int*)expert_ids,    \
+        (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel, a_row_div, K, N);         \
+  }
+#define PLN(TMv, TNv, WMv, WNv, BKv, DBv) \
+  do { if (nv) PL(TMv, TNv, WMv, WNv, true, BKv, DBv) else PL(TMv, TNv, WMv, WNv, false, BKv, DBv) } while (0)
+  switch (cfg) {
+    case 0: PLN(4, 2, 4, 2, 64, false); break;
+    case 1: PLN(4, 4, 4, 2, 64, false); break;
+    case 2: PLN(4, 2, 2, 4, 64, false); break;
+    case 3: PLN(4, 2, 2, 2, 64, false); break;
+    case 4: PLN(2, 2, 4, 2, 64, false); break;
+    case 5: PLN(4, 1, 4, 2, 64, false); break;
+    case 6: PLN(2, 2, 2, 2, 64, false); break;
+    case 7: PLN(4, 2, 4, 4, 64, false); break;
+    case 8: PLN(4, 2, 4, 4, 32, true); break;
+    case 9: PLN(4, 4, 4, 2, 32, true); break;
+    case 10: PLN(4, 2, 2, 4, 32, true); break;
+    case 11: PLN(2, 2, 2, 2, 32, true); break;
+    default: return -7;
+  }
+#undef PLN
+#undef PL
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
 // Vectorized single-pass variant: each thread keeps its 16-byte chunks of the row in registers (one DRAM read),
 // block max via wave shuffles + LDS, then hardware OCP-e4m3 conversion (v_cvt_pk_fp8_f32) and 8-byte stores.
 // Needs K % 8 == 0, 16-byte aligned rows and K <= RQ_THREADS * RQ_VEC * 8. ~4x fewer instructions than the

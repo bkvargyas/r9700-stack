@@ -126,6 +126,7 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
 
         MT = K.pick_mt(numel, global_num_experts)
         blk = K.MOE_BLOCK * MT
+        pf_down = K.pick_moe_prefill(MT, K2)      # LDS-tiled kernel for the down GEMM of wide (MT=4) steps
         cache = getattr(self, "r9k_cache", None)
         if cache is None:
             passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1), K.Mxfp4Experts(w2, self.w2_scale, N2, K2),
@@ -169,5 +170,5 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *CFG_DOWN,
-                       num_experts=global_num_experts, MT=MT)
+                       num_experts=global_num_experts, MT=MT, prefill=pf_down)
         ops.moe_sum(down.view(M, topk, N2), output)

@@ -28,6 +28,10 @@ def lib() -> ctypes.CDLL:
         L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_moe_nvfp4a8.restype = ctypes.c_int
         L.r9k_moe_nvfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
+        L.r9k_moe_4bit_prefill.restype = ctypes.c_int
+        L.r9k_moe_4bit_prefill.argtypes = [ctypes.c_int] + [ctypes.c_long] * 12 + [ctypes.c_int] * 6 + [ctypes.c_long]
+        L.r9k_moe_prefill_bm.restype = ctypes.c_int
+        L.r9k_moe_prefill_bm.argtypes = [ctypes.c_int]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
@@ -130,20 +134,59 @@ def silu_mul_quant_fp8(gu: torch.Tensor):
     return q, s
 
 
+# Prefill (LDS-tiled, large-M) kernel tile table: cfg -> (rows per routing block BM, columns BN); mirrors
+# kPfCfgs in r9k_moe_mxfp4a8.hip (the kernel is the source of truth: prefill_block() asks it).
+PREFILL_TILES = {0: (256, 64), 1: (256, 128), 2: (128, 128), 3: (128, 64), 4: (128, 64), 5: (256, 32),
+                 6: (64, 64), 7: (256, 128), 8: (256, 128), 9: (256, 128), 10: (128, 128), 11: (64, 64)}
+PREFILL_MIN_M = int(os.environ.get("R9K_PREFILL_MIN_M", "128"))   # dense calls at M >= this use the prefill path
+# Untuned shapes: 256x128 double-buffered (cfg 8) from M >= 512, 128x128 double-buffered (cfg 10) below (grid fill).
+PREFILL_DEFAULT = int(os.environ.get("R9K_PREFILL_CFG", "8"))
+PREFILL_DEFAULT_SMALL = int(os.environ.get("R9K_PREFILL_CFG_SMALL", "10"))
+
+
+def prefill_block(cfg: int) -> int:
+    """Rows per routing block (moe_align_block_size block) of prefill tile `cfg`."""
+    bm = lib().r9k_moe_prefill_bm(cfg)
+    if bm <= 0:
+        raise ValueError(f"unknown prefill cfg {cfg}")
+    return bm
+
+
+def is_prefill_cfg(cfg) -> bool:
+    return bool(cfg) and cfg[0] == "P"
+
+
 def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.Tensor,
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
              a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
-             num_experts: int | None = None, MT: int = 1, ldsa: bool = False):
+             num_experts: int | None = None, MT: int = 1, ldsa: bool = False, prefill: int | None = None):
     """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
 
     sorted_ids/expert_ids must come from moe_align_block_size(block_size=16*MT). MT M-tiles per workgroup share
     each weight fragment (use MT>1 when experts see many rows: prefill / wide batches). ldsa: stage the A tile
     through LDS (MT > 1 only; a tuned per-config choice, passed to the kernel as MT | 8).
+    prefill: tile cfg of the LDS-tiled large-M kernel (r9k_moe_4bit_prefill) instead; the tables must then come
+    from moe_align_block_size(block_size=prefill_block(cfg)) and WV/SK/NPW/MT/ldsa are ignored.
     The grid covers at most ceil(numel/BLK) + min(numel, E) blocks -- the most moe_align_block_size can fill
     with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
     launch stays cudagraph-safe."""
     assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     E = num_experts if num_experts is not None else w.wq.shape[0]
+    if prefill is not None:
+        blk = prefill_block(prefill)
+        max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+        nv = isinstance(w, Nvfp4Experts)
+        rc = lib().r9k_moe_4bit_prefill(
+            int(nv), a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(),
+            w.ws.data_ptr() if nv else w.wsr.data_ptr(),
+            w.wg.data_ptr() if nv else w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
+            sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+            topk_w.data_ptr() if topk_w is not None else 0,
+            (w.K // 16) * w.N if nv else w.estride, w.N if nv else w.estride,
+            max_blocks, numel, a_row_div, w.K, w.N, prefill, _stream())
+        if rc:
+            raise RuntimeError(f"r9k_moe_4bit_prefill failed ({rc}) nv={nv} N={w.N} K={w.K} cfg={prefill}")
+        return out
     blk = MOE_BLOCK * MT
     max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
     MT = MT | (8 if ldsa and MT > 1 else 0)
@@ -170,12 +213,16 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
 def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str | None = None
              ) -> tuple[int, ...]:
     """A legal (WV, SK, NPW[, MT[, LDSA]]) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
-    N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320."""
+    N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320.
+    Large M (dense prefill) returns ("P", cfg): the LDS-tiled prefill kernel (tuned.json rows ["P", cfg], else
+    PREFILL_DEFAULT from M >= PREFILL_MIN_M when K % 64 == 0)."""
     if kind and M:
         from .tuned import lookup
         t = lookup(kind, N, K, M)
         if t:
             return t
+        if M >= PREFILL_MIN_M and K % 64 == 0:
+            return ("P", PREFILL_DEFAULT if M >= 512 else PREFILL_DEFAULT_SMALL)
     for WV, SK, NPW in ((2, 4, 2), (4, 2, 1), (2, 5, 2), (4, 1, 1)):
         if K % (SK * group) == 0 and (K >= 1024 or SK <= 2):
             return WV, SK, NPW
@@ -186,6 +233,19 @@ def pick_mt(numel: int, num_experts: int) -> int:
     """M tiles per routing block from the host-known row count: rows per touched expert >= 32 -> 4, >= 16 -> 2."""
     per = numel / max(1, min(num_experts, numel))
     return 4 if per >= 32 else (2 if per >= 16 else 1)
+
+
+MOE_PREFILL_CFG = int(os.environ.get("R9K_MOE_PREFILL_CFG", "11"))     # -1: routed MoE never uses the prefill tile
+
+
+def pick_moe_prefill(MT: int, K_down: int) -> int | None:
+    """Prefill tile for the routed-MoE DOWN GEMM of a step whose routing block is 16*MT rows: the 64x64
+    double-buffered tile (cfg 11) shares block 64 with MT=4, and at K=320 it is 1.6-1.7x faster than the split-K
+    decode kernel (Flash-Next 2048/4096-token chunks: 1618 -> 1010 / 2777 -> 1633 us); gate_up stays on the MT
+    kernel (measured a wash to -10%). None: keep the MT kernel."""
+    if MOE_PREFILL_CFG < 0 or K_down % 64 or 16 * MT != prefill_block(MOE_PREFILL_CFG):
+        return None
+    return MOE_PREFILL_CFG
 
 
 def align_block_size_ref(topk_ids: torch.Tensor, num_experts: int, block: int = MOE_BLOCK):

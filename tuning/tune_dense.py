@@ -119,6 +119,14 @@ def runner(kind, Ws, N, Kd, M, cfg):
 
 def _runner(kind, W, N, Kd, M, cfg):
     x = torch.randn(M, Kd, device="cuda").to(torch.bfloat16)
+    if kind in ("mxfp4", "nvfp4") and K.is_prefill_cfg(cfg):   # ("P", tile cfg): LDS-tiled prefill kernel
+        q, s = K.quant_rows_fp8(x)
+        blk = K.prefill_block(cfg[1])
+        mpad = (M + blk - 1) // blk * blk
+        t = (torch.arange(mpad, dtype=torch.int32, device="cuda"), torch.zeros(mpad // blk, dtype=torch.int32,
+             device="cuda"), torch.full((1,), mpad, dtype=torch.int32, device="cuda"))
+        out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+        return lambda: K.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
     WV, SK, NPW = cfg[:3]
     if kind in ("mxfp4", "nvfp4"):
         q, s = K.quant_rows_fp8(x)
