@@ -77,6 +77,11 @@ if [ -n "$DRAFT" ]; then
 elif [ -n "$MTP" ]; then
   ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
 fi
+# DRYRUN=1: print the assembled docker command and exit (config check without touching the GPUs)
+if [ "${DRYRUN:-0}" = 1 ]; then
+  printf '%q ' docker run -d --name vllmstock "${MNT[@]}" "${ENTRY[@]}" "$IMG" "${PRE[@]}" \
+    ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} "${OFFL[@]}" "${ARGS[@]}" $EXTRA; echo; exit 0
+fi
 sudo docker rm -f vllmstock 2>/dev/null
 sudo docker run -d --name vllmstock --ipc=host --network=host --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \
