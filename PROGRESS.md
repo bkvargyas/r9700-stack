@@ -102,6 +102,45 @@ Correction: the earlier "P2P gives nothing" A/B was flawed (tcclaviger's r4d AR 
   applied to the partial (8 FMAs/WMMA), per-row global in the epilogue -- exact weights; default for dense NVFP4
   (`R9K_NVFP4=native|mxfp4`). NVFP4 MoE layers still convert (expert cache carries MXFP4-layout scales).
 
+### 2026-09-19/20: Qwen3.8-27B-NVFP4 speed work (target: GGZ14 radiance on the same box)
+
+**Baseline discipline.** `~/bb-prod.log` (181.5 combined) is the PRODUCTION box (192.168.0.155, Quark MXFP4) --
+not comparable. The same-box GGZ14 radiance NVFP4 baseline is `~/bb-full.log` (2026-09-16) and a 2026-09-19 rerun:
+**combined decode 196.5 t/s, conc 177/294/428/549, update p50 23.5 ms, TTFT 65 ms, prefill ~4.8k t/s**, GSM8K 97.0,
+HumanEval 98.2. Always check `results.json` `env.endpoint` before quoting a number.
+
+**Our 27B config** (serve/serve.sh): `R9K_AR_QUANT=1 VLLM_KV_CACHE_LAYOUT=LBHNC KVMEM=9 R9K_BF16_TO_MXFP4=in_proj_ba
+R9K_FP8_TO_MXFP4=1 MODEL=/models/Qwen3.8-27B-NVFP4 OFFLOAD_GB=0 MTP= DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 SPEC=7
+ATTN=CUSTOM DRAFT_ATTN=CUSTOM CHAT_TEMPLATE=qwen-fixed NSEQ=8 OVERLAYS=emulated-switch`.
+
+| step | decode single | conc-8 | prefill 9k | ms/step |
+|---|---|---|---|---|
+| start (no spec, stock attn) | 29.7 | 211 | 1374 | - |
+| + DFlash2 spec7 (drafter fp8 fix) | 69.7 | 295 | - | 43 |
+| + TRITON_ATTN (target+drafter), fp8->MXFP4, tuned tiles | 103 | 314 | - | 27.4 |
+| + split-KV verify attention (CUSTOM), quant kernel, drafter on libr9k | 115 | 405 | 1340 | 25.8 |
+| + GGZ14 chat template (acceptance +14%) | 118 | 416 | - | 25.3 |
+| + libr4d prefill attention (LBHNC + fp8 descales) | - | - | 2048 | - |
+| + wht6 compressed all-reduce (>=128 KB, opt-in) | - | - | 2250 | - |
+| + large-M prefill GEMM (Fable) | 114 | 437 | **3450** | 26.0 |
+
+Quality: GSM8K-200 96.5-97.0%, HumanEval 96.3%, 8/8 concurrent sanity answers.
+
+**What moved the needle, in order:** speculative decoding (drafter fp8 dequant fix in models/dflash.py), the chat
+template (acceptance: code 3.34 -> 4.49 tok/step), libr4d prefill attention (2413 -> 93 ms per 9k prompt), the
+large-M GEMM (68-84 -> 117-142 TFLOPS), split-KV verify attention, fp8->MXFP4 requant, wht6 all-reduce.
+
+**Measured dead ends:** unpadded drafter batch + sync scheduling (needs GGZ14's vLLM patch; 29.1 ms/step on stock);
+drafter in W4 (-0.5 ms/step but -7% acceptance); LDS-staged A for the decode kernel (never wins once its gate is
+correct); NT loads on MT>1 (Flash-Next prefill -24%); fp8->MXFP4 on Flash-Next (no gain, it is expert-traffic bound).
+
+**Flash-Next on the same code:** decode 81 / conc-8 206 / prefill 2046, MTP acceptance 2.69 -- unchanged or better
+at every step (the prefill GEMM gave conc-8 +13%).
+
+**Gotchas found the hard way:** vLLM's memory profile underestimates once load-time requant/merges are on (use
+KVMEM=); a stale `tuned.json` sync silently reverted the M=32/64 rows; LDS-A with WV=1,MT=4 staged half its tile
+(NaN at batch 64) -- tests/test_tuned_cfgs.py now gates every tuned row.
+
 ### Next
 1. Unit tests on GPU; VM100 RAM 128 -> 256 GB (host has 364 GB free) so experts (70 GB) + PLE (42 GB) fit pinned.
 2. Stock + plugin bring-up (eager), correctness (GSM8K subset, needle), then cudagraphs + MTP.
