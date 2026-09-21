@@ -153,6 +153,12 @@ layout in `r9700_vllm/kernels/moe.py:100-109` from the WMMA fragment layout (the
 the derivation path is what changes); then update the header, `CREDITS.md`, `PROGRESS.md` and
 `notes/review-fable.md`. **`kernels/r9k_gemm_fp8.hip` derives from the same kernel and needs the same treatment.**
 
+## Where this is going
+
+`notes/replacement-plan.md` (2026-09-21) is the phased plan for replacing everything that is not Apache-2.0 or
+MIT, so the carve-outs in `NOTICE` can go away entirely. Phase 1 (close the all-reduce gap) is the only one that
+wins performance back; phases 2 and 3 spend some. Not urgent — the defaults stay as they are for now.
+
 ## Licence asks (Brian, 2026-09-21: go ahead)
 
 Drafts for both are in `notes/license-requests.md` -- **written, not sent** (no `gh`, no Codeberg credentials and

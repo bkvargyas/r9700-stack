@@ -60,8 +60,13 @@ These cost real time to learn:
 Working and default: our own paged attention; A-tiled (fragment-tiled activation) prefill GEMM; folded-exponent
 MXFP4; DFlash2 speculative decoding; NVFP4→MXFP4 conversion at load; GDN `in_proj` merge; expert LRU cache.
 
-Optional: our own all-reduce (`R9K_AR_IMPL=r9k`) — matches libr4d on decode, ~11% behind on prefill, so libr4d's
-is still the default. Turning it on makes the build fully independent of libr4d at runtime.
+Optional: our own all-reduce (`R9K_AR_IMPL=r9k`) — matches libr4d on decode but is **~11% WORSE on prefill**
+(3,909 vs 4,413 tok/s at 9k) and ~11% worse at conc-8, so libr4d's is still the default. Turning it on makes the
+build fully independent of libr4d at runtime, at that cost. **Decided 2026-09-21: keep the defaults as they are**
+— our attention (free, 99.8%) on, our all-reduce off. For context, dropping libr4d with no replacement at all
+costs −55% prefill, so the work took "unusable without it" down to "11% behind", not to parity.
+
+`notes/replacement-plan.md` is the plan for removing the remaining non-permissive dependencies entirely.
 
 ## What's actually left, roughly in order
 
