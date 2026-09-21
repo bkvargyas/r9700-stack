@@ -192,6 +192,36 @@ def main():
             print(f"    {numel*2:>9} B: ours eager {t_ours:7.1f}  in-graph {t_graph}  "
                   f"rccl eager {t_rccl:7.1f}")
 
+    # compressed path (R9K_AR_QUANT=1): lossy, but both ranks must agree bit for bit
+    if os.environ.get("R9K_AR_QUANT") == "1":
+        from r9700_vllm.comm.r9k_ar import R9kAllReduce
+        w = R9kAllReduce(dist.group.WORLD, dev)
+        if w.disabled or not getattr(w, "_wht", None):
+            if rank == 0:
+                print("  compressed path: NOT ENABLED   <-- FAIL")
+            bad += 1
+        else:
+            if rank == 0:
+                print("  compressed path (>= %d KB):" % (w._qmin >> 10))
+            for numel in (1 << 17, 1 << 20):
+                x = (torch.rand(numel, device=dev, dtype=torch.float32) - 0.5).to(torch.bfloat16)
+                got = w.all_reduce(x)
+                ref = x.float().clone()
+                dist.all_reduce(ref)
+                rel = ((got.float() - ref).norm() / ref.norm()).item()
+                other = got.clone()
+                dist.broadcast(other, src=0)
+                agree = torch.equal(got, other)
+                good = rel < 0.035 and agree
+                bad += 0 if good else 1
+                if rank == 0:
+                    print(f"    n={numel:>8}: rel vs exact {rel:.4f}  ranks agree {agree}"
+                          + ("" if good else "   <-- FAIL"))
+            zz = torch.randn(1 << 20, device=dev, dtype=torch.bfloat16)   # allocate once: timing the AR, not malloc
+            t = timeit(lambda: w.all_reduce(zz))
+            if rank == 0:
+                print(f"    2 MB compressed: {t:.1f} us/call")
+
     dist.barrier()
     if rank == 0:
         print("ALL OK" if bad == 0 else f"FAILURES: {bad}")

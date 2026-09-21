@@ -108,6 +108,62 @@ __global__ void __launch_bounds__(1024) r9k_ar_oneshot_2rank_kernel(
 
 extern "C" int r9k_ar_max_blocks() { return R9K_AR_MAX_BLOCKS; }
 
+// ---------------------------------------------------------------- push-only exchange (for a pre-packed payload)
+// Same handshake as above, but it only delivers `src` into the peer's scratch slot and waits for the peer's
+// delivery to land in ours; the caller reduces the two payloads itself. Used by the compressed path, where the
+// thing on the wire is the packed byte stream (r9k_ar_wht.hip) rather than the raw tensor, so the reduction has
+// to happen after the exchange rather than inside it. Byte count must be a multiple of 16.
+__global__ void __launch_bounds__(1024) r9k_ar_push_2rank_kernel(
+    uint4* __restrict__ peer_scratch, u32* __restrict__ peer_flags, volatile u32* __restrict__ flags,
+    int* __restrict__ seq, long slot16, const uint4* __restrict__ src, long n16, int drain, int acq,
+    int* __restrict__ slot_out) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  const int s = s_seq;
+  const long base = (long)(s & 1) * slot16;
+  if (b == 0 && tid == 0 && slot_out) *slot_out = s & 1;
+
+  const long per = (n16 + nb - 1) / nb;
+  const long lo = per * b, hi = min(lo + per, n16);
+  for (long i = lo + tid; i < hi; i += nt) peer_scratch[base + i] = src[i];
+
+  __syncthreads();
+  ar_release(drain);
+  if (tid == 0) __hip_atomic_store(&peer_flags[b], (u32)(s + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  if (tid == 0) {
+    while ((int)__hip_atomic_load(&flags[b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < s + 1) {
+      __builtin_amdgcn_s_sleep(1);
+    }
+  }
+  __syncthreads();
+  ar_acquire(acq);
+}
+
+// `slot_out` (device int, may be 0) receives which half of the scratch the peer's payload landed in, so the
+// caller's reduce can address it without tracking the sequence counter on the host (which would not survive a
+// graph replay).
+extern "C" int r9k_ar_push_2rank(long peer_scratch, long peer_flags, long flags, long seq, long slot16,
+                                 long src, long nbytes, long stream, int nblocks, int nthreads,
+                                 int drain, int acq, long slot_out) {
+  if (nbytes % 16) return -1;
+  const long n16 = nbytes / 16;
+  if (n16 <= 0) return 0;
+  if (nblocks <= 0 || nblocks > R9K_AR_MAX_BLOCKS) return -2;
+  if ((long)nblocks > n16) nblocks = (int)n16;
+  if (nthreads <= 0) {
+    const long per = (n16 + nblocks - 1) / nblocks;
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < AR_WAVE ? AR_WAVE : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE) return -3;
+  hipLaunchKernelGGL(r9k_ar_push_2rank_kernel, dim3(nblocks), dim3(nthreads), 0, (hipStream_t)stream,
+                     (uint4*)peer_scratch, (u32*)peer_flags, (volatile u32*)flags, (int*)seq, slot16,
+                     (const uint4*)src, n16, drain, acq, (int*)slot_out);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
 // dtype: 0 bf16, 1 fp16, 2 fp32. `numel` is elements; the caller guarantees numel*sizeof % 16 == 0.
 extern "C" int r9k_ar_oneshot_2rank(long peer_scratch, long scratch, long peer_flags, long flags, long seq,
                                     long slot16, long in, long out, long numel, int dtype, long stream,

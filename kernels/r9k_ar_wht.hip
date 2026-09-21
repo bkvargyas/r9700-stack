@@ -157,6 +157,54 @@ static int wht_reduce_launch(long mine, long peer, long out, long ng, long strea
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
 
+// Same reduce, but the peer payload's address is resolved ON THE DEVICE from the double-buffer slot that
+// r9k_ar_push_2rank recorded. The host must not read that slot back -- it advances inside a replayed graph.
+template <typename T>
+__global__ void __launch_bounds__(WHT_NT) r9k_wht_reduce_at_kernel(
+    const unsigned char* __restrict__ mine, const unsigned char* __restrict__ scratch,
+    const int* __restrict__ slot, long slot_stride, T* __restrict__ out, long ngroups) {
+  __shared__ WhtSmem sm;
+  const int tid = threadIdx.x, lane = tid & (WHT_GROUP - 1), gib = tid >> 6;
+  const long g = (long)blockIdx.x * WHT_GPB + gib;
+  const bool live = g < ngroups;
+  float* const gf = sm.f + gib * WHT_GROUP;
+  const unsigned char* const peer = scratch + (long)(*slot) * slot_stride;
+
+  float acc = 0.f;
+  if (live) {
+    const int bit = lane * WHT_BITS, by = bit >> 3, off = bit & 7;
+#pragma unroll
+    for (int src = 0; src < 2; src++) {
+      const unsigned char* p = (src ? peer : mine) + g * WHT_BYTES;
+      const u32 w = (u32)p[by] | ((u32)p[by + 1] << 8);
+      int c = (int)((w >> off) & 0x3F);
+      if (c & 0x20) c -= 64;
+      acc += (float)c * (float)*(const __hip_bfloat16*)(p + WHT_CODES);
+    }
+  }
+  const float v = wht64(acc, lane, gf) * 0.125f;
+  if (live) wht_st(out[g * WHT_GROUP + lane], v);
+}
+
+template <typename T>
+static int wht_reduce_at_launch(long mine, long scratch, long slot, long slot_stride, long out, long ng,
+                                long stream) {
+  hipLaunchKernelGGL(r9k_wht_reduce_at_kernel<T>, wht_grid(ng), dim3(WHT_NT), 0, (hipStream_t)stream,
+                     (const unsigned char*)mine, (const unsigned char*)scratch, (const int*)slot, slot_stride,
+                     (T*)out, ng);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+extern "C" int r9k_wht_reduce_at(long mine, long scratch, long slot, long slot_stride, long out, long numel,
+                                 int dtype, long stream) {
+  if (numel % WHT_GROUP) return -1;
+  const long ng = numel / WHT_GROUP;
+  if (ng <= 0) return 0;
+  if (dtype == 0) return wht_reduce_at_launch<__hip_bfloat16>(mine, scratch, slot, slot_stride, out, ng, stream);
+  if (dtype == 1) return wht_reduce_at_launch<_Float16>(mine, scratch, slot, slot_stride, out, ng, stream);
+  return -4;
+}
+
 // Pack `numel` elements (numel % 64 == 0) of `x` into `pk`. dtype: 0 bf16, 1 fp16.
 extern "C" int r9k_wht_pack(long x, long pk, long numel, int dtype, long stream) {
   if (numel % WHT_GROUP) return -1;

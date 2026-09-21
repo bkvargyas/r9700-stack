@@ -66,7 +66,11 @@ def main():
             rel = ((out.float() - ref).norm() / ref.norm()).item()
             # both ranks must land on the same bits: the pair is the same, only the argument order differs
             sym = torch.equal(out, reduce(pb, pa, numel, dtype))
-            good = rel < 0.02 and sym
+            # Bar is 6-bit's floor, not a wish: the rotation leaves each group Gaussian, E[amax] over 64 samples
+            # is ~sqrt(2 ln 64) = 2.88 sigma, so the step is 2.88 sigma / 31 and the RMS quantisation error is
+            # step/sqrt(12) ~ 0.027 sigma. Summing two such payloads scales error and signal alike, so ~0.027
+            # relative is the floor for ANY correct 6-bit implementation. 0.035 leaves margin for the clamp.
+            good = rel < 0.035 and sym
             ok &= good
             print(f"  {str(dtype):>16} {desc:>12} n={numel:>8}: rel {rel:.4f}  ranks agree {sym}"
                   + ("" if good else "   <-- FAIL"))
