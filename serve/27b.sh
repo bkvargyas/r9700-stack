@@ -12,7 +12,10 @@ exec env \
   R9K_NVFP4=mxfp4 `              # NVFP4 -> MXFP4 at load: +6% everywhere (R9K_NVFP4=native keeps the checkpoint format)` \
   R9K_FP8_TO_MXFP4=1 `           # fp8 attention/GDN/last-8-MLP layers -> MXFP4` \
   R9K_BF16_TO_MXFP4=in_proj_ba ` # so the GDN in_proj pair merges into one GEMM` \
-  R9K_AR_QUANT=1 `               # wht6 compressed all-reduce >= 128 KB: prefill all-reduce 910 -> 378 ms, no measurable quality cost` \
+  R9K_AR_QUANT=1 `               # compressed all-reduce >= 128 KB: prefill all-reduce 910 -> 378 ms, no measurable quality cost` \
+  `# Attention is OUR kernel by default (R9K_PAGED_ATTN=r9k): 99.8% of libr4d, so the dependency costs nothing.` \
+  `# The all-reduce still defaults to libr4d (R9K_AR_IMPL=r4d). Add R9K_AR_IMPL=r9k for a FULLY libr4d-free` \
+  `# build: ~11% prefill and ~4% decode, identical GSM8K. See notes/independence.md. Brian's call which to ship.` \
   VLLM_KV_CACHE_LAYOUT=LBHNC `   # libr4d paged attention needs contiguous per-head slots (serve.sh sets this for ATTN=CUSTOM anyway)` \
   KVMEM=9 `                      # fixed KV budget: vLLM's estimate OOMs once load-time requant is on` \
   MODEL=/models/Qwen3.8-27B-NVFP4 OFFLOAD_GB=0 MTP= \

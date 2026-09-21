@@ -1,6 +1,6 @@
 """Our own 2-rank P2P all-reduce (kernels/r9k_ar.hip) vs RCCL: exactness, rank agreement, and latency.
 
-Run with two ranks on one node:
+Run with two ranks on one node (NOT part of the single-GPU gate suite -- it needs both GPUs):
     torchrun --nproc-per-node=2 tests/test_ar_r9k.py
 
 Checks:
