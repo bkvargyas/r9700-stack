@@ -153,11 +153,17 @@ layout in `r9700_vllm/kernels/moe.py:100-109` from the WMMA fragment layout (the
 the derivation path is what changes); then update the header, `CREDITS.md`, `PROGRESS.md` and
 `notes/review-fable.md`. **`kernels/r9k_gemm_fp8.hip` derives from the same kernel and needs the same treatment.**
 
-## Still the right first move
+## Licence asks (Brian, 2026-09-21: go ahead)
 
-None of the above is a substitute for **asking StillDeadcode for a license** (and GGZ14 for the chat template).
-One message resolves the derived GEMM -- the only piece no flag can turn off -- and covers `r4d.so` for anyone
-else running this. The work here is what makes the answer not matter.
+Drafts for both are in `notes/license-requests.md` -- **written, not sent** (no `gh`, no Codeberg credentials and
+no git identity on this box; they go out under Brian's name). Public issue on each project's tracker is the
+channel. After tonight's work the asks are small: libr4d's runtime pieces are replaced, so only the **derived
+GEMM** is still at stake there, and for vllm-mxfp4 only the **chat template**.
+
+Worth being explicit, because it is easy to assume otherwise: a credits file is not a substitute. Attribution
+satisfies MIT/BSD/Apache because those licences grant permission and ask for credit in return; where there is no
+licence, the default is all rights reserved and credit grants nothing. Fallback costs if neither answers are in
+`notes/license-requests.md`.
 
 ## Note on what we do and do not ship
 
