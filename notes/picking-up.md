@@ -67,14 +67,16 @@ is still the default. Turning it on makes the build fully independent of libr4d 
 
 1. **An eval that can detect regressions.** See the GSM8K point above. Until this exists, quality claims here are
    weaker than they look.
-3. **All-reduce per-call overhead.** Worth the ~11% that full independence costs. Our compressed path runs at
+2. **All-reduce per-call overhead.** Worth the ~11% that full independence costs. Our compressed path runs at
    ~0.22 µs/KB against 0.115 for our exact path, so it is per-call overhead, not the link. **Profile where the
    ~87 µs go at 2 MB before writing kernels** — one attempt was already wasted guessing.
-4. **Power cap 225 W → 300 W.** Never tested; prefill is clock-limited (2.40 GHz vs 2.82 on decode) so it could be
+3. **Power cap 225 W → 300 W.** Never tested; prefill is clock-limited (2.40 GHz vs 2.82 on decode) so it could be
    the biggest single lever left. Needs Brian's say-so, it is his hardware.
-5. **Decode-band attention kernel.** Short-q groups in mixed batches currently use the prefill kernel. Costs
+4. **Decode-band attention kernel.** Short-q groups in mixed batches currently use the prefill kernel. Costs
    nothing measurable today; would matter at higher concurrency.
-6. **GEMM independence** (~5%) — only if the licence situation changes. See `notes/independence.md`.
+5. **GEMM independence** (~5%) — only if the licence situation changes. See `notes/independence.md`.
+6. **Fuse our own prefill kernel launches** (~650 of ~1,950; maybe 8-15 ms of TTFT). See the TTFT section below
+   for why that is the only lever left there, and why the rest is not ours to fix.
 
 ## TTFT: investigated 2026-09-21, localised, and closed
 
