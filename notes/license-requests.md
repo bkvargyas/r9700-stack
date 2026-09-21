@@ -4,8 +4,11 @@ Neither upstream ships a LICENSE file, so by default both are all rights reserve
 permission to copy, modify or distribute, which is why these asks exist. Both are best sent as a public issue on
 the project's own tracker (that is the normal channel and leaves a citable record); no email address needed.
 
-Status: **drafted 2026-09-21, not sent.** No `gh` CLI, no Codeberg credentials and no git identity on this box,
-so they have not been posted from here. Fill in the signature and send.
+Status 2026-09-21: **Brian reports both authors confirmed by DM that our use is fine.** So the permission
+question is answered for this project. These drafts are kept because a DM is not a license: it does not transfer
+to anyone who forks or vendors this repo, and it is not citable. The remaining ask is smaller and worth making
+anyway -- "would you add a LICENSE file, or repeat that in a public issue?" -- and the fallback costs below stay
+accurate if either author later declines.
 
 Context that makes both asks small: our own kernels now replace libr4d's paged attention and 2-rank all-reduce
 (`notes/independence.md`), so the only thing still at stake for libr4d is the **derived GEMM**, and for
