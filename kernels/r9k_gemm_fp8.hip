@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-libr4d-derived
+// Partly derived from libr4d (no upstream licence; used with permission). NOT Apache-2.0 -- see NOTICE.
+
 // r9k_gemm_fp8.hip -- dense FP8(e4m3) weight x FP8(e4m3) activation GEMM, per-row weight scale and per-row
 // activation scale, bf16 out, for gfx1201 (RDNA4). C[M,N] = (A[M,K] * As[m]) @ (W[N,K] * Ws[n])^T.
 //

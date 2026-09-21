@@ -4,6 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "r9700-vllm"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 version = "0.2.0"
 description = "gfx1201 (Radeon AI PRO R9700) kernels and plugin hooks for stock vLLM on ROCm 10"
 requires-python = ">=3.10"

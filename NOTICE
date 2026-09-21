@@ -1,0 +1,78 @@
+r9700-stack
+Copyright 2026 Brian Vargyas
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+THIRD-PARTY COMPONENTS
+================================================================================
+
+Not everything in this repository is covered by the Apache-2.0 licence above.
+The items below are third-party work under their own terms. If you intend to
+reuse this project, read this section: two of these are used with the authors'
+permission for THIS project, and that permission does not transfer to you.
+
+--------------------------------------------------------------------------------
+1. Device-side LRU expert cache kernels  -- Apache-2.0, compatible
+--------------------------------------------------------------------------------
+    kernels/third_party/davetha/
+
+    Vendored unmodified from https://github.com/davetha/r9700-lru-expert-cache
+    (commit 3743f13). Copyright the r9700-lru-expert-cache authors, licensed
+    under the Apache License 2.0. Its own LICENSE and NOTICE are preserved in
+    that directory.
+
+    This one carries the same licence as this project, so it passes on to you
+    normally.
+
+--------------------------------------------------------------------------------
+2. MXFP4 x FP8 GEMM design, derived  -- NOT Apache-2.0
+--------------------------------------------------------------------------------
+    kernels/r9k_moe_mxfp4a8.hip       (in part)
+    kernels/r9k_gemm_fp8.hip          (in part)
+    r9700_vllm/kernels/moe.py         (the weight layout, ~lines 100-109)
+
+    These derive from libr4d by StillDeadcode
+    (https://codeberg.org/StillDeadcode/libr4d, commit 5dc6302): the
+    fragment-order weight layout, the folded e2m1 -> e4m3 unpack with its kMag
+    permute table, and the in-block split-K structure. Most of each file is
+    original work -- see notes/independence.md for a line-level accounting --
+    but the lineage is real.
+
+    libr4d ships no licence file. The author confirmed by DM on 2026-09-21 that
+    our use is fine. That is permission for this project; it is NOT a licence,
+    and it is NOT sublicensed under Apache-2.0. If you want to reuse these
+    parts, ask StillDeadcode.
+
+--------------------------------------------------------------------------------
+3. Chat template, copied verbatim  -- NOT Apache-2.0
+--------------------------------------------------------------------------------
+    serve/templates/qwen-fixed-v22.3.jinja
+
+    Copied unmodified from GGZ14/vllm-mxfp4
+    (https://github.com/GGZ14/vllm-mxfp4, commit 92eed82). Worth about +14%
+    speculative-decoding acceptance over the checkpoint's own template.
+
+    vllm-mxfp4 ships no licence file. The author confirmed by DM on 2026-09-21
+    that our use is fine, with credit. As above: permission for this project,
+    not a licence, not sublicensed.
+
+--------------------------------------------------------------------------------
+4. Ideas and integration approaches  -- no code copied
+--------------------------------------------------------------------------------
+    Several techniques were learned from GGZ14/vllm-mxfp4 (NVFP4 -> MXFP4
+    requantisation at load, merging the GDN in_proj pair, converting fp8 dense
+    layers to MXFP4) and implemented independently here. Ideas are not
+    copyrightable and nothing is carved out on their account; the credit in
+    CREDITS.md is given because it is deserved, not because it is required.
+
+--------------------------------------------------------------------------------
+5. Runtime dependencies  -- not redistributed
+--------------------------------------------------------------------------------
+    vLLM, ROCm, PyTorch and Triton are used unmodified at runtime and are not
+    included here. libr4d's binary (r4d.so) is loaded at runtime when present
+    and is NOT redistributed by this repository (.gitignore excludes *.so); the
+    stack runs without it, using our own kernels.
+
+See CREDITS.md for the full attribution table and notes/independence.md for what
+was replaced with original work and what each piece is measurably worth.

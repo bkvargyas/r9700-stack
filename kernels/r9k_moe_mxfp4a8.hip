@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: LicenseRef-libr4d-derived
+// Partly derived from libr4d (no upstream licence; used with permission). NOT Apache-2.0 -- see NOTICE.
+
 // r9k_moe_mxfp4a8.hip -- grouped (MoE) OCP-MXFP4-weight x FP8-activation GEMM for gfx1201 (RDNA4).
 //
 // Derived from libr4d's r4d_gemm_mxfp4a8_nt_m64 (codeberg.org/StillDeadcode/libr4d, commit 5dc6302;

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
+
 // r9k_ar.hip -- one-shot 2-rank peer-to-peer all-reduce for gfx1201 (RDNA4), plus the IPC helpers it needs.
 //
 // Independent implementation: written from the standard one-shot all-reduce pattern (each rank pushes its whole

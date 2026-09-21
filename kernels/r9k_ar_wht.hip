@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
+
 // r9k_ar_wht.hip -- compressed 2-rank all-reduce payload: Walsh-Hadamard rotation + 6-bit group quantisation.
 //
 // Independent implementation (see notes/independence.md): the transform is the ordinary 64-point Walsh-Hadamard

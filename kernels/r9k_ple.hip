@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
+
 // r9k_ple.hip -- PLE n-gram table row gather + int6 dequant (gfx1201).
 //
 // Table rows are fused int6 rows (tcclaviger Qwen3.8-Flash-Next GPTQ checkpoint format): head_dim codes in

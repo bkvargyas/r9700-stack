@@ -4,11 +4,18 @@ Neither upstream ships a LICENSE file, so by default both are all rights reserve
 permission to copy, modify or distribute, which is why these asks exist. Both are best sent as a public issue on
 the project's own tracker (that is the normal channel and leaves a citable record); no email address needed.
 
-Status 2026-09-21: **Brian reports both authors confirmed by DM that our use is fine.** So the permission
-question is answered for this project. These drafts are kept because a DM is not a license: it does not transfer
-to anyone who forks or vendors this repo, and it is not citable. The remaining ask is smaller and worth making
-anyway -- "would you add a LICENSE file, or repeat that in a public issue?" -- and the fallback costs below stay
-accurate if either author later declines.
+Status 2026-09-21: **Both authors confirmed by DM that our use is fine** (per Brian), and the repo is now
+Apache-2.0 with those two items carved out in `NOTICE`. Brian's read is that neither author is likely to add a
+licence file, and he is content to ship the chat template on credit alone.
+
+So these drafts are no longer blocking anything. They are kept for one reason: **the libr4d carve-out is the one
+that limits what Apache-2.0 actually means here**, because the derived GEMM is the core of the project. Anyone who
+takes this repo under Apache-2.0 finds the central kernel is not theirs to reuse. If that ever matters -- someone
+wants to build on it, or it goes somewhere that needs clean provenance -- there are two ways out, and the ask
+below is the cheap one. The rewrite priced at the bottom (~5%) is the other.
+
+If the ask is made, the useful wording is specific: not "would you add a licence?" but **"would you license libr4d
+under Apache-2.0 or MIT?"** -- only that unblocks sublicensing.
 
 Context that makes both asks small: our own kernels now replace libr4d's paged attention and 2-rank all-reduce
 (`notes/independence.md`), so the only thing still at stake for libr4d is the **derived GEMM**, and for

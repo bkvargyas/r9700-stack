@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
+
 // Paged causal attention for gfx1201 (RDNA4, wave32): the prefill / mixed-batch path of attn/triton3d.py.
 //
 // Independent implementation of paged FlashAttention (online softmax with running row max / row sum, K/V read
