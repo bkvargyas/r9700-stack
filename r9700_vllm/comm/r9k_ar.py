@@ -93,6 +93,7 @@ class R9kAllReduce:
             logger.warning("r9700: r9k all-reduce IPC open failed; staying on RCCL")
             return
         self._peer_scratch, self._peer_flags = ps.value, pf.value
+        self._histon = os.environ.get("R9K_AR_HIST") == "1"
         self._seq = torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
         # 4/2 = release store on the flag, acquire load on the poll: expresses exactly the ordering the
         # handshake needs at system scope, instead of draining everything with __threadfence_system(). Measured
@@ -151,7 +152,7 @@ class R9kAllReduce:
         nbytes = x.numel() * x.element_size()
         use_wht = (self._wht and x.dtype in (torch.bfloat16, torch.float16) and nbytes >= self._qmin
                    and x.numel() % self._qgroup == 0)
-        if os.environ.get("R9K_AR_HIST") == "1":
+        if self._histon:                     # resolved once in __init__: this runs ~157x per decode step
             self._hist(nbytes, use_wht)
         if use_wht:
             return self._all_reduce_wht(x, out)
