@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
+import os
 import json, re, sys, gzip, io, urllib.request, subprocess, tempfile, os, time
 import concurrent.futures as cf
-BASE="http://192.168.0.155:8000/v1/chat/completions"; MODEL="Qwen3.8"
+BASE=os.environ.get("PROD_BASE", "http://localhost:8000") + "/v1/chat/completions"; MODEL="Qwen3.8"
 TAG=sys.argv[1] if len(sys.argv)>1 else "run"
 N=int(sys.argv[2]) if len(sys.argv)>2 else 164
 CONC=8
