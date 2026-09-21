@@ -88,16 +88,46 @@ are **not** 2 MB. At `NBT=4096` and hidden 5120 a prefill message is ~40 MB, whe
 against a ~1.3 ms transfer. I optimised the size that was convenient to benchmark rather than the size that
 dominates the workload. **Profile at the size the workload actually uses.**
 
-### Attempt 2 (next): pipeline large messages
+### Attempt 2 (2026-09-21): pipelining ruled out by measurement. We are link-bound.
 
-The remaining gap is large-message *throughput*, not fixed cost. We sustain ~11.9 GB/s marginal. Serial cost of a
-40 MB message is roughly pack 360 us + push 1.6 ms + reduce 320 us ~ 2.3 ms; chunking the message and overlapping
-pack -> push -> reduce should hide the ~680 us of pack/reduce behind the transfer, i.e. ~20-30% off the AR.
+Measured the real sizes first (`R9K_AR_HIST=1`, now built in): prefill drives **16-32+ MiB compressed** messages
+(the 32 MiB bucket went 387 -> 1,104 over three 9k prefills); decode lives in 8-512 KiB. So the earlier ~40 MB
+arithmetic was right, and attempt 1 tuned the wrong size.
 
-Before writing it: **measure the actual message-size distribution during a 9k prefill** (instrument
-`R9kAllReduce.all_reduce` to histogram `nbytes`) and profile the compressed path at *that* size. Do not repeat
-attempt 1's mistake. Also worth checking whether a larger `R9K_AR_QUANT_MIN_KB` or a different chunk size
-interacts with `NBT`.
+Then profiled a 9k prefill on both backends:
+
+| | ours | libr4d |
+|---|---|---|
+| GPU busy | 2,267 ms | 1,991 ms |
+| all-reduce total (387 calls) | **693 ms** = push 442 + pack 145 + reduce 106 | **375 ms**, one fused kernel |
+| per call | **1.79 ms** | **0.97 ms** |
+
+**This rules out the pipelining plan arithmetically.** libr4d's entire fused all-reduce (0.97 ms) is faster than
+our `push` phase alone (1.14 ms), so even perfectly hiding *all* of pack and reduce behind the transfer lands at
+1.14 ms/call -- still 18% behind. Pipelining cannot close this.
+
+And our push is not inefficient: 15.6 MB in 1.14 ms = **13.7 GB/s, at PCIe 3's practical ceiling**. We are
+link-bound, not overhead-bound. Nothing about scheduling, fusion or overlap gets past a saturated wire.
+
+So libr4d is either moving **fewer bytes** than we are, or streaming transfer and compute together inside one
+kernel so that "exchange" is never a distinct phase. **We do not know which, and should not guess** -- this phase
+has already produced three wrong causes reasoned past the evidence.
+
+### What is actually left for Phase 1
+
+The only lever consistent with being link-bound is **sending fewer bytes**:
+
+1. **Fewer bits per element.** 4-bit instead of 6-bit cuts the payload ~1.5x -> push ~0.76 ms/call, which would
+   put the total near libr4d even without overlap. Cost: relative error goes from ~0.025 to ~0.1 per call, over
+   ~387 calls per prefill. **A quality trade, so it is Brian's decision, and it must be gated on a real eval --
+   GSM8K-500 provably cannot resolve it (see the measurement rules in notes/picking-up.md).**
+2. **A smaller scale field.** fp8 rather than bf16 per group, or a 128-element group: both ~6.125 bits/elem
+   against our 6.25. Marginal (~2%), cheap, no quality cost worth mentioning. Not enough alone.
+3. **Understand what libr4d actually does differently** before building anything else. The honest statement is
+   that a ~15% byte or bandwidth advantage is unaccounted for.
+
+**Recommendation: stop here unless (1) is approved.** The decode half of Phase 1 is done and committed; the
+prefill half is bounded by the link, and the remaining options are a quality trade or an unknown.
 
 ---
 

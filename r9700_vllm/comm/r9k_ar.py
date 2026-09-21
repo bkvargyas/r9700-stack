@@ -130,11 +130,30 @@ class R9kAllReduce:
         n = x.numel() * x.element_size()
         return 0 < n <= self.max_bytes and n % 16 == 0
 
+    def _hist(self, nbytes: int, compressed: bool) -> None:
+        """R9K_AR_HIST=1: histogram the message sizes this workload actually uses, so tuning targets the
+        sizes that dominate rather than the size that was convenient to benchmark."""
+        h = self.__dict__.setdefault("_hist_d", {})
+        bucket = 1 << (nbytes.bit_length() - 1)          # power-of-two bucket
+        k = (bucket, compressed)
+        h[k] = h.get(k, 0) + 1
+        n = self.__dict__.get("_hist_n", 0) + 1
+        self.__dict__["_hist_n"] = n
+        if n % int(os.environ.get("R9K_AR_HIST_EVERY", "2000")) == 0:
+            rows = sorted(h.items(), key=lambda kv: -kv[1])
+            tot = sum(h.values())
+            logger.info("r9700 AR sizes after %d calls: %s", tot, "  ".join(
+                f"{(b >> 20) or b >> 10}{'MiB' if b >> 20 else 'KiB'}{'/c' if c else '/x'}:{v}"
+                f"({100.0 * v / tot:.0f}%)" for (b, c), v in rows[:8]))
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         out = torch.empty_like(x)
         nbytes = x.numel() * x.element_size()
-        if (self._wht and x.dtype in (torch.bfloat16, torch.float16) and nbytes >= self._qmin
-                and x.numel() % self._qgroup == 0):
+        use_wht = (self._wht and x.dtype in (torch.bfloat16, torch.float16) and nbytes >= self._qmin
+                   and x.numel() % self._qgroup == 0)
+        if os.environ.get("R9K_AR_HIST") == "1":
+            self._hist(nbytes, use_wht)
+        if use_wht:
             return self._all_reduce_wht(x, out)
         n16 = x.numel() * x.element_size() // 16
         nb = max(self.min_nb, min(self.max_nb, n16 // self.words_per_block))
