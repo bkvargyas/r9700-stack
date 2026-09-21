@@ -140,7 +140,13 @@ class R9kCommunicator(CudaCommunicator):
             from ..moe.experts import r9k_available
             if "tp" in (getattr(self, "unique_name", "") or "") and getattr(self, "world_size", 1) == 2 \
                     and r9k_available():
-                ar = R4dAllReduce(self.cpu_group, self.device)
+                # R9K_AR_IMPL=r9k selects our own kernel (kernels/r9k_ar.hip, no libr4d); r4d is the default
+                # until it has been measured end to end. Ours is exact-only: R9K_AR_QUANT does nothing there.
+                if os.environ.get("R9K_AR_IMPL", "r4d") == "r9k":
+                    from .r9k_ar import R9kAllReduce
+                    ar = R9kAllReduce(self.cpu_group, self.device)
+                else:
+                    ar = R4dAllReduce(self.cpu_group, self.device)
                 if not ar.disabled:
                     self._r9k_ar = ar
         except Exception as e:
