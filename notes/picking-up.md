@@ -65,10 +65,7 @@ is still the default. Turning it on makes the build fully independent of libr4d 
 
 ## What's actually left, roughly in order
 
-1. **TTFT: 101 ms vs 65 ms** against the reference stack, consistent across every benchmark category. ~36 ms of
-   fixed per-request overhead, unexplained, and user-visible on short prompts. Nobody has looked at it — we have
-   been measuring 9k-token probes where it vanishes. Probably the best value per hour on this list.
-2. **An eval that can detect regressions.** See the GSM8K point above. Until this exists, quality claims here are
+1. **An eval that can detect regressions.** See the GSM8K point above. Until this exists, quality claims here are
    weaker than they look.
 3. **All-reduce per-call overhead.** Worth the ~11% that full independence costs. Our compressed path runs at
    ~0.22 µs/KB against 0.115 for our exact path, so it is per-call overhead, not the link. **Profile where the
@@ -79,8 +76,40 @@ is still the default. Turning it on makes the build fully independent of libr4d 
    nothing measurable today; would matter at higher concurrency.
 6. **GEMM independence** (~5%) — only if the licence situation changes. See `notes/independence.md`.
 
+## TTFT: investigated 2026-09-21, localised, and closed
+
+We were 101 ms vs the reference stack's 65 ms on time-to-first-token, consistent across every BetterBench
+category. Chased it properly; here is the whole answer so nobody starts over.
+
+**It decomposes as ~80 ms fixed + 0-25 ms waiting for the next engine step boundary.** Back-to-back requests
+reliably land just after a step starts and pay nearly a full step (p50 103.7 ms, and pathologically tight --
+194/200 samples inside one 5 ms bucket). Insert a random idle gap before each request and it drops to ~82 ms with
+a 80-105 ms spread, which is exactly our 25 ms step time. Sequential benchmarks therefore see the worst case;
+concurrent users see ~82 ms.
+
+**The ~80 ms is prefill, and prefill is eager.** vLLM's own histograms: queue time **0.0 ms**, prefill time
+**~78 ms** for an *8-token* prompt, and its TTFT matches a client stopwatch to within 1-2 ms (so it is not HTTP,
+streaming or detokenisation). Profiling a 35-token prefill: **GPU busy 32.2 ms against ~78 ms wall clock**, with
+about **1,950 kernel launches** in one forward -- ~24 us of dead time each. Over half the GPU time is our MoE
+kernel running in *decode* mode (`r9k_moe_mxfp4a8_kernel`, correct: M is far below the `PREFILL_MIN_M=128` gate),
+i.e. mostly irreducible expert-weight traffic that does not shrink just because the prompt did.
+
+**Nothing at the configuration level fixes it.** Ruled out by measurement: speculative decoding (it *helps* TTFT
+by 37 ms -- running without a drafter is worse), `qwen-fixed` chat-template rendering, `HSA_ENABLE_MWAITX`,
+`GPU_MAX_HW_QUEUES`, and the API-server layer. `cudagraph_mode` already defaults to `FULL_AND_PIECEWISE`, so the
+1,950 launches are what remains *after* piecewise capture -- capture only covers shapes in the capture list,
+which vLLM populates for decode, not for arbitrary prefill lengths. **Forcing `CGMODE=FULL` makes TTFT 55 ms
+worse** (159 ms) because our custom attention backend cannot be fully captured and it falls back.
+
+**Left open deliberately.** Eager prefill is stock vLLM behaviour and fixing it upstream means patching vLLM,
+which is the fork-maintenance burden this project exists to avoid. The part that *is* ours: ~650 of the 1,950
+launches are our kernels (256 MoE + 258 quantiser + 140 all-reduce), worth maybe 8-15 ms if fused. Modest, real,
+and the only honest lever left.
+
 ## Already tried, measured, and rejected — don't redo these
 
+- `CGMODE=FULL`: TTFT 159 ms vs 104. Custom attention backend cannot be fully captured.
+- `HSA_ENABLE_MWAITX=0`, `HWQ=4`, dropping the chat template: none moved TTFT by more than ~1 ms.
 - `NBT=8192` (bigger prefill chunks): no gain at 9k, engine crash at 20.7k.
 - `R9K_FP8_TO_MXFP4=0` (keep MLP layers 56-63 on fp8): −21% prefill, −18% decode.
 - Fusing the compressed all-reduce into one kernel: 314 µs vs 179 for the split version, at every block count.

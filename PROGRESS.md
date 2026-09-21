@@ -204,6 +204,17 @@ never apples to apples -- GGZ14 chunk at 8192 and keep MLP layers 56-63 on fp8):
 - `R9K_FP8_TO_MXFP4=0` (keep layers 56-63 on fp8): prefill 3456 vs 4392 (-21%), decode 94.7 vs 115.1, step
   30.7 vs 25.1 ms. Much worse -- converting those layers is a clear win and the existing default is right.
 
+### 2026-09-21: TTFT investigated and closed
+
+101 ms vs the reference stack's 65 ms. Decomposed to **~80 ms fixed + 0-25 ms step-boundary wait**; the fixed part
+is prefill (queue time 0.0 ms, prefill time ~78 ms for an *8-token* prompt), and prefill runs **eager**: 32.2 ms
+GPU busy against ~78 ms wall, ~1,950 launches at ~24 us of gap each. `cudagraph_mode` already defaults to
+FULL_AND_PIECEWISE so those launches survive capture; `FULL` is 55 ms *worse*. Ruled out by measurement:
+speculative decoding (helps by 37 ms), chat-template rendering, HSA_ENABLE_MWAITX, GPU_MAX_HW_QUEUES, the API
+server. Closed as upstream behaviour -- full detail and the one remaining lever in notes/picking-up.md.
+
+Added `CGMODE=` and `MWAITX=` knobs to serve/serve.sh while investigating.
+
 **Measurement discipline (learned the hard way this week):**
 - ALWAYS check `results.json` `env.endpoint` before quoting a baseline: ~/bb-prod.log is the PRODUCTION box.
 - Never start a run while another is live (two servers on the same GPUs produced 30% CVs and nonsense numbers);
