@@ -60,6 +60,45 @@ Then flip the default, delete `r4d_ar.py`, and drop the two libr4d all-reduce ro
 to remove a licence dependency is a legitimate trade; it should just be Brian's explicit choice, not a default
 someone inherits by accident.
 
+### Attempt 1 (2026-09-21): decode gaps closed, prefill unchanged. Default NOT flipped.
+
+Step 1.1 paid for itself immediately by **refuting the premise of this phase**. There was no per-call overhead to
+remove: profiled, the push kernel is within 1-2 us of our exact kernel at the same byte count and the three-launch
+gap is under 10 us. The "0.22 vs 0.115 us/KB" figure that motivated Phase 1 was an arithmetic error -- compressed
+time divided by *wire* bytes against exact time divided by *raw* bytes. Per raw byte the compressed path was
+already ahead (0.085 vs 0.114).
+
+What the profile did find: a **~54 us/call system-scope fence cost**. The sweep showed `drain=2` was fast, but
+`drain<3` is `__threadfence()` -- *agent* scope, which orders nothing for a peer GPU. Fast, correct-looking in a
+lockstep test, and a real race. Replaced instead with a **release store / acquire load** at system scope
+(`drain=4, acq=2`, now the default), which states exactly the ordering the handshake needs and lets the hardware
+emit the minimum barrier. 2 MB compressed 174.7 -> 128.8 us; the exact kernel 233.3 -> 206.7 us as a side-effect.
+
+End to end that bought the **decode** side and nothing else:
+
+| | ours before | ours after | libr4d | gap now |
+|---|---|---|---|---|
+| ms/step | 25.7 | **25.1** | 24.9 | +0.8% |
+| conc-8 | 422.2 | **460.6** | 484.8 | -5.0% |
+| single decode | 114.5 | 115.6 | 117.1 | -1.3% |
+| prefill 9k | 3,909 | 3,920 | 4,403 | **-11.0%** |
+
+**Why prefill did not move, and the lesson:** a 26% win at 2 MB is irrelevant because prefill all-reduce messages
+are **not** 2 MB. At `NBT=4096` and hidden 5120 a prefill message is ~40 MB, where a 54 us fixed saving sits
+against a ~1.3 ms transfer. I optimised the size that was convenient to benchmark rather than the size that
+dominates the workload. **Profile at the size the workload actually uses.**
+
+### Attempt 2 (next): pipeline large messages
+
+The remaining gap is large-message *throughput*, not fixed cost. We sustain ~11.9 GB/s marginal. Serial cost of a
+40 MB message is roughly pack 360 us + push 1.6 ms + reduce 320 us ~ 2.3 ms; chunking the message and overlapping
+pack -> push -> reduce should hide the ~680 us of pack/reduce behind the transfer, i.e. ~20-30% off the AR.
+
+Before writing it: **measure the actual message-size distribution during a 9k prefill** (instrument
+`R9kAllReduce.all_reduce` to histogram `nbytes`) and profile the compressed path at *that* size. Do not repeat
+attempt 1's mistake. Also worth checking whether a larger `R9K_AR_QUANT_MIN_KB` or a different chunk size
+interacts with `NBT`.
+
 ---
 
 ## Phase 2 — re-derive the GEMM

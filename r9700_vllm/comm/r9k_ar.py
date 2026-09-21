@@ -94,7 +94,13 @@ class R9kAllReduce:
             return
         self._peer_scratch, self._peer_flags = ps.value, pf.value
         self._seq = torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
-        self.drain, self.acq = (3, 0) if fine else (3, 1)
+        # 4/2 = release store on the flag, acquire load on the poll: expresses exactly the ordering the
+        # handshake needs at system scope, instead of draining everything with __threadfence_system(). Measured
+        # ~54 us/call cheaper at 2 MB. R9K_AR_FENCE=drain,acq overrides for experiments (see tuning/ar_profile.py;
+        # drain=1/2 are agent-scope and are NOT valid for a peer device even though they measure correct).
+        self.drain, self.acq = 4, 2
+        if os.environ.get("R9K_AR_FENCE"):
+            self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
 
         # Compressed path for large (prefill) messages: rotate + 6 bits, so the wire carries 2.56x fewer bytes.
         self._wht = None

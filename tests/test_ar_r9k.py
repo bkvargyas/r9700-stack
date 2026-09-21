@@ -69,7 +69,10 @@ class R9kAR:
         assert self.L.r9k_ar_ipc_open(shs[peer], ctypes.byref(self.peer_scratch)) == 0, "ipc_open scratch"
         assert self.L.r9k_ar_ipc_open(fhs[peer], ctypes.byref(self.peer_flags)) == 0, "ipc_open flags"
         self.seq = torch.zeros(self.max_nb, dtype=torch.int32, device=device)
-        self.drain, self.acq = (3, 0) if self.fine else (3, 1)
+        # must match r9700_vllm/comm/r9k_ar.py, or this test verifies a handshake we do not ship
+        self.drain, self.acq = 4, 2
+        if os.environ.get("R9K_AR_FENCE"):
+            self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
 
     def all_reduce(self, x, nb=None, nt=0):
         out = torch.empty_like(x)

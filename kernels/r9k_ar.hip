@@ -25,9 +25,16 @@
 //
 // Memory model on gfx1201: the scratch is fine-grained (device-uncached) memory when hipExtMallocWithFlags allows
 // it, so peer writes land in the fabric without an explicit cache flush; `drain`/`acq` select how hard we fence:
-//   drain: 0 none, 1 release fence (agent), 2 + buffer_wbl2, 3 system-scope release (default, correct everywhere)
-//   acq:   0 plain volatile poll (fine-grained scratch), 1 poll + system-scope acquire fence (coarse-grained)
-// The defaults the caller passes (3, 0) for fine-grained and (3, 1) for coarse match those two cases.
+//   drain: 0 none, 1/2 device-scope fence (NOT sufficient for a peer GPU -- see below), 3 system-scope fence
+//          then a relaxed flag store, 4 (default) RELEASE store on the flag and no separate fence.
+//   acq:   0 plain relaxed poll, 1 poll + system-scope acquire fence, 2 (default) ACQUIRE load on the poll.
+//
+// Why 4/2 rather than 3/0: the handshake needs the peer's *device* to observe our data writes before it observes
+// our flag. A release store at system scope expresses exactly that, and the hardware emits the minimum barrier
+// for it. A blanket __threadfence_system() plus a relaxed store expresses something stronger (drain everything)
+// and measured ~54 us per call more at 2 MB. drain=1/2 measured fast AND correct in a lockstep two-rank test,
+// but they are __threadfence(), which is agent scope and orders nothing for the peer device -- that is a race
+// that happens to pass, not a valid setting. Kept only so the sweep can show the difference.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
@@ -55,7 +62,30 @@ __device__ __forceinline__ void ar_release(int drain) {
 }
 
 __device__ __forceinline__ void ar_acquire(int acq) {
-  if (acq) __threadfence_system();
+  if (acq == 1) __threadfence_system();        // acq == 2 does the acquire on the load itself
+}
+
+// Publish the flag so the peer sees our data writes first. drain >= 4: a single RELEASE store carries the
+// ordering. Otherwise: an explicit fence of the requested strength, then a relaxed store.
+__device__ __forceinline__ void ar_publish(u32* flag, u32 val, int drain, bool leader) {
+  if (drain >= 4) {
+    if (leader) __hip_atomic_store(flag, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    return;
+  }
+  ar_release(drain);
+  if (leader) __hip_atomic_store(flag, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Spin until the peer has published. acq >= 2: ACQUIRE load, so the peer's data writes are visible to us
+// afterwards without a separate fence.
+__device__ __forceinline__ void ar_wait(volatile u32* flag, int target, int acq) {
+  if (acq >= 2) {
+    while ((int)__hip_atomic_load((u32*)flag, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) < target)
+      __builtin_amdgcn_s_sleep(1);
+  } else {
+    while ((int)__hip_atomic_load((u32*)flag, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < target)
+      __builtin_amdgcn_s_sleep(1);
+  }
 }
 
 // ---------------------------------------------------------------- one-shot 2-rank all-reduce
@@ -85,15 +115,10 @@ __global__ void __launch_bounds__(1024) r9k_ar_oneshot_2rank_kernel(
 
   // 2. publish: every write above must be visible to the peer before the flag is
   __syncthreads();
-  ar_release(drain);
-  if (tid == 0) __hip_atomic_store(&peer_flags[b], (u32)(s + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  ar_publish(&peer_flags[b], (u32)(s + 1), drain, tid == 0);
 
   // 3. wait for the peer's slice to land in OUR scratch
-  if (tid == 0) {
-    while ((int)__hip_atomic_load(&flags[b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < s + 1) {
-      __builtin_amdgcn_s_sleep(1);
-    }
-  }
+  if (tid == 0) ar_wait(&flags[b], s + 1, acq);
   __syncthreads();
   ar_acquire(acq);
 
@@ -133,13 +158,8 @@ __global__ void __launch_bounds__(1024) r9k_ar_push_2rank_kernel(
   for (long i = lo + tid; i < hi; i += nt) peer_scratch[base + i] = src[i];
 
   __syncthreads();
-  ar_release(drain);
-  if (tid == 0) __hip_atomic_store(&peer_flags[b], (u32)(s + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-  if (tid == 0) {
-    while ((int)__hip_atomic_load(&flags[b], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM) < s + 1) {
-      __builtin_amdgcn_s_sleep(1);
-    }
-  }
+  ar_publish(&peer_flags[b], (u32)(s + 1), drain, tid == 0);
+  if (tid == 0) ar_wait(&flags[b], s + 1, acq);
   __syncthreads();
   ar_acquire(acq);
 }
