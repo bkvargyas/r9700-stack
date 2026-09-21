@@ -1,5 +1,6 @@
-"""TRITON_ATTN with split-KV (3D) attention for small multi-query batches (speculative verify) and libr4d paged
-attention for prefill / mixed batches (head_dim 256, GQA 6, block 16; fp8 or bf16 KV).
+"""TRITON_ATTN with split-KV (3D) attention for small multi-query batches (speculative verify) and our paged
+attention (kernels/r9k_attn.hip, or libr4d's) for prefill / mixed batches (head_dim 256, GQA 6, block 16; fp8 or
+bf16 KV).
 
 Stock `unified_attention` only takes its split-KV ("3D") path when every sequence contributes ONE query token
 (`max_seqlen_q > 1` forces the 2D kernel). Speculative decoding verifies 1+k tokens per sequence, so every verify
@@ -32,10 +33,31 @@ from vllm.v1.attention.backends.triton_attn import (
 logger = init_logger("vllm." + __name__)
 
 MAXQ = int(os.environ.get("R9K_ATTN_3D_MAXQ", "16"))
-# libr4d paged attention (head_dim 256, 6 q heads per kv head, block 16, causal, no window) for the batches the 3D
-# path does not take -- prefill chunks and mixed prefill+decode steps. Integration approach follows GGZ14's
-# radiance_r4d_attn.py (see CREDITS.md); stock unified attention measured 36 ms per 4096-token chunk on the 27B.
-R4D_ATTN = os.environ.get("R9K_R4D_ATTN", "1") == "1"
+# Paged attention (head_dim 256, 6 q heads per kv head, block 16, causal, no window) for the batches the 3D path
+# does not take -- prefill chunks and mixed prefill+decode steps; stock unified attention measured 36 ms per
+# 4096-token chunk on the 27B. R9K_PAGED_ATTN selects the kernels: "r9k" (default, kernels/r9k_attn.hip: our own,
+# bf16 + fp8 KV, no decode-band kernel -- short-q groups of a mixed batch go through the same prefill kernel),
+# "r4d" (libr4d's prefill + decode pair; integration approach follows GGZ14's radiance_r4d_attn.py, see
+# CREDITS.md) or "0" (stock unified attention). R9K_R4D_ATTN=0 is the legacy switch that disables libr4d.
+PAGED_ATTN = os.environ.get("R9K_PAGED_ATTN", "r9k")
+R4D_ATTN = os.environ.get("R9K_R4D_ATTN", "1") == "1" and PAGED_ATTN == "r4d"
+
+
+def _r9k_kernels():
+    """(kernels per kv dtype, max decode q_len, scratch fn) for our libr9k paged attention, or None."""
+    if PAGED_ATTN != "r9k":
+        return None
+    try:
+        from ..kernels.attn import prefill_kernels
+        k = prefill_kernels()
+    except Exception as e:           # older libr9k.so without the attention kernels: stock path
+        logger.warning_once("r9700: libr9k attention unavailable (%s); prefill stays on unified attention", e)
+        return None
+    return {kv: (pf, None) for kv, pf in k.items()}, 0, None
+
+
+def _paged_kernels():
+    return _r9k_kernels() if PAGED_ATTN == "r9k" else _r4d_kernels()
 
 
 def _r4d_kernels():
@@ -90,16 +112,19 @@ class R9kTriton3DMetadataBuilder(TritonAttentionMetadataBuilder):
         logger.info_once("r9700: attention 3D split-KV for <= %d query tokens/seq (scratch %d tokens)", MAXQ,
                          self._cap_tokens)
         self._r4d = None
-        k = _r4d_kernels() if (self.headdim == 256 and self.num_heads_q == 6 * self.num_heads_kv) else None
+        k = _paged_kernels() if (self.headdim == 256 and self.num_heads_q == 6 * self.num_heads_kv) else None
         if k is not None:
             kernels, self._r4d_maxq, scratch_fn = k
             vc = self.vllm_config
             self._max_ctx = vc.model_config.max_model_len
-            nbytes = max(scratch_fn(n, self._r4d_maxq, self.num_heads_q, self.num_heads_kv, self.headdim,
-                                    self._max_ctx, 0) for n in range(1, vc.scheduler_config.max_num_seqs + 1))
-            self._r4d_scratch = torch.empty(nbytes, dtype=torch.uint8, device=self.softmax_segm_output.device)
+            self._r4d_scratch = None
+            if scratch_fn is not None:
+                nbytes = max(scratch_fn(n, self._r4d_maxq, self.num_heads_q, self.num_heads_kv, self.headdim,
+                                        self._max_ctx, 0) for n in range(1, vc.scheduler_config.max_num_seqs + 1))
+                self._r4d_scratch = torch.empty(nbytes, dtype=torch.uint8, device=self.softmax_segm_output.device)
             self._r4d = kernels
-            logger.info_once("r9700: libr4d paged attention for prefill / mixed batches (%s)",
+            logger.info_once("r9700: %s paged attention for prefill / mixed batches (%s)",
+                             "libr9k" if PAGED_ATTN == "r9k" else "libr4d",
                              ", ".join(f"{kv}: {p.__name__}" for kv, (p, _) in kernels.items()))
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
@@ -116,7 +141,7 @@ class R9kTriton3DMetadataBuilder(TritonAttentionMetadataBuilder):
 
 
 class R9kTriton3DImpl(TritonAttentionImpl):
-    """Stock Triton attention, except prefill / mixed batches of a matching layer go to libr4d's paged kernels."""
+    """Stock Triton attention, except prefill / mixed batches of a matching layer go to the paged kernels."""
 
     _r4d_ok = None
 
@@ -175,11 +200,12 @@ class R9kTriton3DImpl(TritonAttentionImpl):
         q_row = self.num_heads * self.head_size * query.element_size()
         o_row = self.num_heads * self.head_size * output.element_size()
         stream = torch.cuda.current_stream().cuda_stream
+        scratch_ptr = scratch.data_ptr() if scratch is not None else 0
         for first_req, nseq, q_len, first_tok in groups:
-            (decode if q_len <= maxq else prefill)(
+            (decode if (decode is not None and q_len <= maxq) else prefill)(
                 query.data_ptr() + first_tok * q_row, kv_cache.data_ptr(), bt.data_ptr() + first_req * maxb * 4,
                 attn_metadata.seq_lens.data_ptr() + first_req * 4, output.data_ptr() + first_tok * o_row, kd, vd,
-                scratch.data_ptr(), nseq, q_len, self.num_heads, self.num_kv_heads, self.head_size, 16, maxb,
+                scratch_ptr, nseq, q_len, self.num_heads, self.num_kv_heads, self.head_size, 16, maxb,
                 kv_cache.stride(0), kv_cache.stride(1), self.scale, 0, max_ctx, stream)
         return output
 
@@ -200,13 +226,14 @@ class R9kTriton3DBackend(TritonAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        return [16]           # libr4d's paged kernels are compiled for block 16; the 3D path is fine with it
+        return [16]           # the paged kernels are compiled for block 16; the 3D path is fine with it
 
     @classmethod
     def supported_kv_cache_layouts(cls):
-        """libr4d indexes a key by (block, head, slot) with contiguous K/V-packed slots, i.e. LBHNC ([L,B,H,N,C]
-        identity). Without this the engine picked a slot-major layout on the 27B (strides (16384, 512, 1024, 1))
-        and every prefill fell back to unified attention. The 3D / stock kernels take any strides."""
+        """The paged kernels index a key by (block, head, slot) with contiguous K/V-packed slots, i.e. LBHNC
+        ([L,B,H,N,C] identity). Without this the engine picked a slot-major layout on the 27B (strides
+        (16384, 512, 1024, 1)) and every prefill fell back to unified attention. The 3D / stock kernels take any
+        strides."""
         from vllm.v1.kv_cache_layout import KVCacheLayout
         return (KVCacheLayout.LBHNC,)
 

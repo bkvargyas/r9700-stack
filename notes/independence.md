@@ -26,7 +26,7 @@ told the same in their brief (see the attention task, 2026-09-21).
 |---|---|---|---|
 | 2-rank P2P all-reduce, exact | runtime, `r4d.so` | decode 118.6 vs 99.3 tok/s; 25.1 vs 30.3 ms/step | **replaced** -- `kernels/r9k_ar.hip`, `R9K_AR_IMPL=r9k` |
 | 2-rank all-reduce, compressed (wht6) | runtime, `r4d.so` | prefill 4418 vs 3344 tok/s; conc-8 465.9 vs 390.8 | **open** -- ours is exact-only |
-| paged attention, prefill + mixed batches | runtime, `r4d.so` | prefill 4418 vs 2027 tok/s (**-54%** without it) | **in progress** 2026-09-21 |
+| paged attention, prefill + mixed batches | runtime, `r4d.so` | prefill 4418 vs 2027 tok/s (**-54%** without it) | **replaced** -- `kernels/r9k_attn.hip`, default |
 | MXFP4xFP8 GEMM design | **source derivation** | folded unpack priced at ~5% | **open** -- see below |
 | expert LRU cache kernels | vendored source | -- | not an issue: davetha, Apache-2.0 |
 
@@ -61,13 +61,41 @@ vs 256 for RCCL, both bandwidth-bound on this PCIe 3 link.
 6 bits plus a bf16 scale (~2.6x fewer bytes). Rotating to flatten outliers before low-bit quantisation is a
 well-established public technique (QuIP, QuaRot and others); implement from that, not from libr4d.
 
-## 2. Paged attention -- in progress
+## 2. Paged attention -- replaced (2026-09-21)
 
-Started 2026-09-21. Target interface is in `r9700_vllm/attn/triton3d.py` (~line 170) and the correctness harness
-is `tests/test_attn_r4d.py`, which diffs against vLLM's stock `unified_attention` on an LBHNC cache -- so the
-replacement has a ready-made bar (`rel err < 2e-2`) and a ready-made performance target.
+`kernels/r9k_attn.hip` + `r9700_vllm/kernels/attn.py`, selected by `R9K_PAGED_ATTN` (**`r9k` is the default**;
+`r4d` keeps libr4d for A/B, `0` falls back to stock `unified_attention`).
 
-Geometry: head_size 256, GQA 6, block 16, causal, no window, bf16 or fp8_e4m3 KV.
+One workgroup = (seq, kv head, 16 query tokens), two waves per q head each owning half the head dim. Each KV
+block is staged once per workgroup into LDS (V transposed in hardware by `global_load_tr_b128`, swizzled so a
+fragment is one `ds_read_b128`), double-buffered a block ahead. S is computed **transposed** so each lane owns one
+query row, which makes the online-softmax max/sum/rescale per-lane scalars and leaves P in the accumulator layout
+with no shuffles; rescale is lazy (only when a row max grows past 2^8, decided wave-uniformly by ballot). fp8 KV
+converts on stage with the K descale folded into the softmax scale and the V descale into the output normalizer.
+Geometry: head_size 256, block 16, GQA 1-8 templated, causal, no window/alibi/softcap (those already fall back).
+
+Correctness `tests/test_attn_r9k.py`: all shapes vs stock `unified_attention`, max rel err 2.3e-3 to 6.9e-3
+(bar 2e-2); fp8 KV 2.8e-3 to 3.7e-3. Full 11-gate suite passes with it as the default.
+
+Measured end to end on the 27B (independent A/B, three probes per leg):
+
+| | ours | libr4d | stock |
+|---|---|---|---|
+| prefill 9k | 4,401 | 4,410 | 2,042 |
+| prefill 20.7k | 4,165 | 4,190 | -- |
+| ms/step | 25.1 | 25.2 | 25.2 |
+| single decode | 120.2 | 120.4 | 111.7 |
+| conc-8 | 477.5 | 472.9 | 487.3 |
+| GSM8K-500 | 97.0% | 96.6% | -- |
+
+**99.8% of libr4d at 9k, 99.4% at 20.7k**, step time and decode indistinguishable. Flash-Next unaffected.
+
+**Not covered:** there is no decode-band kernel, so short-q groups inside a mixed prefill+decode batch run on the
+prefill kernel (correct, but a 16-row tile with no KV split; [8,8,8,8] measures 0.07 ms vs libr4d's 0.05). This
+costs nothing measurable end to end (25.1 vs 25.2 ms/step), so it is left undone; a flash-decoding split with a
+combine pass is the piece to write if mixed-batch latency ever matters. The kernel is LDS-bandwidth-bound, not
+compute or DRAM bound -- ~136 KB of LDS traffic per block-step against 1536 WMMA cycles -- so further speed would
+come from shrinking the partner exchange (an fp16 exchange measured ~3%, left off to keep it exact).
 
 Note the "3D" split-KV path for speculative verify is **stock vLLM's** Triton kernel, not ours and not libr4d's --
 our contribution there is only the routing trick that forces `unified_attention` down its split-KV branch. So a

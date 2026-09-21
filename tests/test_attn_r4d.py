@@ -1,5 +1,6 @@
 """libr4d paged attention (attn/triton3d.py prefill / mixed path) == stock unified attention on a K/V-packed LBHNC cache."""
-import sys, time
+import os, sys, time
+os.environ.setdefault("R9K_PAGED_ATTN", "r4d")     # this test exercises the libr4d pair
 import torch
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from r9700_vllm.attn.triton3d import _r4d_kernels, _plan
