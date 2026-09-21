@@ -191,6 +191,19 @@ limit. Argued, not measured -- the kernel already accepts sorted-position tiled 
 excluded 16 GEMMs per chunk that ours included. Untried from this: `NBT=8192` (check the libr4d AR max message
 size at 8192x5120x2 = 80 MiB) and leaving layers 56-63 on the fp8 kernel.
 
+### 2026-09-21: independence from libr4d (see notes/independence.md)
+
+Both runtime dependencies replaced by our own kernels: paged attention (`kernels/r9k_attn.hip`, now the default)
+and the 2-rank all-reduce (`kernels/r9k_ar.hip` + `r9k_ar_wht.hip`, `R9K_AR_IMPL=r9k`). A fully libr4d-free 27B
+runs at **~11% below prefill and ~4% below decode** with identical GSM8K-500, against -55% prefill if the
+dependency were simply dropped. Attention alone is 99.8% of libr4d; the whole remaining gap is the all-reduce.
+
+**Prefill knobs measured and rejected** (both fell out of the finding that the "768 vs 484 GEMM launches" gap was
+never apples to apples -- GGZ14 chunk at 8192 and keep MLP layers 56-63 on fp8):
+- `NBT=8192`: no gain at 9k (4395 vs 4392) and the engine dies with HTTP 500 at a 20.7k prompt. Rejected.
+- `R9K_FP8_TO_MXFP4=0` (keep layers 56-63 on fp8): prefill 3456 vs 4392 (-21%), decode 94.7 vs 115.1, step
+  30.7 vs 25.1 ms. Much worse -- converting those layers is a clear win and the existing default is right.
+
 **Measurement discipline (learned the hard way this week):**
 - ALWAYS check `results.json` `env.endpoint` before quoting a baseline: ~/bb-prod.log is the PRODUCTION box.
 - Never start a run while another is live (two servers on the same GPUs produced 30% CVs and nonsense numbers);

@@ -57,9 +57,30 @@ RCCL's 30.3 / 99.3). On large messages it lands at RCCL's level (prefill 3,326 v
 because libr4d's advantage there is compression, not transport -- at 2 MB the microbenchmark is 233 us for ours
 vs 256 for RCCL, both bandwidth-bound on this PCIe 3 link.
 
-**Open:** a compressed large-message path. The scheme is a Hadamard rotation of each 64-element group shipped as
-6 bits plus a bf16 scale (~2.6x fewer bytes). Rotating to flatten outliers before low-bit quantisation is a
-well-established public technique (QuIP, QuaRot and others); implement from that, not from libr4d.
+### Compressed large-message path (`kernels/r9k_ar_wht.hip`, `R9K_AR_QUANT=1`)
+
+Each 64-element group is rotated by the 64-point Walsh-Hadamard transform and stored as 64 signed 6-bit codes
+plus a bf16 scale: 50 bytes per group, 6.25 bits/element, **2.56x fewer bytes on the wire**. Written from the
+public transform and the published practice of rotating before low-bit quantisation (QuIP, QuaRot). Host path is
+pack -> push (`r9k_ar_push_2rank`) -> reduce. Both ranks reduce the same PACKED pair, so they agree bit for bit;
+decode-size messages stay on the exact kernel.
+
+Accuracy is 6-bit's floor, not a choice: after rotation each group is Gaussian, E[amax] over 64 samples is
+~2.88 sigma, so the step is 2.88/31 sigma and the RMS error is step/sqrt(12) ~ 0.027 relative. Measured 0.0246.
+GSM8K-500 is unchanged (97.2% both legs). 2 MB call: 179 us vs 235 exact vs 254 RCCL.
+
+**Measured negatives, do not retry without new information:**
+- *Fusing pack + exchange + reduce into one kernel* (the obvious idea, since the push kernel already waits for the
+  peer): **314 us vs 179 us for the split version**, and unchanged at 64, 256 and 1024 blocks. The handshake sits
+  between two phases, so the whole grid's pack must land before any reduce starts, and the barrier-heavy rotation
+  serialises within each block; the split version instead parallelises pack and reduce over thousands of blocks.
+- *Reduce-scatter + all-gather instead of one-shot for large messages*: discarded by analysis, not measured. For
+  **two** ranks both move N bytes per rank, so there is nothing to win.
+
+**Still open:** the remaining gap to libr4d is entirely here -- a fully free build is ~11% behind on prefill while
+attention alone measures 99.8%. Our compressed path runs at roughly half the per-byte efficiency of our exact path
+(0.22 vs 0.115 us/KB), so what costs us is per-call overhead, not the link. Whoever picks this up should profile
+where those ~87 us go at 2 MB before writing more kernels.
 
 ## 2. Paged attention -- replaced (2026-09-21)
 
