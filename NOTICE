@@ -26,23 +26,33 @@ permission for THIS project, and that permission does not transfer to you.
     normally.
 
 --------------------------------------------------------------------------------
-2. MXFP4 x FP8 GEMM design, derived  -- NOT Apache-2.0
+2. MXFP4 x FP8 GEMM  -- Apache-2.0 since 2026-09-22 (was listed as derived)
 --------------------------------------------------------------------------------
-    kernels/r9k_moe_mxfp4a8.hip       (in part)
-    kernels/r9k_gemm_fp8.hip          (in part)
-    r9700_vllm/kernels/moe.py         (the weight layout, ~lines 100-109)
+    kernels/r9k_moe_mxfp4a8.hip, kernels/r9k_gemm_fp8.hip,
+    r9700_vllm/kernels/moe.py
 
-    These derive from libr4d by StillDeadcode
-    (https://codeberg.org/StillDeadcode/libr4d, commit 5dc6302): the
-    fragment-order weight layout, the folded e2m1 -> e4m3 unpack with its kMag
-    permute table, and the in-block split-K structure. Most of each file is
-    original work -- see notes/independence.md for a line-level accounting --
-    but the lineage is real.
+    These were previously carved out as derived from libr4d by StillDeadcode
+    (https://codeberg.org/StillDeadcode/libr4d). An audit on 2026-09-22 found
+    that nothing in them is authored content we took:
 
-    libr4d ships no licence file. The author confirmed by DM on 2026-09-21 that
-    our use is fine. That is permission for this project; it is NOT a licence,
-    and it is NOT sublicensed under Apache-2.0. If you want to reuse these
-    parts, ask StillDeadcode.
+      * kMag, the folded-unpack table, is GENERATED, not written. Run
+        `tools/gen_kmag.py --check`: all 16 rows follow from the OCP e2m1 and
+        e4m3 specifications plus one rounding convention.
+      * the unpack's masks and shifts follow from the MXFP4 packing and the two
+        format definitions; the v_perm selectors follow from V_PERM_B32's own
+        semantics and from de-interleaving nibble-packed elements.
+      * the fragment-order weight layout is FORCED by the gfx12 WMMA builtin --
+        any correct implementation produces identical bytes.
+      * in-block split-K through LDS is a textbook technique.
+      * r9k_gemm_fp8.hip contains no folded code at all (it is fp8 x fp8, with
+        nothing to unpack).
+
+    What libr4d arrived at first is the folded-exponent *method* -- fold the
+    block exponent into the e4m3 operand, carry 2^(Wref-127) to the epilogue.
+    A method is not copyrightable expression, and the credit for it stays in
+    CREDITS.md because it is deserved, not because it is required.
+
+    Headers and SPDX identifiers on these files were corrected accordingly.
 
 --------------------------------------------------------------------------------
 3. Chat template, copied verbatim  -- NOT Apache-2.0

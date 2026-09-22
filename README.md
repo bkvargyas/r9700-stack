@@ -55,11 +55,11 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 
 ## Licence
 
-[Apache-2.0](LICENSE), with two carve-outs listed in [NOTICE](NOTICE) — read that file before reusing anything.
+[Apache-2.0](LICENSE), with one carve-out listed in [NOTICE](NOTICE) — read that file before reusing anything.
 
 The short version: the vendored LRU cache kernels are Apache-2.0 too and pass on normally. Nothing loads libr4d
-at runtime any more — attention and the all-reduce are our own kernels as of 2026-09-22 — but parts of the MoE
-GEMM still *derive* from [libr4d](https://codeberg.org/StillDeadcode/libr4d), and the chat template is copied
-from [vllm-mxfp4](https://github.com/GGZ14/vllm-mxfp4). Both authors gave permission for **this** project; neither
+at runtime any more, and the GEMM constants that were once listed as derived from it turn out to be generated
+from the OCP format specs — `tools/gen_kmag.py --check` proves it. The one remaining carve-out is the chat
+template, copied from [vllm-mxfp4](https://github.com/GGZ14/vllm-mxfp4) with its author's permission. Both authors gave permission for **this** project; neither
 upstream has a licence file, so that permission is not ours to pass on. Those parts are not under Apache-2.0 —
 if you want to reuse them, ask their authors.

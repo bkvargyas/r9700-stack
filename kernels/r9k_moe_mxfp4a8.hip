@@ -1,13 +1,28 @@
-// SPDX-License-Identifier: LicenseRef-libr4d-derived
-// Partly derived from libr4d (no upstream licence; used with permission). NOT Apache-2.0 -- see NOTICE.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
 
 // r9k_moe_mxfp4a8.hip -- grouped (MoE) OCP-MXFP4-weight x FP8-activation GEMM for gfx1201 (RDNA4).
 //
-// Derived from libr4d's r4d_gemm_mxfp4a8_nt_m64 (codeberg.org/StillDeadcode/libr4d, commit 5dc6302;
-// LICENSE PENDING -- libr4d ships no license file yet). Same fragment-order weight layout, same
-// folded-exponent e2m1->e4m3 unpack (four v_perm_b32 per eight weights), same fp8 WMMA and in-block
-// split-K reduced through LDS. What is new is the MoE addressing:
+// Provenance (audited 2026-09-22, see notes/independence.md). An earlier header described this file as derived
+// from libr4d's r4d_gemm_mxfp4a8_nt_m64. That was written when the folded-unpack constants had no stated
+// derivation. They do now, and none of them turn out to be authored:
+//   * kMag is generated, not written -- tools/gen_kmag.py reproduces all 16 rows from the OCP e2m1 and e4m3
+//     specifications plus one rounding convention (nearest, ties toward zero). Run it with --check.
+//   * the nibble masks (0x0F0F0F0F, >>4) follow from MXFP4 packing two e2m1 codes per byte;
+//     & 0x07070707 from e2m1 having three magnitude bits; (x & 0x08080808) << 4 from e2m1's sign being bit 3
+//     and e4m3's being bit 7.
+//   * the v_perm table select follows from V_PERM_B32's own semantics (selectors 0-3 index src1, 4-7 index
+//     src0), which makes a 3-bit magnitude code index an 8-byte table directly.
+//   * the output selectors 0x05010400 / 0x07030602 de-interleave the nibble-packed elements back into
+//     sequential order 0..7 -- forced by the packing, not chosen.
+//   * lane_select16 / fold_tab_load (the 2-VGPR table read by permlane16) are this repo's own work, ed02e4a.
+// What remains that libr4d arrived at first is the *method* -- fold the block exponent into the e4m3 operand,
+// carry 2^(Wref-127) to the epilogue -- and a method is not copyrightable expression. The fragment-order weight
+// layout is forced by the WMMA builtin (see permute_fragments in r9700_vllm/kernels/moe.py) and in-block split-K
+// through LDS is a textbook technique. Credit is kept in CREDITS.md because it is deserved, not because it is
+// required.
 //
+// The MoE addressing below is this repo's own, and is what the file is mostly about:
 //   * one workgroup row (blockIdx.y) = one 16-row block of the routing-sorted token list produced by
 //     vLLM's moe_align_block_size(block_size=16): sorted_ids[16*by .. +16] are flat (token*topk+j)
 //     indices, expert_ids[by] is the expert (or cache slot) all 16 rows go to;
