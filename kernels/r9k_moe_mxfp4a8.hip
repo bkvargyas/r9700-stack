@@ -19,8 +19,7 @@
 // What remains that libr4d arrived at first is the *method* -- fold the block exponent into the e4m3 operand,
 // carry 2^(Wref-127) to the epilogue -- and a method is not copyrightable expression. The fragment-order weight
 // layout is forced by the WMMA builtin (see permute_fragments in r9700_vllm/kernels/moe.py) and in-block split-K
-// through LDS is a textbook technique. Credit is kept in CREDITS.md because it is deserved, not because it is
-// required.
+// through LDS is a textbook technique. The provenance audit behind this paragraph is in notes/independence.md.
 //
 // The MoE addressing below is this repo's own, and is what the file is mostly about:
 //   * one workgroup row (blockIdx.y) = one 16-row block of the routing-sorted token list produced by

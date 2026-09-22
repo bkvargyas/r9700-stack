@@ -51,7 +51,7 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |
 | [notes/independence.md](notes/independence.md) | Which third-party pieces were replaced with our own, and why. |
 | [notes/replacement-plan.md](notes/replacement-plan.md) | The plan for replacing what is left, so the repo is cleanly Apache-2.0. |
-| [CREDITS.md](CREDITS.md) | Other people's work this builds on, and its licence status. |
+| [CREDITS.md](CREDITS.md) | The two third-party components, and the licence position. |
 
 ## Licence
 

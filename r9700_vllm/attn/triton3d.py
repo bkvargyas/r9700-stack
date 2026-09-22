@@ -37,8 +37,8 @@ MAXQ = int(os.environ.get("R9K_ATTN_3D_MAXQ", "16"))
 # does not take -- prefill chunks and mixed prefill+decode steps; stock unified attention measured 36 ms per
 # 4096-token chunk on the 27B. R9K_PAGED_ATTN selects the kernels: "r9k" (default, kernels/r9k_attn.hip: our own,
 # bf16 + fp8 KV, no decode-band kernel -- short-q groups of a mixed batch go through the same prefill kernel),
-# "r4d" (libr4d's prefill + decode pair; integration approach follows GGZ14's radiance_r4d_attn.py, see
-# CREDITS.md) or "0" (stock unified attention). R9K_R4D_ATTN=0 is the legacy switch that disables libr4d.
+# "r4d" (libr4d's prefill + decode pair, if you have that library -- not used by default and not redistributed
+# here) or "0" (stock unified attention). R9K_R4D_ATTN=0 is the legacy switch that disables libr4d.
 PAGED_ATTN = os.environ.get("R9K_PAGED_ATTN", "r9k")
 R4D_ATTN = os.environ.get("R9K_R4D_ATTN", "1") == "1" and PAGED_ATTN == "r4d"
 

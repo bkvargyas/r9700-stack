@@ -49,8 +49,9 @@ permission for THIS project, and that permission does not transfer to you.
 
     What libr4d arrived at first is the folded-exponent *method* -- fold the
     block exponent into the e4m3 operand, carry 2^(Wref-127) to the epilogue.
-    A method is not copyrightable expression, and the credit for it stays in
-    CREDITS.md because it is deserved, not because it is required.
+    A method is not copyrightable expression. The audit establishing that, and
+    the generator that reproduces the table, are in notes/independence.md and
+    tools/gen_kmag.py.
 
     Headers and SPDX identifiers on these files were corrected accordingly.
 
@@ -73,8 +74,7 @@ permission for THIS project, and that permission does not transfer to you.
     Several techniques were learned from GGZ14/vllm-mxfp4 (NVFP4 -> MXFP4
     requantisation at load, merging the GDN in_proj pair, converting fp8 dense
     layers to MXFP4) and implemented independently here. Ideas are not
-    copyrightable and nothing is carved out on their account; the credit in
-    CREDITS.md is given because it is deserved, not because it is required.
+    copyrightable and nothing is carved out on their account.
 
 --------------------------------------------------------------------------------
 5. Runtime dependencies  -- not redistributed
@@ -92,5 +92,7 @@ permission for THIS project, and that permission does not transfer to you.
     So the ONLY libr4d exposure left in this repository is the derived GEMM
     source in item 2 above -- a licensing question, not a runtime dependency.
 
-See CREDITS.md for the full attribution table and notes/independence.md for what
-was replaced with original work and what each piece is measurably worth.
+See CREDITS.md for the third-party components, and notes/independence.md for the
+provenance of the kernels -- what was replaced with original work, what each
+piece is measurably worth, and which constants are generated from published
+format specifications rather than authored.
