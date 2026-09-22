@@ -150,3 +150,64 @@ and the only honest lever left.
 - `DRYRUN=1` does **not** source overlays, so a launcher can pass a dry run and still fail to serve.
 - Kill background benchmark scripts with care: several have `trap ... EXIT` handlers that remove the running
   container, so killing the script also destroys the logs you wanted.
+
+## Deferred / next up (2026-09-22)
+
+### vLLM upgrade — deferred, two blockers to clear first
+
+Brian asked to move to a newer vLLM and re-verify the plugin (the project's whole claim is that this is a
+no-op). Held off because two things need deciding first, and both are worse to discover mid-pull:
+
+1. **Disk.** `/dev/sda1` is 93% full — 42 GB free, and the ROCm vLLM images are ~52 GB each. Docker reports
+   26 GB reclaimable plus 16 GB of build cache, which is enough if freed, but beyond that the only candidates
+   are reference images we should keep: `stilldeadcode/vllm-radiance:0.9.3` (13.7 GB) is the stack every
+   benchmark in the README is measured against, and deleting it costs us the ability to re-measure the baseline
+   on the same box.
+2. **The overlay is pinned to the current vLLM build.** `OVERLAYS=emulated-switch` mounts hostcall-patched
+   copies of vLLM's own extensions -- `~/p2p-patched-nightly/_rocm_C.abi3.so` (998 MB) and
+   `_C_stable_libtorch.abi3.so` (350 MB), built 2026-09-18 against *this* vLLM. A new vLLM ships new
+   extensions and the old patched pair will not match. `overlay/emulated-switch/patch-hostcall.sh` regenerates
+   them, so it is a documented step -- but if it fails on a newer vLLM, TP serving on this box will not start
+   at all, and that failure looks exactly like dead hardware (see the OVERLAYS note above).
+
+Sequence when it happens: reclaim cache + dangling layers, pull without deleting any reference image, build the
+plugin, run the 12-gate suite, regenerate the overlay, then serve and re-benchmark.
+
+### Three GPUs: TP=3 will NOT work for this model -- read before planning around it
+
+Brian is adding a third R9700 behind the PLX switch. From `Qwen3.8-27B-NVFP4/config.json`:
+
+    hidden_size 5120   num_attention_heads 24   num_key_value_heads 4
+    intermediate_size 17408   num_hidden_layers 64   head_dim 256
+
+TP=3 divisibility: attention heads 24/3 = 8 fine, but **KV heads 4/3, hidden 5120/3 and intermediate 17408/3 are
+all non-integer**. vLLM requires the KV-head count to divide the TP size (or vice versa for replication); 4 and 3
+satisfy neither. **TP=3 will be rejected.** TP=4 divides cleanly on all four (6 / 1 / 1280 / 4352), so the useful
+progression for this model is 2 -> 4, not 2 -> 3.
+
+So a third card is worth having as a **topology and bandwidth experiment** -- does a third PLX chain get full
+H2D bandwidth, does its ReBAR hold -- which is exactly the groundwork for going to four. It is not a serving
+configuration for the 27B. Options with three: TP=2 plus a spare card for a second model or dev work, or
+pipeline parallel (PP=3 over 64 layers) which works but adds latency and does not help single-stream.
+
+Also note: **our all-reduce is 2-rank only** (`R9kAllReduce` disables itself when world_size != 2, as does
+libr4d's). Anything above TP=2 falls back to RCCL for collectives, which measured 30.3 ms/step against our
+25.1 at TP=2. A TP=4 build would need an N-rank all-reduce written before it is competitive.
+
+### Expect the third card to look faulty at first. It probably is not.
+
+History on this box, from memory `reference_r9700_host_100.md`: a card was diagnosed **"FAULTY for passthrough
+(key finding)"** after its Resizable BAR collapsed to 1 MB on every FLR. That conclusion was **corrected later
+the same day**: the root cause was the **per-PLX-chain prefetch window**, not the card. The window trick had
+only ever been applied to the first card's chain, so the second card's chain had a 258 MB window and its BAR was
+squeezed on every realloc. Enlarging that chain's own window fixed it, and `/usr/local/sbin/r9700-barfix.sh`
+now does both chains.
+
+A third card on a third chain will hit the same thing: **its chain's prefetch window will not have been
+enlarged, so its 32 GB BAR will not hold, and it will present as a broken card.** Extend `r9700-barfix.sh` to
+the new chain before concluding anything about the hardware.
+
+This is worth stating plainly because it is now a pattern rather than an anecdote. Twice on this box an apparent
+hardware fault has turned out to be PLX/topology configuration -- the BAR case above, and on 2026-09-21 an RCCL
+failure that looked exactly like a dead GPU (single-GPU compute fine, comm init fine, every collective failing)
+which was a missing `OVERLAYS=emulated-switch`. On this machine, suspect the topology before the silicon.
