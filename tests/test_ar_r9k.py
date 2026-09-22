@@ -215,7 +215,10 @@ def main():
                 other = got.clone()
                 dist.broadcast(other, src=0)
                 agree = torch.equal(got, other)
-                good = rel < 0.035 and agree
+                # the floor scales with the code width: E[amax] over 64 samples ~ 2.88 sigma, step = 2.88/MAXC
+                # sigma, RMS error = step/sqrt(12). 6-bit -> ~0.027, 4-bit -> ~0.119. Bar = floor + ~30%.
+                maxc = (1 << (w._qbits - 1)) - 1
+                good = rel < (2.88 / maxc / 3.464) * 1.3 and agree
                 bad += 0 if good else 1
                 if rank == 0:
                     print(f"    n={numel:>8}: rel vs exact {rel:.4f}  ranks agree {agree}"

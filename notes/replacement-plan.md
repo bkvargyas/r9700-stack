@@ -126,8 +126,33 @@ The only lever consistent with being link-bound is **sending fewer bytes**:
 3. **Understand what libr4d actually does differently** before building anything else. The honest statement is
    that a ~15% byte or bandwidth advantage is unaccounted for.
 
-**Recommendation: stop here unless (1) is approved.** The decode half of Phase 1 is done and committed; the
-prefill half is bounded by the link, and the remaining options are a quality trade or an unknown.
+### Attempt 3 (2026-09-22): 4-bit built and measured. +5.3% prefill, no detectable quality cost.
+
+`R9K_AR_QUANT_BITS=4` (opt-in; 6 is the default) ships 4.25 bits/elem instead of 6.25 -- 34 bytes per 64-element
+group instead of 50, 1.47x fewer bytes, which is the only lever that exists once the link is saturated.
+
+| our AR | 6-bit | 4-bit | libr4d |
+|---|---|---|---|
+| prefill 9k | 3,913 | **4,120** (+5.3%) | 4,403 |
+| prefill 20.7k | 3,717 | **3,915** (+5.3%) | 4,153 |
+| ms/step | 25.2 | 25.1 | 24.9 |
+| GSM8K (1,319, conc=1) | 94.77% | 94.39% | 95.45% |
+
+**Prefill gap 11% -> 6.4%.** Quality, controlled comparison (only the width changes): McNemar **p=0.551, no
+detectable difference**. A confounded base-vs-4bit comparison reads p=0.034, which should not be believed: it
+changes the AR backend AND the width together, it is the fifth pairwise test run (fails Bonferroni at 0.05/5),
+and the ordering is incoherent as quality -- libr4d-*compressed* scored 95.45% while libr4d-*exact* scored
+94.77%, and compression cannot improve accuracy. Our 6-bit ties libr4d-exact exactly (94.77%, 1250/1319). These
+are ~9-question numerical differences, not quality.
+
+Honest limits: the eval resolves ~1%, so a smaller effect could hide; and the per-call perturbation really is
+4.4x larger (rel 0.108 vs 0.024, and 85.6% of outputs differ) even though accuracy does not move.
+
+**Decision for Brian: enable `R9K_AR_QUANT_BITS=4`?** It buys +5.3% prefill for no measurable quality cost, and
+would put a fully libr4d-free build at 93.6% of libr4d on prefill instead of 89%. Default left at 6-bit.
+
+**Recommendation: stop here either way.** The decode half of Phase 1 is done; the prefill half is link-bound and
+4-bit is the last byte-count lever short of understanding what libr4d does differently, which is unknown.
 
 ---
 

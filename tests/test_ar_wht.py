@@ -27,15 +27,19 @@ def lib():
     for n in ("r9k_wht_group", "r9k_wht_bits", "r9k_wht_group_bytes"):
         getattr(L, n).restype = ctypes.c_int
     L.r9k_wht_pack.restype = ctypes.c_int
-    L.r9k_wht_pack.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int, ctypes.c_long]
+    L.r9k_wht_pack.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 2 + [ctypes.c_long]
     L.r9k_wht_reduce.restype = ctypes.c_int
-    L.r9k_wht_reduce.argtypes = [ctypes.c_long] * 4 + [ctypes.c_int, ctypes.c_long]
+    L.r9k_wht_reduce.argtypes = [ctypes.c_long] * 4 + [ctypes.c_int] * 2 + [ctypes.c_long]
+    L.r9k_wht_bytes_for.restype = ctypes.c_int
+    L.r9k_wht_bytes_for.argtypes = [ctypes.c_int]
     return L
 
 
 def main():
     L = lib()
-    G, BITS, GB = L.r9k_wht_group(), L.r9k_wht_bits(), L.r9k_wht_group_bytes()
+    BITS = int(os.environ.get("R9K_AR_QUANT_BITS", "6"))
+    G, GB = L.r9k_wht_group(), L.r9k_wht_bytes_for(BITS)
+    MAXC = (1 << (BITS - 1)) - 1
     dev = "cuda"
     stream = torch.cuda.current_stream().cuda_stream
     print(f"group {G} elements, {BITS} bits, {GB} bytes/group = {GB*8/G:.2f} bits/elem "
@@ -44,13 +48,13 @@ def main():
 
     def pack(x):
         pk = torch.empty(((x.numel() + G - 1) // G) * GB, dtype=torch.uint8, device=dev)
-        rc = L.r9k_wht_pack(x.data_ptr(), pk.data_ptr(), x.numel(), DT[x.dtype], stream)
+        rc = L.r9k_wht_pack(x.data_ptr(), pk.data_ptr(), x.numel(), DT[x.dtype], BITS, stream)
         assert rc == 0, f"pack rc {rc}"
         return pk
 
     def reduce(pa, pb, numel, dtype):
         out = torch.empty(numel, dtype=dtype, device=dev)
-        rc = L.r9k_wht_reduce(pa.data_ptr(), pb.data_ptr(), out.data_ptr(), numel, DT[dtype], stream)
+        rc = L.r9k_wht_reduce(pa.data_ptr(), pb.data_ptr(), out.data_ptr(), numel, DT[dtype], BITS, stream)
         assert rc == 0, f"reduce rc {rc}"
         return out
 
@@ -70,7 +74,9 @@ def main():
             # is ~sqrt(2 ln 64) = 2.88 sigma, so the step is 2.88 sigma / 31 and the RMS quantisation error is
             # step/sqrt(12) ~ 0.027 sigma. Summing two such payloads scales error and signal alike, so ~0.027
             # relative is the floor for ANY correct 6-bit implementation. 0.035 leaves margin for the clamp.
-            good = rel < 0.035 and sym
+            # floor scales with the width: E[amax] over 64 samples ~ 2.88 sigma, step = 2.88/MAXC sigma,
+            # RMS error = step/sqrt(12). 6-bit -> ~0.027, 4-bit -> ~0.119. Bar is the floor plus ~30% margin.
+            good = rel < (2.88 / MAXC / 3.464) * 1.3 and sym
             ok &= good
             print(f"  {str(dtype):>16} {desc:>12} n={numel:>8}: rel {rel:.4f}  ranks agree {sym}"
                   + ("" if good else "   <-- FAIL"))
@@ -84,8 +90,8 @@ def main():
     got = reduce(pack(a), pack(z), a.numel(), torch.bfloat16).float()
     rel_wht = ((got - a.float()).norm() / a.float().norm()).item()
     blk = a.float().reshape(-1, G)                              # same budget, no rotation
-    s = blk.abs().amax(1, keepdim=True) / 31.0
-    rel_raw = (((blk / s).round().clamp(-31, 31) * s - blk).norm() / blk.norm()).item()
+    s = blk.abs().amax(1, keepdim=True) / MAXC
+    rel_raw = (((blk / s).round().clamp(-MAXC, MAXC) * s - blk).norm() / blk.norm()).item()
     print(f"  outlier data: rotated {rel_wht:.4f} vs unrotated 6-bit {rel_raw:.4f} "
           f"({rel_raw/max(rel_wht,1e-9):.2f}x better)")
     ok &= rel_wht < rel_raw

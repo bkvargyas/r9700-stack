@@ -39,9 +39,11 @@ def _lib():
         for n in ("r9k_wht_group", "r9k_wht_group_bytes"):
             getattr(L, n).restype = ctypes.c_int
         L.r9k_wht_pack.restype = ctypes.c_int
-        L.r9k_wht_pack.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int, ctypes.c_long]
+        L.r9k_wht_pack.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 2 + [ctypes.c_long]
+        L.r9k_wht_bytes_for.restype = ctypes.c_int
+        L.r9k_wht_bytes_for.argtypes = [ctypes.c_int]
         L.r9k_wht_reduce_at.restype = ctypes.c_int
-        L.r9k_wht_reduce_at.argtypes = [ctypes.c_long] * 6 + [ctypes.c_int, ctypes.c_long]
+        L.r9k_wht_reduce_at.argtypes = [ctypes.c_long] * 6 + [ctypes.c_int] * 2 + [ctypes.c_long]
         L.r9k_ar_push_2rank.restype = ctypes.c_int
         # (peer_scratch, peer_flags, flags, seq, slot16, src, nbytes, stream) + (nb, nt, drain, acq) + slot_out
         L.r9k_ar_push_2rank.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 4 + [ctypes.c_long]
@@ -107,7 +109,13 @@ class R9kAllReduce:
         self._wht = None
         if os.environ.get("R9K_AR_QUANT", "0") == "1" and hasattr(self.L, "r9k_wht_pack"):
             self._qgroup = self.L.r9k_wht_group()
-            self._qbytes = self.L.r9k_wht_group_bytes()
+            # R9K_AR_QUANT_BITS=4 ships 4.25 bits/elem instead of 6.25 -- 1.47x fewer bytes, which is the only
+            # lever left once the link is saturated (notes/replacement-plan.md). ~4x the quantisation error per
+            # call, so it is opt-in and must be gated on bench/eval.py at conc=1, never on a conc-8 GSM8K run.
+            self._qbits = int(os.environ.get("R9K_AR_QUANT_BITS", "6"))
+            self._qbytes = self.L.r9k_wht_bytes_for(self._qbits)
+            if self._qbytes <= 0:
+                raise RuntimeError(f"R9K_AR_QUANT_BITS={self._qbits} unsupported (6 or 4)")
             self._qmin = int(float(os.environ.get("R9K_AR_QUANT_MIN_KB", "128")) * 1024)
             # packed bytes for the largest message we accept, rounded to the 16-byte exchange granularity
             self._qcap = ((self.max_bytes // 2 // self._qgroup) * self._qbytes + 15) // 16 * 16
@@ -119,8 +127,8 @@ class R9kAllReduce:
             # Hence: its own counter, never shared with the exact path, and a fixed block count on every call.
             self._qseq = torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
             self._wht = True
-            logger.info("r9700: r9k compressed all-reduce for messages >= %d KB (%d bits/elem)",
-                        self._qmin >> 10, self._qbytes * 8 // self._qgroup)
+            logger.info("r9700: r9k compressed all-reduce for messages >= %d KB (%d-bit codes, %.2f bits/elem)",
+                        self._qmin >> 10, self._qbits, self._qbytes * 8.0 / self._qgroup)
         self.disabled = False
         logger.info("r9700: r9k 2-rank P2P all-reduce installed (rank %d, max %d MiB, fine-grained=%s)",
                     self.rank, self.max_bytes >> 20, fine)
@@ -175,7 +183,8 @@ class R9kAllReduce:
         st = torch.cuda.current_stream().cuda_stream
         ng = x.numel() // self._qgroup
         pk_bytes = (ng * self._qbytes + 15) // 16 * 16
-        rc = self.L.r9k_wht_pack(x.data_ptr(), self._locpk.data_ptr(), x.numel(), _DTYPE[x.dtype], st)
+        rc = self.L.r9k_wht_pack(x.data_ptr(), self._locpk.data_ptr(), x.numel(), _DTYPE[x.dtype],
+                                 self._qbits, st)
         if rc:
             raise RuntimeError(f"r9k_wht_pack failed ({rc})")
         # fixed block count (see _qseq above); the smallest compressed payload is >= 50 KB = 3200 16-byte words,
@@ -187,7 +196,7 @@ class R9kAllReduce:
             raise RuntimeError(f"r9k_ar_push_2rank failed ({rc})")
         rc = self.L.r9k_wht_reduce_at(
             self._locpk.data_ptr(), self._scratch, self._slot.data_ptr(), self.max_bytes,
-            out.data_ptr(), x.numel(), _DTYPE[x.dtype], st)
+            out.data_ptr(), x.numel(), _DTYPE[x.dtype], self._qbits, st)
         if rc:
             raise RuntimeError(f"r9k_wht_reduce_at failed ({rc})")
         return out

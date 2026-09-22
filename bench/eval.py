@@ -78,15 +78,16 @@ def run(n, conc):
 
     def work(i):
         q, gt = data[i]
+        err = None
         try:
             txt = ask(q)
         except Exception as e:
-            txt = f"<<error {type(e).__name__}>>"
+            txt, err = "", f"{type(e).__name__}"
         got = last_number(txt)
         ok = got is not None and abs(float(got) - float(gt)) < 1e-6 if _num(got) and _num(gt) else False
         return i, {"q_sha": hashlib.sha1(q.encode()).hexdigest()[:12], "gt": gt, "got": got, "ok": bool(ok),
                    "out_sha": hashlib.sha1(txt.encode()).hexdigest()[:16], "ntok_approx": len(txt) // 4,
-                   "text": txt}
+                   "err": err, "text": txt}
 
     with cf.ThreadPoolExecutor(max_workers=conc) as ex:
         for i, r in ex.map(work, range(len(data))):
@@ -102,6 +103,23 @@ def _num(x):
         return True
     except (TypeError, ValueError):
         return False
+
+
+def nerr(res):
+    return sum(1 for r in res if r.get("err"))
+
+
+def check(res, name="run"):
+    """A request that never reached the server is not a wrong answer. Scoring it as one turns a dead server
+    into a confident 0.00% and a p=0.000 'regression' -- which is exactly what happened on 2026-09-22."""
+    e = nerr(res)
+    if e:
+        kinds = {}
+        for r in res:
+            if r.get("err"):
+                kinds[r["err"]] = kinds.get(r["err"], 0) + 1
+        raise SystemExit(f"REFUSING to score {name}: {e}/{len(res)} requests failed ({kinds}). "
+                         f"The server was not healthy; this is not a quality result. Fix the run and repeat.")
 
 
 def acc(res):
@@ -147,7 +165,9 @@ def main():
               f"and sets the smallest regression this eval can ever detect. n={n}\n")
         for conc in (1, 8):
             a = run(n, conc)
+            check(a, f"selftest conc={conc} run 1")
             b = run(n, conc)
+            check(b, f"selftest conc={conc} run 2")
             ag, m = agreement(a, b)
             n01, n10, p = mcnemar(a, b)
             print(f"  conc={conc}: acc {acc(a)*100:.2f}% vs {acc(b)*100:.2f}%   "
@@ -164,6 +184,7 @@ def main():
         n = int(sys.argv[3]) if len(sys.argv) > 3 else 1319
         conc = int(sys.argv[4]) if len(sys.argv) > 4 else 1
         res = run(n, conc)
+        check(res, name)
         save(name, res, {"n": n, "conc": conc, "base": BASE, "model": MODEL,
                          "env": {k: v for k, v in os.environ.items() if k.startswith("R9K_")}})
         print(f"{name}: acc {acc(res)*100:.2f}%  ({sum(r['ok'] for r in res)}/{len(res)})")
@@ -172,6 +193,8 @@ def main():
     if cmd == "compare":
         A, B = load(sys.argv[2]), load(sys.argv[3])
         a, b = A["res"], B["res"]
+        check(a, sys.argv[2])
+        check(b, sys.argv[3])
         ag, m = agreement(a, b)
         n01, n10, p = mcnemar(a, b)
         print(f"{sys.argv[2]}  acc {acc(a)*100:.2f}%   n={len(a)}  conc={A['meta']['conc']}")
