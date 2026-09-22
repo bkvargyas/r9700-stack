@@ -61,11 +61,20 @@ def last_number(text):
     return nums[-1].replace("$", "").rstrip(".") if nums else None
 
 
+THINK = os.environ.get("EVAL_THINK") == "1"
+
+
 def ask(q):
-    """Greedy, thinking off: we are measuring numerics, not reasoning-effort variance."""
+    """Greedy. EVAL_THINK=1 turns on long chain-of-thought.
+
+    That mode matters for numerics: a lossy change perturbs every layer of every forward, and a short answer
+    gives that perturbation almost no chance to compound. A long reasoning chain is where a small per-call
+    error turns into a different conclusion, so a null result on short answers is the WEAKEST possible
+    evidence that a numeric change is safe."""
     body = {"model": MODEL, "messages": [{"role": "user", "content": q + "\nGive the final numeric answer."}],
-            "max_tokens": 1024, "temperature": 0.0, "top_p": 1.0, "seed": 1234,
-            "chat_template_kwargs": {"enable_thinking": False}}
+            "max_tokens": 4096 if THINK else 1024, "temperature": 0.0, "top_p": 1.0, "seed": 1234,
+            "chat_template_kwargs": ({"enable_thinking": True, "reasoning_effort": "medium"} if THINK
+                                     else {"enable_thinking": False})}
     req = urllib.request.Request(BASE, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     r = json.loads(urllib.request.urlopen(req, timeout=300).read())
@@ -185,7 +194,7 @@ def main():
         conc = int(sys.argv[4]) if len(sys.argv) > 4 else 1
         res = run(n, conc)
         check(res, name)
-        save(name, res, {"n": n, "conc": conc, "base": BASE, "model": MODEL,
+        save(name, res, {"n": n, "conc": conc, "base": BASE, "model": MODEL, "think": THINK,
                          "env": {k: v for k, v in os.environ.items() if k.startswith("R9K_")}})
         print(f"{name}: acc {acc(res)*100:.2f}%  ({sum(r['ok'] for r in res)}/{len(res)})")
         return

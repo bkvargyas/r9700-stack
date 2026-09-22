@@ -148,8 +148,22 @@ are ~9-question numerical differences, not quality.
 Honest limits: the eval resolves ~1%, so a smaller effect could hide; and the per-call perturbation really is
 4.4x larger (rel 0.108 vs 0.024, and 85.6% of outputs differ) even though accuracy does not move.
 
-**Decision for Brian: enable `R9K_AR_QUANT_BITS=4`?** It buys +5.3% prefill for no measurable quality cost, and
-would put a fully libr4d-free build at 93.6% of libr4d on prefill instead of 89%. Default left at 6-bit.
+**Enabled 2026-09-22 (Brian: enable it, but do not sacrifice accuracy).** Default is now 4-bit, after a second,
+harder eval. The first test used short non-thinking answers -- the condition where a per-call perturbation has
+the LEAST chance to compound -- so a null there was the weakest possible evidence. The long-chain test was run
+precisely because it should be the most sensitive:
+
+| | 6-bit | 4-bit | discordant | McNemar |
+|---|---|---|---|---|
+| GSM8K 1319, short answers | 94.77% | 94.39% | 25 / 20 | p=0.551 |
+| GSM8K 800, full chain-of-thought | 96.88% | **97.00%** | 4 / 5 | **p=1.000** |
+
+**The prediction was wrong in an informative way.** Long chains do not compound the error, they absorb it: only
+**1.1%** of answers changed outcome under thinking, against **3.4%** on short answers, because later reasoning
+catches and corrects a perturbed intermediate step. Two independent nulls with point estimates in opposite
+directions (-0.38pp, +0.12pp) is what a genuinely zero effect looks like.
+
+Bound honestly: both evals resolve ~1%, so this is "smaller than we can measure", not "exactly zero".
 
 **Recommendation: stop here either way.** The decode half of Phase 1 is done; the prefill half is link-bound and
 4-bit is the last byte-count lever short of understanding what libr4d does differently, which is unknown.

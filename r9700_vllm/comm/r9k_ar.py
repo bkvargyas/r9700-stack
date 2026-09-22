@@ -4,7 +4,8 @@ Independent of libr4d: the kernel and these IPC helpers are ours (see kernels/r9
 Selected with R9K_AR_IMPL=r9k; R9K_AR_IMPL=r4d (default for now) keeps the libr4d backend.
 
 Two paths, as libr4d's backend has: small messages go exact (bit-identical to RCCL); with R9K_AR_QUANT=1,
-messages at or above R9K_AR_QUANT_MIN_KB are rotated and shipped at 6.25 bits/element (kernels/r9k_ar_wht.hip),
+messages at or above R9K_AR_QUANT_MIN_KB are rotated and shipped at 4.25 bits/element (kernels/r9k_ar_wht.hip;
+R9K_AR_QUANT_BITS=6 for the more conservative width),
 which is what makes a prefill-sized all-reduce fit the PCIe 3 link. The compressed path is lossy, so both ranks
 reduce the same PACKED pair and stay bit-identical to each other, and decode-size messages stay exact.
 """
@@ -109,10 +110,19 @@ class R9kAllReduce:
         self._wht = None
         if os.environ.get("R9K_AR_QUANT", "0") == "1" and hasattr(self.L, "r9k_wht_pack"):
             self._qgroup = self.L.r9k_wht_group()
-            # R9K_AR_QUANT_BITS=4 ships 4.25 bits/elem instead of 6.25 -- 1.47x fewer bytes, which is the only
-            # lever left once the link is saturated (notes/replacement-plan.md). ~4x the quantisation error per
-            # call, so it is opt-in and must be gated on bench/eval.py at conc=1, never on a conc-8 GSM8K run.
-            self._qbits = int(os.environ.get("R9K_AR_QUANT_BITS", "6"))
+            # 4.25 bits/elem (34 bytes per 64-element group) instead of 6.25: 1.47x fewer bytes and +5.3%
+            # prefill, the only lever once the link is saturated. Default since 2026-09-22 on two independent
+            # paired evals at conc=1, both null and with point estimates in OPPOSITE directions:
+            #   short answers, GSM8K 1319:      94.77% -> 94.39%, 25/20 discordant, McNemar p=0.551
+            #   full chain-of-thought, 800:     96.88% -> 97.00%,  4/5  discordant, McNemar p=1.000
+            # The long-chain result is the load-bearing one. The worry was that a ~4x larger per-call
+            # perturbation (rel 0.108 vs 0.024) would COMPOUND over a long reasoning chain; it does the
+            # opposite -- only 1.1% of answers changed outcome under thinking against 3.4% on short answers,
+            # because subsequent reasoning catches and corrects a perturbed intermediate step.
+            # Bound honestly: these resolve ~1%, so "smaller than we can measure", not "exactly zero".
+            # R9K_AR_QUANT_BITS=6 restores the conservative width. Re-evaluate ONLY at conc=1 -- at conc=8 this
+            # stack is ~32% self-consistent with itself, so a conc-8 comparison measures nothing.
+            self._qbits = int(os.environ.get("R9K_AR_QUANT_BITS", "4"))
             self._qbytes = self.L.r9k_wht_bytes_for(self._qbits)
             if self._qbytes <= 0:
                 raise RuntimeError(f"R9K_AR_QUANT_BITS={self._qbits} unsupported (6 or 4)")

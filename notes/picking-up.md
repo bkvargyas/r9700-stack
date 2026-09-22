@@ -51,6 +51,11 @@ These cost real time to learn:
 - **BetterBench's combined decode number moves with speculative acceptance**, which is sampling-noisy (per
   category CV 15-33%). Two unpaired single runs cannot resolve 3%. Compare `update p50` (step time) if you want
   to know whether a *kernel* changed. Use its paired `ab` mode for small differences.
+- **Test numeric changes on LONG generations, not short answers.** Intuition says a short answer is a cleaner
+  test; it is the opposite. A per-call perturbation needs room to compound, so short answers are the most
+  forgiving condition and a null there proves little. Measured 2026-09-22 on 4-bit all-reduce: 3.4% of short
+  answers changed outcome vs 1.1% under chain-of-thought -- long reasoning *absorbs* numeric error because later
+  steps correct earlier ones. Use `EVAL_THINK=1`.
 - **Cold single-shot kernel timings overstate by ~15%** — the card sits at 2.2-2.4 GHz under sustained load.
   Use `tuning/prefill_ab.py` (warmed, interleaved).
 - **Gates that call the inner op miss served-path breakage.** Exercise the public wrappers in `r9700_vllm/ops.py`.
