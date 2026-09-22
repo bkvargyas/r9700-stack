@@ -215,6 +215,13 @@ server. Closed as upstream behaviour -- full detail and the one remaining lever 
 
 Added `CGMODE=` and `MWAITX=` knobs to serve/serve.sh while investigating.
 
+### 2026-09-22: power cap is a fixed condition, not a knob
+
+Raising the 225 W cap is closed permanently. Every reference measurement (libr4d, GGZ14) was taken at 225 W, so
+uncapping ours would invalidate the comparison in the same way the `bb-prod.log` baseline mix-up did; and Brian
+runs capped in production, so an uncapped number is one he would never see. Prefill being clock-limited at
+2.40 GHz is therefore a property of the target, not an opportunity.
+
 **Measurement discipline (learned the hard way this week):**
 - ALWAYS check `results.json` `env.endpoint` before quoting a baseline: ~/bb-prod.log is the PRODUCTION box.
 - Never start a run while another is live (two servers on the same GPUs produced 30% CVs and nonsense numbers);

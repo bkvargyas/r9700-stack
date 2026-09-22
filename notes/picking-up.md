@@ -75,8 +75,11 @@ costs −55% prefill, so the work took "unusable without it" down to "11% behind
 2. **All-reduce per-call overhead.** Worth the ~11% that full independence costs. Our compressed path runs at
    ~0.22 µs/KB against 0.115 for our exact path, so it is per-call overhead, not the link. **Profile where the
    ~87 µs go at 2 MB before writing kernels** — one attempt was already wasted guessing.
-3. **Power cap 225 W → 300 W.** Never tested; prefill is clock-limited (2.40 GHz vs 2.82 on decode) so it could be
-   the biggest single lever left. Needs Brian's say-so, it is his hardware.
+3. ~~**Power cap 225 W → 300 W.**~~ **Closed 2026-09-22 — do not re-propose.** Brian's reasoning, which is
+   better than the perf argument for it: every libr4d/reference measurement we have was taken at the 225 W cap,
+   so raising ours would make the whole comparison apples-to-oranges — the same mistake as the `bb-prod.log`
+   baseline mix-up. He also intends to run capped long term, so a number measured uncapped is one he would never
+   see in production. The cap is a fixed condition of this project, not a tuning knob.
 4. **Decode-band attention kernel.** Short-q groups in mixed batches currently use the prefill kernel. Costs
    nothing measurable today; would matter at higher concurrency.
 5. **GEMM independence** (~5%) — only if the licence situation changes. See `notes/independence.md`.
