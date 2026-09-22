@@ -9,7 +9,8 @@ harness loads the libraries side by side (ctypes, same ABI), warms the GPU to a 
 usage: prefill_ab.py --libs head=/opt/r9700/kernels_head/libr9k.so,new=/opt/r9700/kernels/libr9k.so
                      --cases "nvfp4:17408,5120:2048:head/P8,new/P8,new/P12" [--rounds 6] [--warm 10]
 cfg names: P<n> prefill tile n, F<n> the same tile with folded exponents (MXFP4), A<n> the A-tiled kernel (folded,
-fragment-tiled activation), old the MT kernel, foldold folded MT. kind "quant" times the activation quantizer alone
+fragment-tiled activation), X<n> the A-tiled kernel with fp32-per-group scaling (not folded), old the MT kernel,
+foldold folded MT. kind "quant" times the activation quantizer alone
 (cfgs row / tiled; the N of the shape is ignored, K is the row length).
 """
 import argparse
@@ -67,7 +68,7 @@ def main():
             elif cfg in ("old", "foldold"):
                 mt = T.mt_for(M)
                 cc = (2, 4, 2, mt, 1) if mt > 1 and T.ldsa_ok((2, 4, 2), mt, Kd) else (2, 4, 2, mt, 0)
-            elif cfg.startswith("A"):
+            elif cfg.startswith("A") or cfg.startswith("X"):
                 cc = ("A", int(cfg[1:]))
             else:
                 cc = ("P", int(cfg[1:]))

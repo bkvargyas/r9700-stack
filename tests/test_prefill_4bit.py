@@ -72,7 +72,14 @@ for kind in ("mxfp4", "nvfp4"):
     for (N, Kd) in ((17408, 5120), (5120, 8704), (8240, 5120)) if kind == "mxfp4" else ((17408, 5120), (5120, 8704)):
         W, wd = make_w(kind, N, Kd)
         for M in (512, 2048):
-            cfg = K.pick_cfg(N, Kd, 32 if kind == "mxfp4" else 16, M=M, kind=kind)
+            # this section exercises the tuned LDS-A tile ("P" rows); with R9K_ATILED on, MXFP4 dispatches to the
+            # A-tiled kernel at these M whether folded or not (tests/test_atiled_4bit.py gates that path), so the
+            # tiled pick is switched off for the lookup
+            atiled, K.ATILED = K.ATILED, False
+            try:
+                cfg = K.pick_cfg(N, Kd, 32 if kind == "mxfp4" else 16, M=M, kind=kind)
+            finally:
+                K.ATILED = atiled
             assert K.is_prefill_cfg(cfg), (kind, N, Kd, M, cfg)
             blk = K.prefill_block(cfg[1])
             x = torch.randn(M, Kd, device="cuda", generator=g).to(torch.bfloat16)

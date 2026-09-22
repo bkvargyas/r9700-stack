@@ -127,7 +127,7 @@ def _runner(kind, W, N, Kd, M, cfg):
     if kind == "quant":                                          # activation quantizer alone: cfg "row" / "tiled"
         tiled = cfg == "tiled"
         return lambda: K.quant_rows_fp8(x, tiled=tiled)
-    if kind == "mxfp4" and K.is_atiled_cfg(cfg):                 # ("A", cfg): A-tiled prefill kernel (folded W)
+    if kind == "mxfp4" and K.is_atiled_cfg(cfg):                 # ("A", cfg): A-tiled prefill kernel (W.fold: variant)
         q, s = K.quant_rows_fp8(x, tiled=True)
         blk = K.atiled_block(cfg[1])
         mpad = (M + blk - 1) // blk * blk

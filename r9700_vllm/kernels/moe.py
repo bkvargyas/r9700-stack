@@ -41,7 +41,7 @@ def lib() -> ctypes.CDLL:
             L.r9k_fold_supported.restype = ctypes.c_int
         if hasattr(L, "r9k_moe_4bit_prefill_at"):     # ... or no A-tiled kernels
             L.r9k_moe_4bit_prefill_at.restype = ctypes.c_int
-            L.r9k_moe_4bit_prefill_at.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 7 + [ctypes.c_long]
+            L.r9k_moe_4bit_prefill_at.argtypes = [ctypes.c_int] + [ctypes.c_long] * 12 + [ctypes.c_int] * 7 + [ctypes.c_long]
             L.r9k_moe_atiled_bm.restype = ctypes.c_int
             L.r9k_moe_atiled_bm.argtypes = [ctypes.c_int]
             L.r9k_quant_rows_fp8_tiled.restype = ctypes.c_int
@@ -316,10 +316,11 @@ def is_prefill_cfg(cfg) -> bool:
     return bool(cfg) and cfg[0] == "P"
 
 
-# A-tiled prefill kernel (r9k_moe_4bit_prefill_at: fragment-tiled activations straight from global, folded weights
-# through LDS). cfg -> (BM, BN, BK); mirrors kAtCfgs in the kernel (atiled_block() asks it). Selected by pick_cfg as
-# ("A", cfg) for folded dense MXFP4 GEMMs at prefill M when R9K_ATILED=1 and K % BK == 0; the caller then quantizes
-# with quant_rows_fp8(x, tiled=True) and runs moe_gemm(..., a_tiled=True). Everything else keeps the LDS-A tiles.
+# A-tiled prefill kernel (r9k_moe_4bit_prefill_at: fragment-tiled activations straight from global, weights through
+# LDS, folded or with fp32-per-group scaling like the LDS-A kernel). cfg -> (BM, BN, BK); mirrors kAtCfgs in the
+# kernel (atiled_block() asks it). Selected by pick_cfg as ("A", cfg) for dense MXFP4 GEMMs at prefill M, folded or
+# not, when R9K_ATILED=1 and K % BK == 0; the caller then quantizes with quant_rows_fp8(x, tiled=True) and runs
+# moe_gemm(..., a_tiled=True). Everything else keeps the LDS-A tiles.
 ATILED_TILES = {0: (256, 64, 64), 1: (256, 128, 64), 2: (256, 64, 128), 3: (256, 128, 64), 4: (128, 128, 64),
                 5: (128, 64, 64), 6: (256, 128, 64), 7: (256, 64, 64), 8: (128, 128, 64)}
 ATILED = os.environ.get("R9K_ATILED", "1") == "1"
@@ -345,8 +346,11 @@ def is_atiled_cfg(cfg) -> bool:
     return bool(cfg) and cfg[0] == "A"
 
 
-def pick_atiled(N: int, K: int, M: int) -> tuple[str, int] | None:
-    """("A", cfg) for a folded dense MXFP4 GEMM at M >= PREFILL_MIN_M when the tiled path is on and legal."""
+def pick_atiled(N: int, K: int, M: int, fold: bool = True) -> tuple[str, int] | None:
+    """("A", cfg) for a dense MXFP4 GEMM at M >= PREFILL_MIN_M when the tiled path is on and legal. fold only says
+    which kernel variant the caller will run: the tile comes from the tuned "mxfp4_at" rows either way (measured
+    2026-09-22: the fold-tuned tile is also the best non-folded tile on every served shape and band, within 3%),
+    else the M-band defaults."""
     if not ATILED or M < PREFILL_MIN_M or K % 64 or K > ATILED_MAX_K or not atiled_supported():
         return None
     from .tuned import lookup
@@ -373,21 +377,22 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     with numel routed rows over E experts -- instead of the buffer's worst-case capacity; host-known, so the
     launch stays cudagraph-safe.
     a_tiled: a_q is the fragment-tiled buffer of quant_rows_fp8(tiled=True) in sorted-position order (dense:
-    identity tables) and `prefill` is an A-tiled cfg (atiled_block(cfg) rows per block); folded MXFP4 only."""
+    identity tables) and `prefill` is an A-tiled cfg (atiled_block(cfg) rows per block); MXFP4 only, w.fold picks
+    the folded or the fp32-per-group variant."""
     assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     E = num_experts if num_experts is not None else w.wq.shape[0]
     if a_tiled:
-        assert prefill is not None and isinstance(w, Mxfp4Experts) and w.fold, "a_tiled: folded MXFP4 prefill only"
+        assert prefill is not None and isinstance(w, Mxfp4Experts), "a_tiled: MXFP4 prefill only"
         blk = atiled_block(prefill)
         max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
         rc = lib().r9k_moe_4bit_prefill_at(
-            a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
+            1 if w.fold else 0, a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.wsr.data_ptr(),
             w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
             sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
             topk_w.data_ptr() if topk_w is not None else 0,
             w.estride, w.estride, max_blocks, numel, a_row_div, a_q.shape[0] // 16, w.K, w.N, prefill, _stream())
         if rc:
-            raise RuntimeError(f"r9k_moe_4bit_prefill_at failed ({rc}) N={w.N} K={w.K} cfg={prefill}")
+            raise RuntimeError(f"r9k_moe_4bit_prefill_at failed ({rc}) fold={w.fold} N={w.N} K={w.K} cfg={prefill}")
         return out
     if prefill is not None:
         blk = prefill_block(prefill)
@@ -433,10 +438,10 @@ def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str
     """A legal (WV, SK, NPW[, MT[, LDSA]]) for any N % 16 == 0, K % group == 0 (32 MXFP4, 16 NVFP4): deep split-K for long K (weight streaming with few
     N tiles per wave), shallow for short K. Mirrors the tuned Flash-Next defaults (2,4,2) @K=2560, (4,2,1) @K=320.
     Large M (dense prefill) returns ("P", cfg): the LDS-tiled prefill kernel (tuned.json rows ["P", cfg], else
-    PREFILL_DEFAULT from M >= PREFILL_MIN_M when K % 64 == 0); or ("A", cfg), the A-tiled kernel, for folded
-    MXFP4 (fold=True) when R9K_ATILED is on (pick_atiled)."""
-    if kind == "mxfp4" and M and fold:
-        t = pick_atiled(N, K, M)
+    PREFILL_DEFAULT from M >= PREFILL_MIN_M when K % 64 == 0); or ("A", cfg), the A-tiled kernel, for MXFP4
+    (folded or not: fold only selects the kernel variant) when R9K_ATILED is on (pick_atiled)."""
+    if kind == "mxfp4" and M:
+        t = pick_atiled(N, K, M, fold)
         if t:
             return t
     if kind and M:
