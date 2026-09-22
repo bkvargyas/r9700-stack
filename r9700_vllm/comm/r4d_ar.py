@@ -140,9 +140,11 @@ class R9kCommunicator(CudaCommunicator):
             from ..moe.experts import r9k_available
             if "tp" in (getattr(self, "unique_name", "") or "") and getattr(self, "world_size", 1) == 2 \
                     and r9k_available():
-                # R9K_AR_IMPL=r9k selects our own kernel (kernels/r9k_ar.hip, no libr4d); r4d is the default
-                # until it has been measured end to end. Ours is exact-only: R9K_AR_QUANT does nothing there.
-                if os.environ.get("R9K_AR_IMPL", "r4d") == "r9k":
+                # Ours is the default (kernels/r9k_ar.hip + r9k_ar_wht.hip, no libr4d). R9K_AR_IMPL=r4d keeps
+                # libr4d's for A/B. Together with R9K_PAGED_ATTN=r9k this makes the default configuration
+                # free of libr4d at runtime -- r4d.so is not loaded at all. Costs ~6% prefill against libr4d's
+                # all-reduce; see notes/replacement-plan.md for the measurements behind that trade.
+                if os.environ.get("R9K_AR_IMPL", "r9k") == "r9k":
                     from .r9k_ar import R9kAllReduce
                     ar = R9kAllReduce(self.cpu_group, self.device)
                 else:

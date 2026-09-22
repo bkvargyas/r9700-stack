@@ -65,7 +65,13 @@ These cost real time to learn:
 Working and default: our own paged attention; A-tiled (fragment-tiled activation) prefill GEMM; folded-exponent
 MXFP4; DFlash2 speculative decoding; NVFP4→MXFP4 conversion at load; GDN `in_proj` merge; expert LRU cache.
 
-Optional: our own all-reduce (`R9K_AR_IMPL=r9k`) — matches libr4d on decode but is **~11% WORSE on prefill**
+**The default configuration no longer uses libr4d at all** (2026-09-22): attention and the 2-rank all-reduce are
+both ours. Verified by moving `r4d.so` aside and serving without it. Costs ~6.5% prefill against libr4d
+(4,124 vs 4,413 @9k); decode is slightly *better* (117.2 vs 114.7 single, 25.4 vs 25.0 ms/step) and conc-8 is
+~3% behind. `R9K_PAGED_ATTN=r4d` / `R9K_AR_IMPL=r4d` still select libr4d's for A/B. The only libr4d exposure
+left anywhere is the **derived GEMM source** -- licensing, not runtime. See `notes/replacement-plan.md` Phase 2.
+
+Superseded note: our own all-reduce (`R9K_AR_IMPL=r9k`) — matches libr4d on decode but is **~11% WORSE on prefill**
 (3,909 vs 4,413 tok/s at 9k) and ~11% worse at conc-8, so libr4d's is still the default. Turning it on makes the
 build fully independent of libr4d at runtime, at that cost. **Decided 2026-09-21: keep the defaults as they are**
 — our attention (free, 99.8%) on, our all-reduce off. For context, dropping libr4d with no replacement at all

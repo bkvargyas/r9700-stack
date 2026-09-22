@@ -70,9 +70,17 @@ permission for THIS project, and that permission does not transfer to you.
 5. Runtime dependencies  -- not redistributed
 --------------------------------------------------------------------------------
     vLLM, ROCm, PyTorch and Triton are used unmodified at runtime and are not
-    included here. libr4d's binary (r4d.so) is loaded at runtime when present
-    and is NOT redistributed by this repository (.gitignore excludes *.so); the
-    stack runs without it, using our own kernels.
+    included here.
+
+    libr4d's binary (r4d.so) is NOT redistributed by this repository
+    (.gitignore excludes *.so) and, since 2026-09-22, is NOT USED AT ALL by the
+    default configuration: paged attention and the 2-rank all-reduce are both
+    our own kernels. Verified by moving r4d.so aside and serving without it.
+    R9K_PAGED_ATTN=r4d and R9K_AR_IMPL=r4d still select libr4d's versions for
+    A/B comparison, if you have that library.
+
+    So the ONLY libr4d exposure left in this repository is the derived GEMM
+    source in item 2 above -- a licensing question, not a runtime dependency.
 
 See CREDITS.md for the full attribution table and notes/independence.md for what
 was replaced with original work and what each piece is measurably worth.

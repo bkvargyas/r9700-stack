@@ -5,6 +5,14 @@ no license file, so anything we take from it -- binary or source -- is unlicense
 depend on, what has been replaced, and how each replacement was written, so the provenance of our own code is
 documented rather than reconstructed later from memory.
 
+## Status 2026-09-22: the default configuration does not use libr4d at all
+
+Attention and the 2-rank all-reduce are both ours and both default. **Verified by moving `r4d.so` aside and
+serving without it** -- `READY-WITHOUT-R4D`, sanity 8/8, prefill 4,153 tok/s, i.e. unchanged. Cost of that
+independence, measured head to head: **-6.5% prefill** (4,124 vs 4,413 @9k), -3% conc-8, and decode slightly
+*better* (117.2 vs 114.7 single). The only libr4d exposure left in the repository is the **derived GEMM
+source** -- a licensing question, not a runtime dependency.
+
 ## Method for every replacement
 
 Clean implementation from public material only:
@@ -25,7 +33,7 @@ told the same in their brief (see the attention task, 2026-09-21).
 | piece | kind | measured worth | status |
 |---|---|---|---|
 | 2-rank P2P all-reduce, exact | runtime, `r4d.so` | decode 118.6 vs 99.3 tok/s; 25.1 vs 30.3 ms/step | **replaced** -- `kernels/r9k_ar.hip`, `R9K_AR_IMPL=r9k` |
-| 2-rank all-reduce, compressed (wht6) | runtime, `r4d.so` | prefill 4418 vs 3344 tok/s; conc-8 465.9 vs 390.8 | **open** -- ours is exact-only |
+| 2-rank all-reduce, compressed (wht6) | runtime, `r4d.so` | prefill 4418 vs 3344 tok/s; conc-8 465.9 vs 390.8 | **replaced** -- `r9k_ar_wht.hip`, 4-bit, default |
 | paged attention, prefill + mixed batches | runtime, `r4d.so` | prefill 4418 vs 2027 tok/s (**-54%** without it) | **replaced** -- `kernels/r9k_attn.hip`, default |
 | MXFP4xFP8 GEMM design | **source derivation** | folded unpack priced at ~5% | **open** -- see below |
 | expert LRU cache kernels | vendored source | -- | not an issue: davetha, Apache-2.0 |
