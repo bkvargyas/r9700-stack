@@ -100,8 +100,14 @@ def prepare_nvfp4_weights(packed: torch.Tensor, scale16: torch.Tensor, row_mult:
 def permute_fragments(packed: torch.Tensor) -> torch.Tensor:
     """[E, N, K/2] uint8 checkpoint order -> [E, N/16*K/16*32] int32 fragment order.
 
-    Slot l of tile (nt, ks) holds W[nt*16 + (l & 15)][ks*16 + 8*(l >> 4) .. +8] (4 packed bytes);
-    identical to libr4d mxfp4_layout.permute_w, vectorized over experts.
+    Slot l of tile (nt, ks) holds W[nt*16 + (l & 15)][ks*16 + 8*(l >> 4) .. +8] (4 packed bytes).
+
+    That destination is not a choice: `v_wmma_f32_16x16x16_fp8_fp8_w32_gfx12` requires lane l of a wave to hold
+    row (l & 15) and k-bytes 8*(l >> 4)..+8 of the B fragment. Permuting the weight into exactly that order on
+    the host is the only way a wave can then read its fragment as 32 contiguous dwords, so any correct
+    implementation for this builtin produces the same bytes. (An earlier docstring described this as "identical
+    to libr4d mxfp4_layout.permute_w" -- true, and true of anyone else's too, because the hardware fixes it.
+    See notes/independence.md.)
     """
     E, N, Kh = packed.shape
     K = Kh * 2

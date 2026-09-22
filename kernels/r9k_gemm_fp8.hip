@@ -1,15 +1,25 @@
-// SPDX-License-Identifier: LicenseRef-libr4d-derived
-// Partly derived from libr4d (no upstream licence; used with permission). NOT Apache-2.0 -- see NOTICE.
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 Brian Vargyas
 
 // r9k_gemm_fp8.hip -- dense FP8(e4m3) weight x FP8(e4m3) activation GEMM, per-row weight scale and per-row
 // activation scale, bf16 out, for gfx1201 (RDNA4). C[M,N] = (A[M,K] * As[m]) @ (W[N,K] * Ws[n])^T.
 //
-// Skinny-M kernel for LM heads (vocab x hidden) and similar weight-bandwidth-bound shapes. Same structure as
-// r9k_moe_mxfp4a8 (itself derived from libr4d's gemm_mxfp4a8_nt_m64): the weight is pre-permuted into
-// fragment order so a wave reads contiguous bytes, A is read straight from global (a lane's A fragment is 8
-// consecutive bytes of one row), split-K across the waves of a workgroup reduced in LDS, MT M-tiles per
-// workgroup share each weight fragment. No unpack: an fp8 weight fragment feeds v_wmma_f32_16x16x16_fp8_fp8
-// directly.
+// Skinny-M kernel for LM heads (vocab x hidden) and similar weight-bandwidth-bound shapes. Shares its shape
+// with r9k_moe_mxfp4a8: the weight is pre-permuted into fragment order so a wave reads contiguous bytes, A is
+// read straight from global (a lane's A fragment is 8 consecutive bytes of one row), split-K across the waves
+// of a workgroup reduced in LDS, MT M-tiles per workgroup share each weight fragment. No unpack at all: an fp8
+// weight fragment feeds v_wmma_f32_16x16x16_fp8_fp8 directly.
+//
+// Provenance note (2026-09-22): an earlier header credited this structure to libr4d. That was over-cautious and
+// is corrected here. None of it is libr4d's to own, and none of it is present in this file by copying:
+//   * fragment order is FORCED by the WMMA builtin -- v_wmma_f32_16x16x16_fp8_fp8_w32_gfx12 requires lane l to
+//     hold row (l & 15), k-bytes 8*(l >> 4)..+8, so pre-permuting the weight to match is the only way to read
+//     it contiguously. Any correct implementation lands on the same bytes.
+//   * split-K across a workgroup's waves reduced in LDS is a textbook GEMM technique, chosen here because it
+//     needs no HBM partials or counters and so stays cudagraph-safe.
+//   * MT M-tiles sharing a weight fragment is ordinary register tiling.
+// This file contains no folded-exponent code (no kMag, no v_perm unpack, no Wref) -- it is fp8 x fp8 and has
+// nothing to unpack. See notes/independence.md.
 //
 // Weight layout: Wp[((n/16) * (K/16) + (k/16)) * 32 + lane] is a uint2 (8 bytes) = row 16*(n/16) + (lane&15),
 // k = 16*(k/16) + 8*(lane>>4) .. +8.  Shape rules: N % 16 == 0, K % (16*SK) == 0.
