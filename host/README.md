@@ -154,5 +154,7 @@ traffic goes up to the IOMMU just as it does now, and the IOMMU isolation is wea
 support ATS, which rules out ACS Direct-Translated P2P.
 
 **Practical consequence:** for tensor-parallel all-reduce, cards on *different* switches get about twice the
-bandwidth of two cards sharing one. At TP=2 on Flash-Next this doesn't matter: the 2026-09-18 A/B test found P2P
-itself makes no difference there, because expert offload dominates.
+bandwidth of two cards sharing one. That matters most for large messages (prefill). Decode all-reduces are small
+and bound by latency: the P2P all-reduce kernel cut per-call time from 69 us (RCCL) to ~3 us and gave Flash-Next
++9.5% single-stream decode (PROGRESS.md). The 2026-09-18 "P2P gives nothing" A/B is **not** valid: both arms used
+P2P IPC. The same shared uplink also carries host-to-GPU expert fetches when experts are offloaded.
