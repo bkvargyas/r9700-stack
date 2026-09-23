@@ -1,8 +1,11 @@
 #!/bin/bash
-# TP=4 (all four cards, RCCL all-reduce) vs two TP=2 servers (one per PLX switch), Qwen3.8-27B-NVFP4, serve/27b.sh.
+# TP=4 (all four cards, RCCL all-reduce) vs two TP=2 servers (one per PLX switch).
+# LAUNCH=27b.sh (Qwen3.8-27B-NVFP4, default) or flashnext.sh; OUT=results dir; TP4_ARGS / TP4_FALLBACK = extra launcher
+# args for TP=4 (Flash-Next: try all experts in VRAM, OFFLOAD_GB=0, fall back to offload if it does not start).
 # 2026-09-23. Phases run one after another; only phase 4 loads two servers at once, which IS the dual deployment.
 set -u
-R=~/r9700-build/repo; BB=~/bb-venv/bin/betterbench; OUT=~/tp4v2; mkdir -p $OUT
+R=~/r9700-build/repo; BB=~/bb-venv/bin/betterbench; LAUNCH=${LAUNCH:-27b.sh}; OUT=${OUT:-~/tp4v2}; mkdir -p $OUT
+TP4_ARGS=${TP4_ARGS:-}; TP4_FALLBACK=${TP4_FALLBACK:-}
 trap 'docker rm -f tp4 tp2a tp2b >/dev/null 2>&1' EXIT
 docker ps --format "{{.Names}}" | grep -q . && { echo BUSY; exit 1; }
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a $OUT/progress.log; }
@@ -15,11 +18,17 @@ bb(){ # port runname config [phase flags]
   $BB run --endpoint http://localhost:$port/v1 --model Qwen3.8 --name $name --no-update-check --no-html \
     --config $cfg --out $OUT/$name.json "$@" > $OUT/$name.log 2>&1; log "bb $name exit $?"; }
 cfg(){ echo "{\"concurrency_levels\": [$1]}" > $OUT/cfg-$2.json; echo $OUT/cfg-$2.json; }
-serve(){ # name gpus tp port nseq
-  NAME=$1 GPUS=$2 TP=$3 PORT=$4 bash $R/serve/27b.sh NSEQ=$5 > $OUT/$1-launch.log 2>&1; }
+serve(){ # name gpus tp port nseq [launcher args...] (27b.sh sets NSEQ itself, so it goes in as an argument)
+  local n=$1 g=$2 t=$3 p=$4 q=$5; shift 5
+  NAME=$n GPUS=$g TP=$t PORT=$p bash $R/serve/$LAUNCH NSEQ=$q "$@" > $OUT/$n-launch.log 2>&1; }
 
 log "phase 1: TP=4"
-serve tp4 0,1,2,3 4 8080 16 && up tp4 8080 && {
+log "launcher $LAUNCH, TP=4 args: ${TP4_ARGS:-none}"
+if ! { serve tp4 0,1,2,3 4 8080 16 $TP4_ARGS && up tp4 8080; } && [ -n "$TP4_FALLBACK" ]; then
+  log "TP=4 retry with fallback args: $TP4_FALLBACK"; mv $OUT/tp4-died.log $OUT/tp4-died-first.log 2>/dev/null
+  docker rm -f tp4 >/dev/null 2>&1; serve tp4 0,1,2,3 4 8080 16 $TP4_FALLBACK && up tp4 8080
+fi
+docker ps --format "{{.Names}}" | grep -qx tp4 && {
   docker logs tp4 2>&1 | grep -iE "all-reduce|P2P" | sort -u | head -5 > $OUT/tp4-ar.txt
   bb 8080 tp4-full "$(cfg 1,2,4,8,16 tp4)"; }
 docker logs tp4 > $OUT/tp4-server.log 2>&1; docker rm -f tp4 >/dev/null 2>&1
