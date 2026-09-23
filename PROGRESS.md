@@ -240,6 +240,30 @@ runs capped in production, so an uncapped number is one he would never see. Pref
   (comm init completes, single-GPU compute is fine, all transports fail alike) -- the signature of the stock,
   hostcall-carrying RCCL on the .100 PLX box. Both launchers now default `OVERLAYS=${OVERLAYS-emulated-switch}`.
   A new launcher is not verified until it has actually served a request.
+### 2026-09-23: 45+48 on one PLX switch, switch-local P2P, and what routing costs in serving
+Third card installed; VM100 now runs **45 + 48, both on the same PEX 8747** (was 45 + c6 on separate switches).
+Host work is in `host/README.md`: a second card on one switch gets no BAR0 without `r9700_chainfix` (DKMS), and
+peer traffic only stays in the switch with ACS redirect off **and** guest GPU addresses equal to host addresses.
+- Synthetic, 45<->48 at 256 MB: both-ways peer copy 12.74 -> **25.26 GB/s**; RCCL all-reduce busbw 5.09 -> 10.08.
+- **Full BetterBench 20-pass, `serve/27b.sh` (switch-local P2P) vs the 2026-09-22 baseline (45 + c6): parity.**
+  Step 24.4 ms both; conc 166/280/379/510 vs 166/270/394/521; prefill 4,123/4,153/4,048/3,812 vs
+  4,099/4,143/4,043/3,809 (2k/8k/16k/32k); per-category decode all within noise (`betterbench compare`).
+- **Live A/B on one running server, ACS redirect off / on / off** (`host/acsab.sh`; prefill sweep + quick decode):
+
+| | pf 2k | pf 8k | pf 16k | pf 32k | step p50 | step p99 |
+|---|--:|--:|--:|--:|--:|--:|
+| switch-local (off) | 4,167 | 4,187 | 4,070 | 3,821 | 24.47 ms | 26.62 ms |
+| **via CPU (on)** | **3,741** | **3,770** | **3,683** | **3,491** | **25.29 ms** | **27.37 ms** |
+| switch-local (off, repeat) | 4,121 | 4,149 | 4,047 | 3,810 | 24.49 ms | 26.50 ms |
+
+  Routing peer traffic through the CPU costs **9-10% prefill and +3.3% decode step time**; the repeat arm
+  returns to within ~1%, so it is not drift. Decode tok/s medians moved with speculative acceptance (199/200/203)
+  and are not the signal here; step time is. No IOMMU/AER faults in any arm. Raw results: `~/bb0923/` on VM100.
+- So two cards per switch cost nothing **only** with switch-local routing. For 4 cards on two switches the
+  in-bank hops need it too, which means matching guest addresses for both banks in one VM (not yet solved:
+  OVMF packs its 64-bit window contiguously and the two banks' host apertures are ~0.5 TB apart).
+- Correction carried forward: the 2026-09-18 Flash-Next "P2P gives nothing" A/B is invalid (P2P IPC in both arms).
+
 ### Next
 1. Unit tests on GPU; VM100 RAM 128 -> 256 GB (host has 364 GB free) so experts (70 GB) + PLE (42 GB) fit pinned.
 2. Stock + plugin bring-up (eager), correctness (GSM8K subset, needle), then cudagraphs + MTP.

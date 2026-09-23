@@ -11,6 +11,7 @@ of the setup below happens in Linux.
 | `r9700-chainfix/` | `/usr/src/r9700-chainfix-1.0` (DKMS) | Kernel module that gives the second card on a switch its window |
 | `gpu-reset.sh` | `/var/lib/vz/snippets/gpu-reset.sh` | Proxmox hookscript that runs barfix at VM pre-start / post-stop |
 | `p2pbidir.py`, `p2pbw.py`, `p2ptest.py` | guest | Peer-copy (one-way and both ways, with a data check) and RCCL tests |
+| `acsab.sh` | mgmt VM | Live ACS off/on/off A/B with BetterBench prefill + decode on a running server |
 
 ## Why a single card is easy and two cards on one switch are not
 
@@ -141,6 +142,23 @@ With redirect off, DMA from 45 to 48's address ranges (and back) goes card to ca
 traffic aimed at the other card's windows is routed locally; everything else still goes through the IOMMU. That's
 fine while both cards belong to the same VM. **If the cards on a switch are ever split between VMs, set
 `CHAIN_A_P2P=0`**; otherwise one VM's GPU could write into the other VM's GPU.
+
+### Effect on serving (2026-09-23, `serve/27b.sh`, 27B NVFP4 TP2)
+
+- **Parity with separate switches:** a full BetterBench 20-pass on 45 + 48 with switch-local P2P matches the
+  2026-09-22 baseline on 45 + c6 (separate switches) across decode, concurrency and prefill.
+- **Live A/B:** on one running server, ACS redirect off / on / off (`acsab.sh`):
+
+| | prefill 2k | 8k | 16k | 32k | decode step p50 |
+|---|--:|--:|--:|--:|--:|
+| switch-local | 4,167 | 4,187 | 4,070 | 3,821 | 24.47 ms |
+| **via the CPU (ACS on)** | **3,741** | **3,770** | **3,683** | **3,491** | **25.29 ms** |
+| switch-local, repeat | 4,121 | 4,149 | 4,047 | 3,810 | 24.49 ms |
+
+- **What routing through the CPU costs:**
+  - **prefill, −9 to −10%:** its all-reduces are large, so it's bandwidth-bound even with 4-bit compression;
+  - **decode step time, +3.3%:** every small all-reduce makes a round trip through the root complex.
+- **Why the second card per switch is free:** only because of the switch-local routing above.
 
 ## Install
 
