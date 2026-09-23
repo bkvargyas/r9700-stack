@@ -10,6 +10,11 @@
  * prefetchable windows in place (adjust_resource + program the bridge registers), then asks the
  * kernel to assign only the starved PLX downstream port subtree, which it sizes correctly alone.
  * All work happens at load time; the module does nothing afterwards and can be removed.
+ *
+ * place_at=<addr> mode (load BEFORE the chain's root-port remove+rescan, unload after): reserves the
+ * part of the root bus aperture below <addr>, so the rescan's first-fit puts the chain window exactly at
+ * <addr>. Used to give the cards host addresses a guest can reproduce (OVMF places the guest's 64-bit
+ * window on a 128GB boundary), which is what lets peer traffic stay inside the PLX switch.
  */
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -19,11 +24,15 @@ static char *up_bdf   = "41:00.0";   /* PLX upstream */
 static char *port_bdf = "42:10.0";   /* PLX downstream port of the starved card */
 static unsigned int window_gb = 128; /* new size of the root/upstream prefetchable windows */
 static bool dry_run;
+static char *place_at = "";          /* reserve mode: chain window start to force, e.g. 0x22000000000 */
 module_param(root_bdf, charp, 0444);
 module_param(up_bdf, charp, 0444);
 module_param(port_bdf, charp, 0444);
 module_param(window_gb, uint, 0444);
 module_param(dry_run, bool, 0444);
+module_param(place_at, charp, 0444);
+
+static struct resource placeholder = { .name = "r9700_chainfix placeholder" };
 
 static struct pci_dev *get_dev(const char *bdf)
 {
@@ -77,7 +86,38 @@ static int grow(struct pci_dev *br, resource_size_t size)
 	return 0;
 }
 
-static int __init chainfix_init(void)
+/* Reserve [start of the root bus aperture holding <at>, at) so nothing below <at> can be allocated. */
+static int reserve_below(u64 at)
+{
+	struct pci_dev *root = get_dev(root_bdf);
+	struct resource *r;
+	int ret = -ENODEV;
+
+	if (!root) {
+		pr_err("r9700_chainfix: root port %s not found\n", root_bdf);
+		return ret;
+	}
+	pci_bus_for_each_resource(root->bus, r) {
+		if (!r || !(r->flags & IORESOURCE_MEM) || at <= r->start || at > r->end)
+			continue;
+		placeholder.start = r->start;
+		placeholder.end = at - 1;
+		placeholder.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+		ret = request_resource(r, &placeholder);
+		if (ret) {
+			pr_err("r9700_chainfix: cannot reserve %pR in %pR (in use)\n", &placeholder, r);
+		} else {
+			pci_info(root, "chainfix: reserved %pR so the chain window lands at %#llx\n", &placeholder, at);
+		}
+		break;
+	}
+	if (ret == -ENODEV)
+		pci_err(root, "chainfix: no bus aperture contains %#llx\n", at);
+	pci_dev_put(root);
+	return ret;
+}
+
+static int grow_chain(void)
 {
 	struct pci_dev *root = get_dev(root_bdf), *up = get_dev(up_bdf), *port = get_dev(port_bdf);
 	resource_size_t size = (resource_size_t)window_gb << 30;
@@ -111,7 +151,23 @@ out:
 	return ret;
 }
 
-static void __exit chainfix_exit(void) { }
+static int __init chainfix_init(void)
+{
+	u64 at;
+
+	if (*place_at) {
+		if (kstrtoull(place_at, 0, &at))
+			return -EINVAL;
+		return dry_run ? 0 : reserve_below(at);
+	}
+	return grow_chain();
+}
+
+static void __exit chainfix_exit(void)
+{
+	if (placeholder.parent)
+		release_resource(&placeholder);
+}
 
 module_init(chainfix_init);
 module_exit(chainfix_exit);

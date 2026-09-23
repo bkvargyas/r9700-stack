@@ -10,6 +10,7 @@ of the setup below happens in Linux.
 | `r9700-barfix.sh` | `/usr/local/sbin/r9700-barfix.sh` | Sets every card to 32 GB and re-enumerates each chain |
 | `r9700-chainfix/` | `/usr/src/r9700-chainfix-1.0` (DKMS) | Kernel module that gives the second card on a switch its window |
 | `gpu-reset.sh` | `/var/lib/vz/snippets/gpu-reset.sh` | Proxmox hookscript that runs barfix at VM pre-start / post-stop |
+| `p2pbidir.py`, `p2pbw.py`, `p2ptest.py` | guest | Peer-copy (one-way and both ways, with a data check) and RCCL tests |
 
 ## Why a single card is easy and two cards on one switch are not
 
@@ -62,9 +63,9 @@ Once the rescan has placed the first card, barfix sees the second card has no Re
 Result on chain A (root `40:01.1`, upstream `41:00.0`):
 
 ```
-40:01.1 / 41:00.0  prefetchable window 0x20800000000-0x227ffffffff   128G
-42:08.0 -> 45:00.0 BAR0 32G @ 0x20800000000   BAR2 2M @ 0x21000000000
-42:10.0 -> 48:00.0 BAR0 32G @ 0x21800000000   BAR2 2M @ 0x22000000000
+40:01.1 / 41:00.0  prefetchable window 0x22000000000-0x23fffffffff   128G   (forced by place_at, see below)
+42:08.0 -> 45:00.0 BAR0 32G @ 0x22000000000   BAR2 2M @ 0x22800000000
+42:10.0 -> 48:00.0 BAR0 32G @ 0x23000000000   BAR2 2M @ 0x23800000000
 ```
 
 The module is DKMS-managed (`r9700-chainfix/1.0`). With `proxmox-default-headers` installed, apt rebuilds it for
@@ -73,12 +74,80 @@ every new kernel. If it's missing for the running kernel anyway, barfix runs `dk
 **Licence:** `r9700-chainfix/` is GPL-2.0, like any kernel module that links against the PCI core. It is a
 standalone host tool and doesn't link with the rest of the repo, which stays Apache-2.0.
 
+## Switch-local P2P on the PEX 8747
+
+Out of the box, peer traffic between two cards on one switch doesn't stay in the switch. The PLX downstream ports
+have ACS `ReqRedir+ CmpltRedir+`, so every peer transfer goes up the switch's single Gen3 x16 uplink to the root
+complex, through the IOMMU, and back down the same link. Both cards share that uplink, so same-switch P2P ran at
+half the cross-chain bandwidth. Two things together keep the traffic in the switch:
+
+1. **Turn ACS redirect off** on the two PLX downstream ports (clear ReqRedir and CmpltRedir).
+2. **Give the guest the host's addresses.** With redirect off, the switch routes by the address in the request. The
+   guest's GPU driver uses *guest*-physical peer addresses, so those must equal the host BAR addresses.
+   Otherwise the switch doesn't recognize them and forwards the request upstream anyway.
+
+The GPUs have no ATS capability, which rules out ACS Direct-Translated P2P, the standard way to do this under an
+IOMMU. That's why the addresses have to match instead.
+
+### How the addresses are matched
+
+- **Guest side (config only):** the guest firmware (`OVMF_CODE_4M.secboot.fd`) puts its 64-bit PCI window at
+  `ALIGN_UP(reserved-memory-end, 128G)` and fills it bottom-up: the card on `p2pdn2` at the base, the card on
+  `p2pdn1` at base + 64G.
+  - `-m <ram>,slots=1,maxmem=…` moves reserved-memory-end. It reserves memory-hotplug address space and uses no
+    RAM.
+  - On AMD hosts, once that space crosses the HyperTransport hole below 1 TB, QEMU moves above-4G RAM to 1 TB.
+  - With 256G of RAM, `maxmem=1100G` gives a base of **0x22000000000**.
+  - Test placement on a disk-less scratch VM with the same efidisk type (`qm monitor` → `info pci`). The legacy
+    `OVMF_CODE.fd` uses a completely different "dynamic" window near the top of the address space.
+- **Host side (`place_at`):** the kernel ignores pre-programmed bridge bases and first-fits the chain at the
+  bottom of the bus aperture (0x20800000000, which isn't 128G-aligned). barfix therefore:
+  1. removes the root port;
+  2. loads `r9700_chainfix place_at=0x22000000000 root_bdf=40:00.0`, which reserves the aperture below the target;
+  3. rescans, so the first fit lands the chain at the target;
+  4. unloads the module, releasing the reservation;
+  5. places the second card at +64G, as before.
+
+VM100 (`/etc/pve/qemu-server/100.conf` `args:`):
+
+```
+-m 262144,slots=1,maxmem=1100G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=131072
+-device pcie-root-port,id=p2prp,bus=pcie.0,chassis=90,slot=90,x-speed=32,x-width=16
+-device x3130-upstream,id=p2pup,bus=p2prp
+-device xio3130-downstream,id=p2pdn1,bus=p2pup,chassis=91,slot=1
+-device xio3130-downstream,id=p2pdn2,bus=p2pup,chassis=92,slot=2
+-device vfio-pci,host=0000:48:00.0,bus=p2pdn1,addr=0x0,rombar=0     # guest 0x23000000000 == host
+-device vfio-pci,host=0000:45:00.0,bus=p2pdn2,addr=0x0,rombar=0     # guest 0x22000000000 == host
+```
+
+### Result (2026-09-23, 45 <-> 48, 256 MB)
+
+| test | ACS redirect on | redirect off + matched addresses |
+|---|---|---|
+| peer copy 0->1 alone | 12.71 GB/s | 13.01 GB/s |
+| peer copy 1->0 alone | 12.71 GB/s | 13.02 GB/s |
+| **both at once, total** | 12.74 GB/s | **25.26 GB/s** |
+| **RCCL all-reduce busbw** | 5.09 GB/s | **10.08 GB/s** (24.8 ms vs 49.1 ms) |
+
+- **Data and logs:** data checks pass both ways, and neither host nor guest logged IOMMU or AER errors.
+- **Per-direction limit:** the ~13 GB/s per direction is now the Gen3 x16 link between the switch and each card.
+- **Checked paths:** a forced re-enumeration, a VM start and a `qm reboot 100` all came back at the same numbers.
+- **Idle link speed:** the switch-to-card links read 2.5 GT/s when idle. That's amdgpu's idle power state, and they
+  train to 8 GT/s under load.
+
+### Security trade-off
+
+With redirect off, DMA from 45 to 48's address ranges (and back) goes card to card with no IOMMU check. Only
+traffic aimed at the other card's windows is routed locally; everything else still goes through the IOMMU. That's
+fine while both cards belong to the same VM. **If the cards on a switch are ever split between VMs, set
+`CHAIN_A_P2P=0`**; otherwise one VM's GPU could write into the other VM's GPU.
+
 ## Install
 
 ```
 apt install dkms proxmox-default-headers
-cp -r r9700-chainfix /usr/src/r9700-chainfix-1.0
-dkms add r9700-chainfix/1.0 && dkms install r9700-chainfix/1.0
+cp -r r9700-chainfix /usr/src/r9700-chainfix-1.1
+dkms add r9700-chainfix/1.1 && dkms install r9700-chainfix/1.1
 install -m755 r9700-barfix.sh /usr/local/sbin/
 install -m755 gpu-reset.sh /var/lib/vz/snippets/
 qm set 100 --hookscript local:snippets/gpu-reset.sh
@@ -87,74 +156,25 @@ qm set 100 --hookscript local:snippets/gpu-reset.sh
 ## Operating it
 
 - **Automatic:** the hookscript runs barfix at every VM100 pre-start and post-stop.
-- **Idempotent:** a chain whose cards all have an assigned 32 GB Region 0 is left alone. Repeated resets leave the
-  RDNA PSP unable to reload without a full power cycle, so healthy cards aren't touched.
+- **Idempotent:** a chain is left alone when every card has an assigned 32 GB Region 0 and, with `CHAIN_*_AT` set,
+  the first card sits at that address. Repeated resets leave the RDNA PSP unable to reload without a full power
+  cycle, so healthy cards aren't touched.
+- **ACS:** switch-local P2P is re-applied on every run. The kernel re-enables ACS whenever it rescans a port.
 - **Forced:** `FORCE=1 /usr/local/sbin/r9700-barfix.sh` re-enumerates everything. The VM must be stopped.
-- **Choosing chains:** `CHAIN_A="…" CHAIN_B="…"` selects which cards are on each chain. An empty value skips that
-  chain.
-- **Check:** run `lspci -vvs 48:00.0 | grep -E "Region 0|BAR 0: current"`. Both lines must show 32G.
-- **Guest VM:** its 64-bit MMIO (`-fw_cfg name=opt/ovmf/X-PciMmio64Mb`) must hold every passed card's BAR.
-  Today it's 131072 (128 GB); 8 cards need at least 512 GB.
+- **Knobs:**
+  - `CHAIN_A` / `CHAIN_B`: the cards on each chain. An empty value skips that chain.
+  - `CHAIN_A_AT`: forced chain address, default `0x22000000000`. Set it empty for the kernel's own first fit.
+  - `CHAIN_A_P2P`: default 1. `CHAIN_B_P2P`: default 0.
+  - `CHAIN_*_WIN`: the pre-programmed windows.
+- **Check:**
+  - `lspci -vvs 48:00.0 | grep -E "Region 0|BAR 0: current"`: both lines must show 32G.
+  - `setpci -s 42:08.0 f2a.w`: `0011` means P2P mode, `001d` means redirect is on.
+- **Guest VM:** its 64-bit window must hold every passed card's BAR. Adding cards changes the placement: recheck
+  it with the scratch-VM probe and adjust `maxmem` / `CHAIN_*_AT` together.
 
-## Verified (2026-09-23, VM100 = 45 + 48)
+## Decode vs prefill
 
-- **Forced barfix run:**
-  - the rescan placed card 45;
-  - barfix detected that card 48 was starved;
-  - the module grew the chain window to 128G;
-  - the port rescan placed card 48;
-  - both cards were bound to vfio-pci at 32G.
-- **VM start and `qm reboot 100`:** the hooks ran at post-stop and pre-start and correctly skipped the healthy
-  chain. The BARs held.
-- **Guest after the reboot:** both cards show `VRAM RAM=32624M, BAR=32768M` and `p2p_links_count 1`.
-- **P2P test** (`p2ptest.py`, RCCL 2.30.4 rebuild): all-reduce is correct and peer access is True. Bus bandwidth is
-  ~5.0 GB/s at 256 MB.
-
-### P2P path
-
-Two things aren't native here:
-
-- **Guest topology:** the guest sees the GPUs under an *emulated* QEMU switch (xio3130). That only exists so
-  amdgpu/RCCL will enable peer access. The transfers themselves are real GPU-to-GPU DMA into the peer's BAR, with
-  no staging in host RAM.
-- **Routing:** transfers don't stay inside the PLX switch. Its downstream ports have ACS `ReqRedir+ CmpltRedir+`,
-  so peer requests go up to the root complex, get translated by the IOMMU, and come back down. The GPUs expose no
-  ATS capability, so ACS Direct-Translated P2P (switch-local under an IOMMU) isn't possible. Switching redirect off
-  would make the switch route by *guest*-physical addresses, which are wrong on the host.
-
-### Why same-switch P2P is half the cross-chain bandwidth (measured 2026-09-23)
-
-The bottleneck is the switch's **uplink**. ACS redirect sends every peer transfer up the PEX 8747's single
-Gen3 x16 link to the CPU and back down the same link. Both GPUs on the switch share it, in both directions:
-
-| test (45 <-> 48, 256 MB) | per direction | total |
-|---|---|---|
-| peer memcpy 0->1 alone | 12.71 GB/s | 12.71 |
-| peer memcpy 1->0 alone | 12.71 GB/s | 12.71 |
-| **both at once** | **6.37 GB/s** | **12.74** |
-| RCCL send 0->1 | 9.76 GB/s | |
-| RCCL all-reduce busbw | 5.09 GB/s | (2 x 5.1 on the uplink) |
-
-- **Full duplex without doubling:** switch-local routing would give each direction ~12.7 GB/s at the same time.
-  Instead the total stays at one Gen3 x16 link's worth (the PEX 8747 is Gen3; the root port could do Gen4).
-- **All-reduce:** both ranks send at once, so each gets half of the ~10 GB/s the RCCL path reaches through the
-  uplink.
-- **Cross-chain (45 + c6):** each GPU has its own uplink, which is why it measured ~9.9 GB/s.
-- **Not the cause: the 2.5 GT/s readings on the switch-to-card links.** Those are amdgpu's idle power state (its
-  PCIe levels are Gen1/Gen4/Gen5). Under load the links train to 8 GT/s.
-
-**Switch-local P2P would need two things together:**
-
-1. ACS `ReqRedir`/`CmpltRedir` turned off on the PLX downstream ports.
-2. The guest placing each GPU's BARs at the **host** physical addresses.
-
-Today the guest places them at 0x6000000000 and 0x7000000000, while the host has them at 0x20800000000 and
-0x21800000000. With redirect off but different addresses, the switch doesn't recognize the peer's address, so the
-traffic goes up to the IOMMU just as it does now, and the IOMMU isolation is weakened for no gain. The GPUs don't
-support ATS, which rules out ACS Direct-Translated P2P.
-
-**Practical consequence:** for tensor-parallel all-reduce, cards on *different* switches get about twice the
-bandwidth of two cards sharing one. That matters most for large messages (prefill). Decode all-reduces are small
-and bound by latency: the P2P all-reduce kernel cut per-call time from 69 us (RCCL) to ~3 us and gave Flash-Next
-+9.5% single-stream decode (PROGRESS.md). The 2026-09-18 "P2P gives nothing" A/B is **not** valid: both arms used
-P2P IPC. The same shared uplink also carries host-to-GPU expert fetches when experts are offloaded.
+Decode all-reduces are small and limited by latency: the P2P all-reduce kernel cut per-call time from 69 µs
+(RCCL) to ~3 µs and gave Flash-Next +9.5% single-stream decode (PROGRESS.md). Prefill all-reduces are large and
+limited by bandwidth, which is what switch-local P2P doubles. The 2026-09-18 "P2P gives nothing" A/B is **not**
+valid: both arms used P2P IPC.

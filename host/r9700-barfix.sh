@@ -26,6 +26,20 @@ set -u
 CHAIN_A="${CHAIN_A-45:00.0 48:00.0}"
 CHAIN_B="${CHAIN_B-c6:00.0}"
 FORCE="${FORCE:-0}"
+# Chain windows pre-programmed before the rescan: "<upper32 base> <upper32 limit root> <upper32 limit upstream>"
+CHAIN_A_WIN="${CHAIN_A_WIN-00000220 000002a0 0000029f}"
+CHAIN_B_WIN="${CHAIN_B_WIN-00000148 00000168 00000167}"
+# Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x22000000000.
+# Used so the guest can put its GPUs at the SAME addresses (switch-local P2P); empty = kernel's first fit.
+CHAIN_A_AT="${CHAIN_A_AT-0x22000000000}"
+CHAIN_B_AT="${CHAIN_B_AT-}"
+# Switch-local P2P: clear ACS ReqRedir/CmpltRedir on the chain's PLX downstream ports so peer traffic between
+# its cards stays inside the switch. Only valid when the VM sees the cards at their HOST addresses (VM100:
+# maxmem=1100G + 48 on p2pdn1, 45 on p2pdn2), and only while every card on the chain belongs to ONE VM
+# (it removes IOMMU checks on card-to-card DMA). The kernel re-enables ACS on every rescan, so it is re-applied
+# on each run. Set CHAIN_A_P2P=0 to leave ACS alone.
+CHAIN_A_P2P="${CHAIN_A_P2P-1}"
+CHAIN_B_P2P="${CHAIN_B_P2P-0}"
 
 CHAINFIX=r9700_chainfix   # DKMS package r9700-chainfix/1.0 (src /usr/src/r9700-chainfix-1.0), rebuilt per kernel
 
@@ -35,6 +49,30 @@ chain_is_32g() {
     card_is_32g "$c" || return 1
   done
   return 0
+}
+
+# chain_ok <at|-> <card>...: every card has an assigned 32GB BAR0 and, if <at> is set, the first card's
+# BAR0 starts at <at> (so the guest's matching addresses stay valid).
+chain_ok() {
+  local at="$1"; shift
+  chain_is_32g "$@" || return 1
+  [ "$at" = - ] && return 0
+  lspci -vvs "$1" 2>/dev/null | grep -qiE "Region 0: Memory at 0*${at#0x} "
+}
+
+# acs_p2p <upstream> <card>...: clear ACS ReqRedir (bit 2) + CmpltRedir (bit 3) on each card's PLX port.
+acs_p2p() {
+  local up="$1"; shift
+  local card port off ctl new
+  for card in "$@"; do
+    port=$(plx_port_of "$up" "$card"); [ -n "$port" ] || continue
+    off=$(lspci -vvv -s "$port" | grep -oE "Capabilities: \[[0-9a-f]+ v1\] Access Control" | grep -oE "\[[0-9a-f]+" | tr -d "[")
+    [ -n "$off" ] || { echo "  $port: no ACS capability"; continue; }
+    ctl=$(setpci -s "$port" "$(printf %x $((0x$off + 6))).w")
+    new=$(printf %04x $(( 0x$ctl & ~0xc )))
+    [ "$ctl" = "$new" ] || setpci -s "$port" "$(printf %x $((0x$off + 6))).w=$new"
+    echo "  $port ACS ctl $ctl -> $new (switch-local P2P)"
+  done
 }
 
 # ReBAR control alone is not enough: the BAR must also have been ASSIGNED (Region 0 present at 32G);
@@ -110,12 +148,16 @@ fix_starved() {
   done
 }
 
-# resize_chain <root> <upstream> <base> <limit_root> <limit_up> <card>...
+# resize_chain <root> <upstream> <base> <limit_root> <limit_up> <at|-> <p2p 0|1> <card>...
 resize_chain() {
-  local root="$1" up="$2" base="$3" limr="$4" limu="$5"; shift 5
+  local root="$1" up="$2" base="$3" limr="$4" limu="$5" at="$6" p2p="$7"; shift 7
   local cards=("$@") card
   [ ${#cards[@]} -gt 0 ] || { echo "  (no cards)"; return; }
-  if [ "$FORCE" != 1 ] && chain_is_32g "${cards[@]}"; then echo "  ${cards[*]} already 32GB"; return; fi
+  if [ "$FORCE" != 1 ] && chain_ok "$at" "${cards[@]}"; then
+    echo "  ${cards[*]} already 32GB$([ "$at" != - ] && echo " at $at")"
+    if [ "$p2p" = 1 ]; then acs_p2p "$up" "${cards[@]}"; fi
+    return 0
+  fi
 
   for card in "${cards[@]}"; do unbind_card "$card"; done
   sleep 1
@@ -125,7 +167,14 @@ resize_chain() {
   setpci -s "$up"   28.L=$base 2c.L=$limu 24.W=0001 26.W=fff1
 
   echo 1 > /sys/bus/pci/devices/0000:$root/remove; sleep 2
+  # place_at: with the root port gone, reserve the bus aperture below <at> (anchored on the host bridge
+  # <bus>:00.0, which is never removed) so the rescan's first fit lands the chain window at <at>.
+  if [ "$at" != - ]; then
+    ensure_chainfix && modprobe -r "$CHAINFIX" 2>/dev/null
+    modprobe "$CHAINFIX" root_bdf="${root%%:*}:00.0" place_at="$at" || echo "  WARNING: could not reserve below $at"
+  fi
   echo 1 > /sys/bus/pci/rescan; sleep 3
+  [ "$at" != - ] && modprobe -r "$CHAINFIX" 2>/dev/null
 
   fix_starved "$root" "$up" "${cards[@]}"
 
@@ -136,10 +185,12 @@ resize_chain() {
          "region0=$(r=$(lspci -vvs "$card" | grep -m1 -oE 'Region 0: Memory at [0-9a-f]+ .*size=[0-9]+[MG]\]' | sed -E 's/.*at ([0-9a-f]+).*size=([0-9]+[MG]).*/\2@\1/'); echo "${r:-UNASSIGNED}")" \
          "driver=$(basename "$(readlink -f /sys/bus/pci/devices/0000:$card/driver 2>/dev/null)" 2>/dev/null)"
   done
-  chain_is_32g "${cards[@]}" || echo "  WARNING: not every card on this chain has a 32GB BAR0"
+  chain_ok "$at" "${cards[@]}" || echo "  WARNING: not every card on this chain has a 32GB BAR0 at the expected address"
+  if [ "$p2p" = 1 ]; then acs_p2p "$up" "${cards[@]}"; fi
+  return 0
 }
 
 echo "chain A (${CHAIN_A:-none}):"
-resize_chain 40:01.1 41:00.0 00000208 000002a0 0000029f $CHAIN_A
+resize_chain 40:01.1 41:00.0 $CHAIN_A_WIN "${CHAIN_A_AT:--}" "$CHAIN_A_P2P" $CHAIN_A
 echo "chain B (${CHAIN_B:-none}):"
-resize_chain c0:01.1 c1:00.0 00000148 00000168 00000167 $CHAIN_B
+resize_chain c0:01.1 c1:00.0 $CHAIN_B_WIN "${CHAIN_B_AT:--}" "$CHAIN_B_P2P" $CHAIN_B
