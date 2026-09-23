@@ -5,7 +5,7 @@
 # (remove root port + rescan) so the kernel can hand each card a 32GB BAR inside it.
 #
 # chain A: root 40:01.1  up 41:00.0  -> 45:00.0 (PLX port 42:08.0), 48:00.0 (PLX port 42:10.0)
-# chain B: root c0:01.1  up c1:00.0  -> c6:00.0 (PLX port c2:10.0)
+# chain B: root c0:01.1  up c1:00.0  -> c5:00.0 (PLX port c2:08.0), c8:00.0 (PLX port c2:10.0)
 #
 # A chain may carry MORE THAN ONE card (45 and 48 are on the same PEX 8747): every card on the
 # chain gets its ReBAR control set before the single remove+rescan, otherwise the cards that were
@@ -22,26 +22,26 @@
 # power cycle). FORCE=1 re-enumerates anyway.
 set -u
 
-# Override to change which cards are attached to which chain, e.g. CHAIN_A="45:00.0" CHAIN_B="c6:00.0"
+# Override to change which cards are attached to which chain, e.g. CHAIN_A="45:00.0" CHAIN_B="c5:00.0"
 CHAIN_A="${CHAIN_A-45:00.0 48:00.0}"
-CHAIN_B="${CHAIN_B-c6:00.0}"
+CHAIN_B="${CHAIN_B-c5:00.0 c8:00.0}"
 FORCE="${FORCE:-0}"
 # Chain windows pre-programmed before the rescan: "<upper32 base> <upper32 limit root> <upper32 limit upstream>"
-CHAIN_A_WIN="${CHAIN_A_WIN-00000220 000002a0 0000029f}"
-CHAIN_B_WIN="${CHAIN_B_WIN-00000148 00000168 00000167}"
-# Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x22000000000.
+CHAIN_A_WIN="${CHAIN_A_WIN-00000260 000002e0 000002df}"
+CHAIN_B_WIN="${CHAIN_B_WIN-00000140 00000160 0000015f}"
+# Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x26000000000.
 # Used so the guest can put its GPUs at the SAME addresses (switch-local P2P); empty = kernel's first fit.
-CHAIN_A_AT="${CHAIN_A_AT-0x22000000000}"
-CHAIN_B_AT="${CHAIN_B_AT-}"
+CHAIN_A_AT="${CHAIN_A_AT-0x26000000000}"
+CHAIN_B_AT="${CHAIN_B_AT-0x14000000000}"
 # Switch-local P2P: clear ACS ReqRedir/CmpltRedir on the chain's PLX downstream ports so peer traffic between
 # its cards stays inside the switch. Only valid when the VM sees the cards at their HOST addresses (VM100:
-# maxmem=1100G + 48 on p2pdn1, 45 on p2pdn2), and only while every card on the chain belongs to ONE VM
+# maxmem=1100G, X-PciMmio64Mb=262144, 48 on p2pdn1, 45 on p2pdn2, c8/c5 on p2pdn3/4), and only while every card on the chain belongs to ONE VM
 # (it removes IOMMU checks on card-to-card DMA). The kernel re-enables ACS on every rescan, so it is re-applied
 # on each run. Set CHAIN_A_P2P=0 to leave ACS alone.
 CHAIN_A_P2P="${CHAIN_A_P2P-1}"
 CHAIN_B_P2P="${CHAIN_B_P2P-0}"
 
-CHAINFIX=r9700_chainfix   # DKMS package r9700-chainfix/1.0 (src /usr/src/r9700-chainfix-1.0), rebuilt per kernel
+CHAINFIX=r9700_chainfix   # DKMS package r9700-chainfix/1.2 (src /usr/src/r9700-chainfix-1.2), rebuilt per kernel
 
 chain_is_32g() {
   local c

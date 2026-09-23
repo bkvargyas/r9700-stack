@@ -12,7 +12,7 @@
  * All work happens at load time; the module does nothing afterwards and can be removed.
  *
  * place_at=<addr> mode (load BEFORE the chain's root-port remove+rescan, unload after): reserves the
- * part of the root bus aperture below <addr>, so the rescan's first-fit puts the chain window exactly at
+ * free parts of the root bus aperture below <addr>, so the rescan's first-fit puts the chain window exactly at
  * <addr>. Used to give the cards host addresses a guest can reproduce (OVMF places the guest's 64-bit
  * window on a 128GB boundary), which is what lets peer traffic stay inside the PLX switch.
  */
@@ -32,7 +32,10 @@ module_param(window_gb, uint, 0444);
 module_param(dry_run, bool, 0444);
 module_param(place_at, charp, 0444);
 
-static struct resource placeholder = { .name = "r9700_chainfix placeholder" };
+/* Free gaps below <at> in the bus aperture; the aperture may already hold other devices' windows. */
+#define MAX_PLACEHOLDERS 16
+static struct resource placeholder[MAX_PLACEHOLDERS];
+static int nr_placeholders;
 
 static struct pci_dev *get_dev(const char *bdf)
 {
@@ -86,11 +89,15 @@ static int grow(struct pci_dev *br, resource_size_t size)
 	return 0;
 }
 
-/* Reserve [start of the root bus aperture holding <at>, at) so nothing below <at> can be allocated. */
+/*
+ * Reserve every free range of the root bus aperture below <at>, so nothing below <at> can be allocated.
+ * Windows already placed there (e.g. an NVMe's bridge windows) are stepped around, not displaced.
+ */
 static int reserve_below(u64 at)
 {
 	struct pci_dev *root = get_dev(root_bdf);
-	struct resource *r;
+	struct resource *r, *ph, *busy;
+	resource_size_t cursor;
 	int ret = -ENODEV;
 
 	if (!root) {
@@ -100,15 +107,42 @@ static int reserve_below(u64 at)
 	pci_bus_for_each_resource(root->bus, r) {
 		if (!r || !(r->flags & IORESOURCE_MEM) || at <= r->start || at > r->end)
 			continue;
-		placeholder.start = r->start;
-		placeholder.end = at - 1;
-		placeholder.flags = IORESOURCE_MEM | IORESOURCE_BUSY;
-		ret = request_resource(r, &placeholder);
-		if (ret) {
-			pr_err("r9700_chainfix: cannot reserve %pR in %pR (in use)\n", &placeholder, r);
-		} else {
-			pci_info(root, "chainfix: reserved %pR so the chain window lands at %#llx\n", &placeholder, at);
+		ret = 0;
+		/* children are sorted by start; the rescan lock keeps PCI from adding any meanwhile */
+		pci_lock_rescan_remove();
+		cursor = r->start;
+		for (busy = r->child; ; busy = busy->sibling) {
+			resource_size_t gap_end = (busy && busy->start < at) ? busy->start - 1 : at - 1;
+
+			if (gap_end >= cursor && cursor < at) {
+				if (nr_placeholders == MAX_PLACEHOLDERS) {
+					pr_err("r9700_chainfix: more than %d free ranges below %#llx\n",
+					       MAX_PLACEHOLDERS, at);
+					ret = -ENOSPC;
+					break;
+				}
+				ph = &placeholder[nr_placeholders];
+				ph->name = "r9700_chainfix placeholder";
+				ph->flags = IORESOURCE_MEM | IORESOURCE_BUSY;
+				ph->start = cursor;
+				ph->end = gap_end;
+				ret = request_resource(r, ph);
+				if (ret) {
+					pr_err("r9700_chainfix: cannot reserve %pR in %pR\n", ph, r);
+					break;
+				}
+				nr_placeholders++;
+				pci_info(root, "chainfix: reserved %pR\n", ph);
+			}
+			if (!busy || busy->start >= at)
+				break;
+			if (busy->end >= cursor)
+				cursor = busy->end + 1;
 		}
+		pci_unlock_rescan_remove();
+		if (!ret)
+			pci_info(root, "chainfix: %d range(s) reserved so the chain window lands at %#llx\n",
+				 nr_placeholders, at);
 		break;
 	}
 	if (ret == -ENODEV)
@@ -151,22 +185,33 @@ out:
 	return ret;
 }
 
+static void release_placeholders(void)
+{
+	while (nr_placeholders)
+		release_resource(&placeholder[--nr_placeholders]);
+}
+
 static int __init chainfix_init(void)
 {
 	u64 at;
+	int ret;
 
 	if (*place_at) {
 		if (kstrtoull(place_at, 0, &at))
 			return -EINVAL;
-		return dry_run ? 0 : reserve_below(at);
+		if (dry_run)
+			return 0;
+		ret = reserve_below(at);
+		if (ret)
+			release_placeholders();	/* a failed init never reaches chainfix_exit */
+		return ret;
 	}
 	return grow_chain();
 }
 
 static void __exit chainfix_exit(void)
 {
-	if (placeholder.parent)
-		release_resource(&placeholder);
+	release_placeholders();
 }
 
 module_init(chainfix_init);

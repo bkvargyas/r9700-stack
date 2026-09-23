@@ -8,9 +8,10 @@ of the setup below happens in Linux.
 | File | Installed at | Role |
 |---|---|---|
 | `r9700-barfix.sh` | `/usr/local/sbin/r9700-barfix.sh` | Sets every card to 32 GB and re-enumerates each chain |
-| `r9700-chainfix/` | `/usr/src/r9700-chainfix-1.0` (DKMS) | Kernel module that gives the second card on a switch its window |
+| `r9700-chainfix/` | `/usr/src/r9700-chainfix-1.2` (DKMS) | Kernel module that gives the second card on a switch its window |
 | `gpu-reset.sh` | `/var/lib/vz/snippets/gpu-reset.sh` | Proxmox hookscript that runs barfix at VM pre-start / post-stop |
 | `p2pbidir.py`, `p2pbw.py`, `p2ptest.py` | guest | Peer-copy (one-way and both ways, with a data check) and RCCL tests |
+| `p2ptest4.py` | guest | N-GPU peer-copy matrix (with a data check) + N-rank RCCL all-reduce |
 | `acsab.sh` | mgmt VM | Live ACS off/on/off A/B with BetterBench prefill + decode on a running server |
 
 ## Why a single card is easy and two cards on one switch are not
@@ -61,15 +62,18 @@ Once the rescan has placed the first card, barfix sees the second card has no Re
 2. **Removes and rescans only the starved card's PLX downstream port.** On its own, the kernel sizes that port's
    window correctly (32 GB + 2 MB) and places it in the free space.
 
-Result on chain A (root `40:01.1`, upstream `41:00.0`):
+Result with four cards (2026-09-23), both chains forced by `place_at` (see below):
 
 ```
-40:01.1 / 41:00.0  prefetchable window 0x22000000000-0x23fffffffff   128G   (forced by place_at, see below)
-42:08.0 -> 45:00.0 BAR0 32G @ 0x22000000000   BAR2 2M @ 0x22800000000
-42:10.0 -> 48:00.0 BAR0 32G @ 0x23000000000   BAR2 2M @ 0x23800000000
+40:01.1 / 41:00.0  prefetchable window 0x26000000000-0x27fffffffff   128G
+42:08.0 -> 45:00.0 BAR0 32G @ 0x26000000000   BAR2 2M @ 0x26800000000
+42:10.0 -> 48:00.0 BAR0 32G @ 0x27000000000   BAR2 2M @ 0x27800000000
+c0:01.1 / c1:00.0  prefetchable window 0x14000000000-0x15fffffffff   128G
+c2:08.0 -> c5:00.0 BAR0 32G @ 0x14000000000   BAR2 2M @ 0x14800000000
+c2:10.0 -> c8:00.0 BAR0 32G @ 0x15000000000   BAR2 2M @ 0x15800000000
 ```
 
-The module is DKMS-managed (`r9700-chainfix/1.0`). With `proxmox-default-headers` installed, apt rebuilds it for
+The module is DKMS-managed (`r9700-chainfix/1.2`). With `proxmox-default-headers` installed, apt rebuilds it for
 every new kernel. If it's missing for the running kernel anyway, barfix runs `dkms autoinstall` once.
 
 **Licence:** `r9700-chainfix/` is GPL-2.0, like any kernel module that links against the PCI core. It is a
@@ -93,33 +97,57 @@ IOMMU. That's why the addresses have to match instead.
 ### How the addresses are matched
 
 - **Guest side (config only):** the guest firmware (`OVMF_CODE_4M.secboot.fd`) puts its 64-bit PCI window at
-  `ALIGN_UP(reserved-memory-end, 128G)` and fills it bottom-up: the card on `p2pdn2` at the base, the card on
-  `p2pdn1` at base + 64G.
+  `ALIGN_UP(reserved-memory-end, <window size>)` (window size = `X-PciMmio64Mb`) and fills the emulated switch
+  bottom-up in *reverse* port order, 64G per card: with four ports, `p2pdn4` at the base, then `p2pdn3`, `p2pdn2`,
+  `p2pdn1`.
   - `-m <ram>,slots=1,maxmem=…` moves reserved-memory-end. It reserves memory-hotplug address space and uses no
     RAM.
   - On AMD hosts, once that space crosses the HyperTransport hole below 1 TB, QEMU moves above-4G RAM to 1 TB.
-  - With 256G of RAM, `maxmem=1100G` gives a base of **0x22000000000**.
+  - With 256G of RAM and `maxmem=1100G`: a 128G window (two cards) starts at **0x22000000000**, a 256G window
+    (four cards, needed since 4 x 64G no longer fits in 128G) at **0x24000000000**.
   - Test placement on a disk-less scratch VM with the same efidisk type (`qm monitor` → `info pci`). The legacy
     `OVMF_CODE.fd` uses a completely different "dynamic" window near the top of the address space.
 - **Host side (`place_at`):** the kernel ignores pre-programmed bridge bases and first-fits the chain at the
   bottom of the bus aperture (0x20800000000, which isn't 128G-aligned). barfix therefore:
   1. removes the root port;
-  2. loads `r9700_chainfix place_at=0x22000000000 root_bdf=40:00.0`, which reserves the aperture below the target;
+  2. loads `r9700_chainfix place_at=0x26000000000 root_bdf=40:00.0`, which reserves every free range of the
+     aperture below the target (1.2+: it steps around windows already there, e.g. the NVMe's on bus c0);
   3. rescans, so the first fit lands the chain at the target;
   4. unloads the module, releasing the reservation;
   5. places the second card at +64G, as before.
 
+### Four cards: only one chain can be switch-local
+
+The two chains live in different root-complex apertures (chain A on bus 40: 2-3 TB; chain B on bus c0: 1-1.5 TB),
+while the guest's 64-bit window is one contiguous range. So the guest can reproduce the host addresses of **one**
+chain only. Chain A keeps switch-local P2P (`CHAIN_A_P2P=1`); chain B keeps ACS redirect on (`CHAIN_B_P2P=0`), so
+its traffic, same-switch included, goes through the IOMMU, which translates guest to host addresses.
+
+Two placement rules keep that safe:
+
+- **Chain A's host window must not cover a guest address of another card.** With redirect off, a request that falls
+  inside the PLX's window but hits no downstream port is not forwarded upstream. So chain A goes at the *top* of the
+  guest window (`p2pdn2`/`p2pdn1` = 0x260/0x270, host window 0x260-0x280), and chain B's guest addresses
+  (0x240/0x250) sit below it.
+- **Chain B's host window must not overlap guest RAM.** Above-4G guest RAM sits at GPA 1 TB-1.25 TB, and chain B's
+  first fit lands at 0x10800000000, inside it. `CHAIN_B_AT=0x14000000000` puts it above guest RAM.
+
 VM100 (`/etc/pve/qemu-server/100.conf` `args:`):
 
 ```
--m 262144,slots=1,maxmem=1100G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=131072
+-m 262144,slots=1,maxmem=1100G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=262144
 -device pcie-root-port,id=p2prp,bus=pcie.0,chassis=90,slot=90,x-speed=32,x-width=16
 -device x3130-upstream,id=p2pup,bus=p2prp
--device xio3130-downstream,id=p2pdn1,bus=p2pup,chassis=91,slot=1
--device xio3130-downstream,id=p2pdn2,bus=p2pup,chassis=92,slot=2
--device vfio-pci,host=0000:48:00.0,bus=p2pdn1,addr=0x0,rombar=0     # guest 0x23000000000 == host
--device vfio-pci,host=0000:45:00.0,bus=p2pdn2,addr=0x0,rombar=0     # guest 0x22000000000 == host
+-device xio3130-downstream,id=p2pdn{1..4},bus=p2pup,chassis=9{1..4},slot={1..4}   # four ports
+-device vfio-pci,host=0000:48:00.0,bus=p2pdn1,addr=0x0,rombar=0     # guest 0x27000000000 == host
+-device vfio-pci,host=0000:45:00.0,bus=p2pdn2,addr=0x0,rombar=0     # guest 0x26000000000 == host
+-device vfio-pci,host=0000:c8:00.0,bus=p2pdn3,addr=0x0,rombar=0     # guest 0x25000000000 (host 0x15000000000)
+-device vfio-pci,host=0000:c5:00.0,bus=p2pdn4,addr=0x0,rombar=0     # guest 0x24000000000 (host 0x14000000000)
 ```
+
+Result (2026-09-23, `p2ptest4.py`): all four GPUs init (32 GB VRAM and BAR, SMU OK), each has 3 KFD P2P links.
+Every peer pair copies at 12.5-13.0 GB/s one-way with the data check passing. A 4-rank RCCL all-reduce is correct,
+at 3.7 GB/s busbw @256MB. No IOMMU or AER faults on the host or in the guest.
 
 ### Result (2026-09-23, 45 <-> 48, 256 MB)
 
@@ -164,8 +192,8 @@ fine while both cards belong to the same VM. **If the cards on a switch are ever
 
 ```
 apt install dkms proxmox-default-headers
-cp -r r9700-chainfix /usr/src/r9700-chainfix-1.1
-dkms add r9700-chainfix/1.1 && dkms install r9700-chainfix/1.1
+cp -r r9700-chainfix /usr/src/r9700-chainfix-1.2
+dkms add r9700-chainfix/1.2 && dkms install r9700-chainfix/1.2
 install -m755 r9700-barfix.sh /usr/local/sbin/
 install -m755 gpu-reset.sh /var/lib/vz/snippets/
 qm set 100 --hookscript local:snippets/gpu-reset.sh
@@ -181,7 +209,8 @@ qm set 100 --hookscript local:snippets/gpu-reset.sh
 - **Forced:** `FORCE=1 /usr/local/sbin/r9700-barfix.sh` re-enumerates everything. The VM must be stopped.
 - **Knobs:**
   - `CHAIN_A` / `CHAIN_B`: the cards on each chain. An empty value skips that chain.
-  - `CHAIN_A_AT`: forced chain address, default `0x22000000000`. Set it empty for the kernel's own first fit.
+  - `CHAIN_A_AT` / `CHAIN_B_AT`: forced chain addresses, defaults `0x26000000000` / `0x14000000000`. Set one
+    empty for the kernel's own first fit.
   - `CHAIN_A_P2P`: default 1. `CHAIN_B_P2P`: default 0.
   - `CHAIN_*_WIN`: the pre-programmed windows.
 - **Check:**
