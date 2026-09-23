@@ -118,6 +118,8 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 - **`tests/`** — correctness gates. Each kernel is checked against a reference implementation, and several are
   checked to be *bit-identical* to the path they replace.
 - **`tuning/`** — the benchmark harnesses used to pick tile configurations.
+- **`host/`** — Proxmox host setup: 32 GB BARs for cards behind the PLX switches, including a second card on the
+  same switch (DKMS kernel module + barfix script + VM hookscript).
 - **`notes/`** — design notes and investigation write-ups.
 
 ## Docs
@@ -126,6 +128,7 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 |---|---|
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |
+| [host/README.md](host/README.md) | Host PCIe setup: why a second card on one PLX switch gets no BAR, and the fix. |
 | [notes/independence.md](notes/independence.md) | Which third-party pieces were replaced with our own, and why. |
 | [notes/replacement-plan.md](notes/replacement-plan.md) | The plan for replacing what is left, so the repo is cleanly Apache-2.0. |
 | [CREDITS.md](CREDITS.md) | The two third-party components, and the licence position. |
