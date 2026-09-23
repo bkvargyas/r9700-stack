@@ -122,6 +122,37 @@ Two things aren't native here:
   ATS capability, so ACS Direct-Translated P2P (switch-local under an IOMMU) isn't possible. Switching redirect off
   would make the switch route by *guest*-physical addresses, which are wrong on the host.
 
-The ~5 GB/s is about half of the ~9.9 GB/s measured on 2026-09-18 with the cards on separate chains (45 + c6).
-That drop is the next thing to investigate. The 2026-09-18 A/B test also found P2P doesn't matter for Flash-Next
-at TP=2, where expert offload dominates.
+### Why same-switch P2P is half the cross-chain bandwidth (measured 2026-09-23)
+
+The bottleneck is the switch's **uplink**. ACS redirect sends every peer transfer up the PEX 8747's single
+Gen3 x16 link to the CPU and back down the same link. Both GPUs on the switch share it, in both directions:
+
+| test (45 <-> 48, 256 MB) | per direction | total |
+|---|---|---|
+| peer memcpy 0->1 alone | 12.71 GB/s | 12.71 |
+| peer memcpy 1->0 alone | 12.71 GB/s | 12.71 |
+| **both at once** | **6.37 GB/s** | **12.74** |
+| RCCL send 0->1 | 9.76 GB/s | |
+| RCCL all-reduce busbw | 5.09 GB/s | (2 x 5.1 on the uplink) |
+
+- **Full duplex without doubling:** switch-local routing would give each direction ~12.7 GB/s at the same time.
+  Instead the total stays at one Gen3 x16 link's worth (the PEX 8747 is Gen3; the root port could do Gen4).
+- **All-reduce:** both ranks send at once, so each gets half of the ~10 GB/s the RCCL path reaches through the
+  uplink.
+- **Cross-chain (45 + c6):** each GPU has its own uplink, which is why it measured ~9.9 GB/s.
+- **Not the cause: the 2.5 GT/s readings on the switch-to-card links.** Those are amdgpu's idle power state (its
+  PCIe levels are Gen1/Gen4/Gen5). Under load the links train to 8 GT/s.
+
+**Switch-local P2P would need two things together:**
+
+1. ACS `ReqRedir`/`CmpltRedir` turned off on the PLX downstream ports.
+2. The guest placing each GPU's BARs at the **host** physical addresses.
+
+Today the guest places them at 0x6000000000 and 0x7000000000, while the host has them at 0x20800000000 and
+0x21800000000. With redirect off but different addresses, the switch doesn't recognize the peer's address, so the
+traffic goes up to the IOMMU just as it does now, and the IOMMU isolation is weakened for no gain. The GPUs don't
+support ATS, which rules out ACS Direct-Translated P2P.
+
+**Practical consequence:** for tensor-parallel all-reduce, cards on *different* switches get about twice the
+bandwidth of two cards sharing one. At TP=2 on Flash-Next this doesn't matter: the 2026-09-18 A/B test found P2P
+itself makes no difference there, because expert offload dominates.
