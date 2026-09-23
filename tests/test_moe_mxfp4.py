@@ -110,6 +110,14 @@ if __name__ == "__main__":
     # odd shapes: N=48 tail, K=320 with SK=5/10
     allok &= run_case(8, 3, 2, 48, 1024, 2560, 320, 3, cfg1=(4, 4, 1), cfg2=(2, 5, 2))[0]
     allok &= run_case(8, 3, 2, 640, 2560, 2560, 320, 4, cfg1=(4, 2, 4), cfg2=(1, 10, 4))[0]
+    # Flash-Next per-rank at TP4: w13 N=2*160=320 K=2560, w2 N=2560 K=160 -- the tuned down cfg (SK=2) is illegal
+    # there, so legal_cfg must hand back a config the kernel accepts
+    c1, c2 = K.legal_cfg((2, 4, 2), 320, 2560), K.legal_cfg((4, 2, 1), 2560, 160)
+    assert c1 == (2, 4, 2) and 160 % (c2[1] * K.GROUP) == 0, (c1, c2)
+    for (E, M, topk) in [(8, 1, 2), (32, 4, 10)]:
+        allok &= run_case(E, M, topk, 320, 2560, 2560, 160, seed=100 + E + M, cfg1=c1, cfg2=c2)[0]
+    for MT in (2, 4):
+        allok &= run_case(16, 200, 4, 320, 2560, 2560, 160, 110 + MT, cfg1=c1, cfg2=c2, MT=MT)[0]
     # multi-tile routing blocks (prefill-like: many rows per expert)
     for MT in (2, 4):
         allok &= run_case(16, 200, 4, 640, 2560, 2560, 320, 10 + MT, MT=MT)[0]

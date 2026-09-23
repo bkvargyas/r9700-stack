@@ -457,6 +457,16 @@ def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str
     return 4, 1, 1
 
 
+def legal_cfg(cfg: tuple[int, ...], N: int, K: int, group: int = GROUP) -> tuple[int, int, int]:
+    """cfg's (WV, SK, NPW) if the kernel accepts it for this shape (K % (SK*group) == 0), else pick_cfg's.
+    The fixed decode configs are tuned for Flash-Next at TP=2 (down K=320); TP=4 shards the down GEMM to K=160,
+    where SK=2 is rejected (-2) and only SK in {1, 5} fit."""
+    WV, SK, NPW = cfg[:3]
+    if K % (SK * group) == 0 and WV * SK * 32 <= 1024:
+        return WV, SK, NPW
+    return pick_cfg(N, K, group)[:3]  # type: ignore[return-value]
+
+
 def pick_mt(numel: int, num_experts: int) -> int:
     """M tiles per routing block from the host-known row count: rows per touched expert >= 32 -> 4, >= 16 -> 2."""
     per = numel / max(1, min(num_experts, numel))

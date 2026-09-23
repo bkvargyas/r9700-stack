@@ -5,13 +5,14 @@
 # 2026-09-23. Phases run one after another; only phase 4 loads two servers at once, which IS the dual deployment.
 set -u
 R=~/r9700-build/repo; BB=~/bb-venv/bin/betterbench; LAUNCH=${LAUNCH:-27b.sh}; OUT=${OUT:-~/tp4v2}; mkdir -p $OUT
-TP4_ARGS=${TP4_ARGS:-}; TP4_FALLBACK=${TP4_FALLBACK:-}
+TP4_ARGS=${TP4_ARGS:-}; TP4_FALLBACK=${TP4_FALLBACK:-}; SKIP_TP4=${SKIP_TP4:-0}   # 1 = only the TP=2 phases
+ONLY_TP4=${ONLY_TP4:-0}   # 1 = only the TP=4 phase
 trap 'docker rm -f tp4 tp2a tp2b >/dev/null 2>&1' EXIT
 docker ps --format "{{.Names}}" | grep -q . && { echo BUSY; exit 1; }
 log(){ echo "[$(date +%H:%M:%S)] $*" | tee -a $OUT/progress.log; }
 up(){ # name port -> wait until serving
   for i in $(seq 1 120); do curl -sf localhost:$2/v1/models >/dev/null && { log "$1 READY"; python3 $R/bench/warmup.py http://localhost:$2 >/dev/null 2>&1; return 0; }
-    docker ps --format "{{.Names}}" | grep -qx $1 || { log "$1 DIED"; docker logs --tail 60 $1 > $OUT/$1-died.log 2>&1; return 1; }; sleep 10; done
+    docker ps --format "{{.Names}}" | grep -qx $1 || { log "$1 DIED"; docker logs $1 > $OUT/$1-died.log 2>&1; return 1; }; sleep 10; done
   log "$1 TIMEOUT"; return 1; }
 bb(){ # port runname config [phase flags]
   local port=$1 name=$2 cfg=$3; shift 3
@@ -22,6 +23,7 @@ serve(){ # name gpus tp port nseq [launcher args...] (27b.sh sets NSEQ itself, s
   local n=$1 g=$2 t=$3 p=$4 q=$5; shift 5
   NAME=$n GPUS=$g TP=$t PORT=$p bash $R/serve/$LAUNCH NSEQ=$q "$@" > $OUT/$n-launch.log 2>&1; }
 
+if [ "$SKIP_TP4" != 1 ]; then
 log "phase 1: TP=4"
 log "launcher $LAUNCH, TP=4 args: ${TP4_ARGS:-none}"
 if ! { serve tp4 0,1,2,3 4 8080 16 $TP4_ARGS && up tp4 8080; } && [ -n "$TP4_FALLBACK" ]; then
@@ -33,6 +35,9 @@ docker ps --format "{{.Names}}" | grep -qx tp4 && {
   bb 8080 tp4-full "$(cfg 1,2,4,8,16 tp4)"; }
 docker logs tp4 > $OUT/tp4-server.log 2>&1; docker rm -f tp4 >/dev/null 2>&1
 
+fi
+
+[ "$ONLY_TP4" = 1 ] && { log "TP4VS2 DONE (TP=4 only)"; exit 0; }
 log "phase 2+3: TP=2 on each switch, benchmarked alone"
 serve tp2a 0,1 2 8080 8 && up tp2a 8080 && serve tp2b 2,3 2 8081 8 && up tp2b 8081 || exit 1
 for s in tp2a:8080 tp2b:8081; do

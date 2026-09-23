@@ -4,7 +4,7 @@
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
 # Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = RCCL all-reduce: ours is 2-rank), PORT=8080, NAME=vllmstock (two servers
-#   side by side need distinct GPUS/PORT/NAME),
+#   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -90,12 +90,15 @@ if [ "${DRYRUN:-0}" = 1 ]; then
     ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} "${OFFL[@]}" "${ARGS[@]}" $EXTRA; echo; exit 0
 fi
 sudo docker rm -f ${NAME:-vllmstock} 2>/dev/null
-sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host --shm-size 32g \
+# --pid=host: two servers side by side (e.g. one per PLX switch) otherwise both get worker PIDs 104/105 in their own
+# PID namespaces, and with the shared host network the second one's RCCL init fails (hipIpcGetMemHandle: invalid
+# argument, HSA_ENABLE_IPC_MODE_LEGACY=0). PIDNS= (empty) to keep a private PID namespace.
+sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host ${PIDNS---pid=host} --shm-size 32g \
   --device=/dev/kfd --device=/dev/dri --group-add 44 --group-add 991 --ulimit memlock=-1 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -e HIP_VISIBLE_DEVICES=${GPUS:-0,1} -e VLLM_ROCM_USE_AITER=0 -e HSA_ENABLE_IPC_MODE_LEGACY=0 \
   -e GPU_MAX_HW_QUEUES=${HWQ:-1} -e HSA_ENABLE_MWAITX=${MWAITX:-1} -e OMP_NUM_THREADS=8 -e R9K_LIB=/opt/r9700/r9700_vllm/kernels/libr9k.so \
-  "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
+  $DOCKER_ARGS "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
   -v $HOME/vllmstock-triton:/root/.triton \
   "${ENTRY[@]}" $IMG "${PRE[@]}" ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port ${PORT:-8080} \

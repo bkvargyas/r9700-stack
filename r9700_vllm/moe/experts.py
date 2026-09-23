@@ -34,9 +34,16 @@ def _cfg(env: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
     return tuple(int(x) for x in v.split(",")) if v else default  # type: ignore[return-value]
 
 
-# (WV, SK, NPW) launch configs; tuned defaults for Flash-Next TP2 shapes, overridable for sweeps.
+# (WV, SK, NPW) launch configs; tuned defaults for Flash-Next TP2 shapes, overridable for sweeps. Applied through
+# K.legal_cfg, which swaps in pick_cfg when another TP size shards K to a shape the tuned SK does not divide.
 CFG_GATE_UP = _cfg("R9K_MOE_CFG1", (2, 4, 2))
 CFG_DOWN = _cfg("R9K_MOE_CFG2", (4, 2, 1))
+
+
+def _legal(cfg: tuple[int, int, int], W) -> tuple[int, int, int]:
+    return K.legal_cfg(cfg, W.N, W.K, 16 if isinstance(W, K.Nvfp4Experts) else K.GROUP)
+
+
 FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
 # Cold-pass strategy by step width (routed rows = tokens x top-k). Measured 2026-09-18, MTP-3, 270 slots:
 #  - few rows (e.g. 4 concurrent = 160 rows): bulk-staging the few cold experts beats latency-bound UVA reads
@@ -166,7 +173,7 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         xq, xs = K.quant_rows_fp8(hidden_states)
         gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
         for W1, _, (sid, eid, ntpp) in passes:
-            K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *CFG_GATE_UP,
+            K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *_legal(CFG_GATE_UP, W1),
                        num_experts=global_num_experts, MT=MT, prefill=pf_gate)
 
         if FUSED_ACT:
@@ -180,6 +187,6 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         down = torch.zeros((numel, N2), dtype=torch.bfloat16, device=dev)
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
-            K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *CFG_DOWN,
+            K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *_legal(CFG_DOWN, W2),
                        num_experts=global_num_experts, MT=MT, prefill=pf_down)
         ops.moe_sum(down.view(M, topk, N2), output)
