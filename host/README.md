@@ -9,6 +9,8 @@ of the setup below happens in Linux.
 |---|---|---|
 | `r9700-barfix.sh` | `/usr/local/sbin/r9700-barfix.sh` | Sets every card to 32 GB and re-enumerates each chain |
 | `r9700-chainfix/` | `/usr/src/r9700-chainfix-1.2` (DKMS) | Kernel module that gives the second card on a switch its window |
+| `r9700-guestplace/` | guest: `/usr/src/r9700-guestplace-1.0` (DKMS), `/etc/modprobe.d/`, `/etc/systemd/system/` | Guest module + boot unit that move every card to its host BAR address before amdgpu |
+| `r9700-guestplace/r9700-powercap.sh` | guest: `/usr/local/sbin/` | 225 W cap on every R9700 (waits for all of them) |
 | `gpu-reset.sh` | `/var/lib/vz/snippets/gpu-reset.sh` | Proxmox hookscript that runs barfix at VM pre-start / post-stop |
 | `p2pbidir.py`, `p2pbw.py`, `p2ptest.py` | guest | Peer-copy (one-way and both ways, with a data check) and RCCL tests |
 | `p2ptest4.py` | guest | N-GPU peer-copy matrix (with a data check) + N-rank RCCL all-reduce |
@@ -96,58 +98,71 @@ IOMMU. That's why the addresses have to match instead.
 
 ### How the addresses are matched
 
-- **Guest side (config only):** the guest firmware (`OVMF_CODE_4M.secboot.fd`) puts its 64-bit PCI window at
-  `ALIGN_UP(reserved-memory-end, <window size>)` (window size = `X-PciMmio64Mb`) and fills the emulated switch
-  bottom-up in *reverse* port order, 64G per card: with four ports, `p2pdn4` at the base, then `p2pdn3`, `p2pdn2`,
-  `p2pdn1`.
-  - `-m <ram>,slots=1,maxmem=…` moves reserved-memory-end. It reserves memory-hotplug address space and uses no
-    RAM.
-  - On AMD hosts, once that space crosses the HyperTransport hole below 1 TB, QEMU moves above-4G RAM to 1 TB.
-  - With 256G of RAM and `maxmem=1100G`: a 128G window (two cards) starts at **0x22000000000**, a 256G window
-    (four cards, needed since 4 x 64G no longer fits in 128G) at **0x24000000000**.
-  - Test placement on a disk-less scratch VM with the same efidisk type (`qm monitor` → `info pci`). The legacy
-    `OVMF_CODE.fd` uses a completely different "dynamic" window near the top of the address space.
+The host puts each chain at a fixed address; the guest copies each card's address with a module. Both sides
+treat every switch the same way.
+
 - **Host side (`place_at`):** the kernel ignores pre-programmed bridge bases and first-fits the chain at the
-  bottom of the bus aperture (0x20800000000, which isn't 128G-aligned). barfix therefore:
+  bottom of the bus aperture. barfix therefore:
   1. removes the root port;
-  2. loads `r9700_chainfix place_at=0x26000000000 root_bdf=40:00.0`, which reserves every free range of the
-     aperture below the target (1.2+: it steps around windows already there, e.g. the NVMe's on bus c0);
+  2. loads `r9700_chainfix place_at=<CHAIN_*_AT>`, which reserves every free range of the aperture below the
+     target (1.2+: it steps around windows already there, e.g. the NVMe's on bus c0);
   3. rescans, so the first fit lands the chain at the target;
   4. unloads the module, releasing the reservation;
   5. places the second card at +64G, as before.
 
-### Four cards: only one chain can be switch-local
-
-The two chains live in different root-complex apertures (chain A on bus 40: 2-3 TB; chain B on bus c0: 1-1.5 TB),
-while the guest's 64-bit window is one contiguous range. So the guest can reproduce the host addresses of **one**
-chain only. Chain A keeps switch-local P2P (`CHAIN_A_P2P=1`); chain B keeps ACS redirect on (`CHAIN_B_P2P=0`), so
-its traffic, same-switch included, goes through the IOMMU, which translates guest to host addresses.
-
-Two placement rules keep that safe:
-
-- **Chain A's host window must not cover a guest address of another card.** With redirect off, a request that falls
-  inside the PLX's window but hits no downstream port is not forwarded upstream. So chain A goes at the *top* of the
-  guest window (`p2pdn2`/`p2pdn1` = 0x260/0x270, host window 0x260-0x280), and chain B's guest addresses
-  (0x240/0x250) sit below it.
-- **Chain B's host window must not overlap guest RAM.** Above-4G guest RAM sits at GPA 1 TB-1.25 TB, and chain B's
-  first fit lands at 0x10800000000, inside it. `CHAIN_B_AT=0x14000000000` puts it above guest RAM.
+  Chain A (bus 40, aperture 2-3 TB) sits at **0x260/0x270**, chain B (bus c0, aperture 1-1.5 TB) at
+  **0x140/0x150**. Any address inside a chain's own aperture works; it just has to match the guest config.
+- **Guest side (`r9700_guestplace`, DKMS in the guest):** OVMF packs all 64-bit BARs bottom-up in its own order
+  and cannot be told where to put them, and one contiguous window cannot hold two chains that sit 1 TB apart on
+  the host. So the guest has **one emulated switch per host chain** (root port -> x3130 upstream -> two xio3130
+  downstream ports). At boot, before amdgpu, `r9700-guestplace.service` loads the module. It releases every
+  card, re-windows each emulated switch around its own two cards only, and puts each BAR0 at its host address
+  (BAR2 right after). Because each switch spans only 128G, it never has to cross the gap between the chains.
+  That gap holds the guest's other devices (hotplug ports, the virtio bus), which are never moved.
+  - `blacklist amdgpu` in `/etc/modprobe.d/r9700-guestplace.conf` stops udev from binding the cards first;
+    the service loads amdgpu itself afterwards, even if placement fails (the cards then work, just not
+    switch-local).
+  - The VM's 64-bit hole must cover every target: `-global q35-pcihost.pci-hole64-size=2048G`. That pushes
+    the end of the hole past the HyperTransport hole, so QEMU moves above-4G RAM to 1 TB (GPA
+    0x100-0x13f8), and the hole starts right after it at 0x140. **Host chain windows must not overlap guest
+    RAM**, which is why chain B sits at 0x140 and not at its first fit (0x108).
+  - Cross-switch P2P between the two emulated root ports is allowed by the guest kernel (AMD Zen CPU passes
+    `pci_p2pdma`'s host-bridge check): each GPU still has 3 KFD P2P links.
+  - The guest kernel (xanmod) is clang-built, so the module is built with `LLVM=-21` (`clang-21 lld-21
+    llvm-21` from trixie-backports); the Makefile pins it because dkms passes a bare `CC=clang`.
 
 VM100 (`/etc/pve/qemu-server/100.conf` `args:`):
 
 ```
--m 262144,slots=1,maxmem=1100G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=262144
--device pcie-root-port,id=p2prp,bus=pcie.0,chassis=90,slot=90,x-speed=32,x-width=16
+-global q35-pcihost.pci-hole64-size=2048G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=262144
+-device pcie-root-port,id=p2prp,bus=pcie.0,chassis=90,slot=90,x-speed=32,x-width=16     # chain A switch
 -device x3130-upstream,id=p2pup,bus=p2prp
--device xio3130-downstream,id=p2pdn{1..4},bus=p2pup,chassis=9{1..4},slot={1..4}   # four ports
--device vfio-pci,host=0000:48:00.0,bus=p2pdn1,addr=0x0,rombar=0     # guest 0x27000000000 == host
--device vfio-pci,host=0000:45:00.0,bus=p2pdn2,addr=0x0,rombar=0     # guest 0x26000000000 == host
--device vfio-pci,host=0000:c8:00.0,bus=p2pdn3,addr=0x0,rombar=0     # guest 0x25000000000 (host 0x15000000000)
--device vfio-pci,host=0000:c5:00.0,bus=p2pdn4,addr=0x0,rombar=0     # guest 0x24000000000 (host 0x14000000000)
+-device xio3130-downstream,id=p2pdn1,bus=p2pup,chassis=91,slot=1
+-device xio3130-downstream,id=p2pdn2,bus=p2pup,chassis=92,slot=2
+-device pcie-root-port,id=p2prpb,bus=pcie.0,chassis=95,slot=95,x-speed=32,x-width=16    # chain B switch
+-device x3130-upstream,id=p2pupb,bus=p2prpb
+-device xio3130-downstream,id=p2pdn3,bus=p2pupb,chassis=93,slot=3
+-device xio3130-downstream,id=p2pdn4,bus=p2pupb,chassis=94,slot=4
+-device vfio-pci,host=0000:48:00.0,bus=p2pdn1,addr=0x0,rombar=0     # guest 03:00.0 -> 0x27000000000
+-device vfio-pci,host=0000:45:00.0,bus=p2pdn2,addr=0x0,rombar=0     # guest 04:00.0 -> 0x26000000000
+-device vfio-pci,host=0000:c8:00.0,bus=p2pdn3,addr=0x0,rombar=0     # guest 07:00.0 -> 0x15000000000
+-device vfio-pci,host=0000:c5:00.0,bus=p2pdn4,addr=0x0,rombar=0     # guest 08:00.0 -> 0x14000000000
 ```
 
-Result (2026-09-23, `p2ptest4.py`): all four GPUs init (32 GB VRAM and BAR, SMU OK), each has 3 KFD P2P links.
-Every peer pair copies at 12.5-13.0 GB/s one-way with the data check passing. A 4-rank RCCL all-reduce is correct,
-at 3.7 GB/s busbw @256MB. No IOMMU or AER faults on the host or in the guest.
+History: until 2026-09-23 evening the guest side was config only (`maxmem=1100G` to steer OVMF's window, port
+order chosen so OVMF's reverse fill matched), which can match ONE chain at most; chain B ran through the IOMMU.
+
+### Four cards, both chains switch-local (2026-09-23, `p2ptest4.py`, `p2pbidir.py`)
+
+All four GPUs init (32 GB VRAM and BAR, SMU OK, 225 W cap), each with 3 KFD P2P links, guest BAR == host BAR for
+every card, 0 IOMMU/AER faults.
+
+| | before (chain B via IOMMU) | after (both switch-local) |
+|---|---|---|
+| chain B pair, both directions at once | ~12.7 GB/s total | **25.23 GB/s** |
+| chain A pair, both directions at once | 25.26 GB/s | 25.23 GB/s |
+| cross-chain pair, both directions | – | 25.32 GB/s |
+| 4-rank RCCL all-reduce busbw @256MB | 3.7 GB/s | **10.03 GB/s** (37.4 ms) |
 
 ### Result (2026-09-23, 45 <-> 48, 256 MB)
 
@@ -197,6 +212,15 @@ dkms add r9700-chainfix/1.2 && dkms install r9700-chainfix/1.2
 install -m755 r9700-barfix.sh /usr/local/sbin/
 install -m755 gpu-reset.sh /var/lib/vz/snippets/
 qm set 100 --hookscript local:snippets/gpu-reset.sh
+
+# guest (VM100)
+apt install -t trixie-backports clang-21 lld-21 llvm-21 dkms
+cp r9700-guestplace/{r9700_guestplace.c,Makefile,dkms.conf} /usr/src/r9700-guestplace-1.0/
+dkms install r9700-guestplace/1.0
+install -m644 r9700-guestplace/r9700-guestplace.conf /etc/modprobe.d/
+install -m644 r9700-guestplace/r9700-guestplace.service /etc/systemd/system/
+install -m755 r9700-guestplace/r9700-powercap.sh /usr/local/sbin/
+systemctl enable r9700-guestplace   # plus a drop-in: r9700-powercap.service After=r9700-guestplace.service
 ```
 
 ## Operating it
@@ -211,13 +235,15 @@ qm set 100 --hookscript local:snippets/gpu-reset.sh
   - `CHAIN_A` / `CHAIN_B`: the cards on each chain. An empty value skips that chain.
   - `CHAIN_A_AT` / `CHAIN_B_AT`: forced chain addresses, defaults `0x26000000000` / `0x14000000000`. Set one
     empty for the kernel's own first fit.
-  - `CHAIN_A_P2P`: default 1. `CHAIN_B_P2P`: default 0.
+  - `CHAIN_A_P2P` / `CHAIN_B_P2P`: default 1 (switch-local; needs the guest module).
   - `CHAIN_*_WIN`: the pre-programmed windows.
 - **Check:**
   - `lspci -vvs 48:00.0 | grep -E "Region 0|BAR 0: current"`: both lines must show 32G.
   - `setpci -s 42:08.0 f2a.w`: `0011` means P2P mode, `001d` means redirect is on.
-- **Guest VM:** its 64-bit window must hold every passed card's BAR. Adding cards changes the placement: recheck
-  it with the scratch-VM probe and adjust `maxmem` / `CHAIN_*_AT` together.
+- **Guest VM:** `CHAIN_*_AT` must match the `place=` line in the guest's `/etc/modprobe.d/r9700-guestplace.conf`
+  (second card on a chain = first + 64G). Check with `dmesg | grep guestplace` and `lspci -vv` in the guest.
+  Adding a switch: another root port/upstream/downstream group in `args:`, its cards in `place=`, and the
+  hole64 size large enough to reach the highest target.
 
 ## Decode vs prefill
 

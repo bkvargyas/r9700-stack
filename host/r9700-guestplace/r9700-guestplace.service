@@ -1,0 +1,14 @@
+[Unit]
+Description=Place R9700 BARs at their host addresses, then load amdgpu
+After=systemd-modules-load.service systemd-udev-settle.service
+Before=r9700-powercap.service docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# a failed placement still loads amdgpu: the cards work, peer traffic just takes the IOMMU path
+ExecStart=-/sbin/modprobe r9700_guestplace
+ExecStart=/sbin/modprobe amdgpu
+
+[Install]
+WantedBy=multi-user.target

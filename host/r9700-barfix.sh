@@ -29,17 +29,19 @@ FORCE="${FORCE:-0}"
 # Chain windows pre-programmed before the rescan: "<upper32 base> <upper32 limit root> <upper32 limit upstream>"
 CHAIN_A_WIN="${CHAIN_A_WIN-00000260 000002e0 000002df}"
 CHAIN_B_WIN="${CHAIN_B_WIN-00000140 00000160 0000015f}"
-# Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x26000000000.
-# Used so the guest can put its GPUs at the SAME addresses (switch-local P2P); empty = kernel's first fit.
+# Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x26000000000; the
+# second card follows 64GB above it. The guest's r9700_guestplace.ko moves each card to the same address
+# (switch-local P2P), so these must match /etc/modprobe.d/r9700-guestplace.conf in VM100. Any address inside
+# the chain's own root-complex aperture works; empty = kernel's first fit (then the guest cannot match).
 CHAIN_A_AT="${CHAIN_A_AT-0x26000000000}"
 CHAIN_B_AT="${CHAIN_B_AT-0x14000000000}"
 # Switch-local P2P: clear ACS ReqRedir/CmpltRedir on the chain's PLX downstream ports so peer traffic between
-# its cards stays inside the switch. Only valid when the VM sees the cards at their HOST addresses (VM100:
-# maxmem=1100G, X-PciMmio64Mb=262144, 48 on p2pdn1, 45 on p2pdn2, c8/c5 on p2pdn3/4), and only while every card on the chain belongs to ONE VM
-# (it removes IOMMU checks on card-to-card DMA). The kernel re-enables ACS on every rescan, so it is re-applied
-# on each run. Set CHAIN_A_P2P=0 to leave ACS alone.
+# its cards stays inside the switch. Only valid when the VM sees the cards at their HOST addresses
+# (r9700_guestplace in the guest), and only while every card on the chain belongs to ONE VM (it removes IOMMU
+# checks on card-to-card DMA). The kernel re-enables ACS on every rescan, so it is re-applied on each run.
+# Set CHAIN_*_P2P=0 to leave ACS alone.
 CHAIN_A_P2P="${CHAIN_A_P2P-1}"
-CHAIN_B_P2P="${CHAIN_B_P2P-0}"
+CHAIN_B_P2P="${CHAIN_B_P2P-1}"
 
 CHAINFIX=r9700_chainfix   # DKMS package r9700-chainfix/1.2 (src /usr/src/r9700-chainfix-1.2), rebuilt per kernel
 
