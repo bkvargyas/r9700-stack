@@ -11,6 +11,8 @@ What the subclasses add, all around construction and weight loading:
   * construction scope: int6 PLE table (ple/int6.py) when the checkpoint's PLE shards are int6, and exact-size
     pinning for vLLM's UVA expert offload (utils/hostmem.py).
   * optional quantized LM heads, R9K_TARGET_LMHEAD / R9K_DRAFT_LMHEAD = fp8|mxfp4 (models/lm_heads.py).
+  * our QSA sparse attention (attn/qsa.py, kernels/r9k_qsa.hip) bound on every full-attention layer's impl
+    after construction; R9K_QSA=stock keeps vLLM's Triton kernel.
 
 Unavoidable internals touched (both scoped to ``__init__`` and restored): the ``PLEVocabParallelEmbedding`` name
 in ``vllm.models.qwen4_exp.amd.ple_layer`` (stock constructs it without a quant config or class hook) and
@@ -31,6 +33,7 @@ from vllm.models.qwen4_exp.amd.model import Qwen4ExpForCausalLM, Qwen4ExpForCond
 from vllm.models.qwen4_exp.amd.mtp import Qwen4ExpMTP
 
 from . import lm_heads
+from ..attn import qsa as _qsa
 
 logger = init_logger("vllm." + __name__)
 
@@ -144,6 +147,7 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
     def __init__(self, *, vllm_config, prefix: str = "model") -> None:
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        _qsa.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -162,6 +166,7 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        _qsa.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -177,6 +182,7 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        _qsa.install(self)
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))
