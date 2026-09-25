@@ -274,11 +274,13 @@ class R9kAllReduceN:
         self.drain, self.acq = 4, 2
         if os.environ.get("R9K_AR_FENCE"):
             self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
-        # Prefill-sized messages: the compressed hierarchical path (comm/r9k_ar4.py, R9K_AR4=1), which beats RCCL's
-        # ring 2.2x at 4 bits / 1.6x at 6 bits (tests/test_ar4.py); the exact kernels cannot on this topology.
+        # Prefill-sized messages: the compressed hierarchical path (comm/r9k_ar4.py), which beats RCCL's ring 2.2x
+        # at 4 bits / 1.6x at 6 bits (tests/test_ar4.py); the exact kernels cannot on this topology. Default since
+        # 2026-09-25 on two null paired evals at conc=1 (300 short: 96.67 -> 96.00%, p=0.69; 800 chain-of-thought:
+        # 97.62 -> 97.62%, 1/1 discordant, p=1.0, 75% of outputs token-identical). R9K_AR4=0 keeps RCCL.
         # Its constructor is collective (all ranks must take the same branch): R9K_AR4 is read on every rank.
         self.ar4 = None
-        if N == 4 and os.environ.get("R9K_AR4", "0") == "1":
+        if N == 4 and os.environ.get("R9K_AR4", "1") == "1":
             from .r9k_ar4 import R9kAllReduce4
             a4 = R9kAllReduce4(group, device)
             if not a4.disabled:

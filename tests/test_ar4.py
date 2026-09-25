@@ -144,6 +144,27 @@ def main():
                 else float("nan")
             if rank == 0:
                 print(f"{mb:>6} {t_rccl:>9.0f} {t_ar4:>9.0f} {t_ex:>11.0f}")
+    if os.environ.get("PHASES", "0") == "1":
+        # eager per-phase breakdown (events between launches); the handshake waits land in the pushing kernels
+        for mb in (5, 11, 21):
+            n = (mb << 20) // 2 // 256 * 256
+            x = torch.randn(n, device=dev).to(torch.bfloat16)
+            acc = {}
+            for it in range(12):
+                tl = []
+                dist.barrier()
+                ar.all_reduce(x, timing=tl)
+                torch.cuda.synchronize()
+                if it >= 2:
+                    for (a, ea), (b, eb) in zip(tl, tl[1:]):
+                        acc[b] = acc.get(b, 0.0) + ea.elapsed_time(eb) * 1e3 / 10
+            tot = sum(acc.values())
+            row = [None] * world
+            dist.all_gather_object(row, acc)
+            if rank == 0:
+                print(f"  phases @ {mb} MB (rank 0 / rank 2, us): total {tot:.0f} / {sum(row[2].values()):.0f}")
+                for k in acc:
+                    print(f"    {k:<8} {acc[k]:7.1f}   {row[2][k]:7.1f}")
     dist.destroy_process_group()
     sys.exit(1 if bad else 0)
 

@@ -2,12 +2,11 @@
 
 Hierarchical 2x2 (see the kernel header and notes/ar4-plan.md): pairs share a PCIe switch, cross partners sit on
 the other switch. Seven launches, four handshakes, 4- or 6-bit Walsh-Hadamard wire, outputs bit-identical on all
-ranks. Selected by R9kAllReduceN for messages above its exact range (R9K_AR4=1, default once validated), for
+ranks. Selected by R9kAllReduceN for messages above its exact range (default; R9K_AR4=0 reverts), for
 bf16/fp16 messages whose element count is a multiple of 4 * 64 and at most R9K_AR4_MAX_MB.
 
 Env:
-  R9K_AR4 (0)            1 = use this path for large messages (read by R9kAllReduceN); default off until the
-                         paired eval passes
+  R9K_AR4 (1)            0 = keep RCCL for large messages (read by R9kAllReduceN)
   R9K_AR4_BITS (4)       4 or 6 bits per element on the wire
   R9K_AR4_MAX_MB (64)    largest message (bf16 bytes) this path accepts; scratch is sized from it
   R9K_AR4_PAIRS          "0,1;2,3": the two same-switch pairs by TP rank (default: consecutive pairs)
@@ -161,7 +160,9 @@ class R9kAllReduce4:
         base = self.flags if who == self.rank else self.peers[who][1]
         return base + phase * self.max_blocks * 4
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
+    def all_reduce(self, x: torch.Tensor, timing: list | None = None) -> torch.Tensor:
+        """timing: if a list is given, a CUDA event is recorded after each launch and appended (eager use only;
+        tests/test_ar4.py PHASES=1 prints the per-phase breakdown)."""
         L, st = self.L, torch.cuda.current_stream().cuda_stream
         n = x.numel()
         G = n // GROUP                 # groups; multiple of 4
@@ -176,6 +177,15 @@ class R9kAllReduce4:
         def chk(rc, what):
             if rc:
                 raise RuntimeError(f"r9k_ar4 {what} failed ({rc})")
+            if timing is not None:
+                e = torch.cuda.Event(enable_timing=True)
+                e.record()
+                timing.append((what, e))
+
+        if timing is not None:
+            e0 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            timing.append(("start", e0))
 
         # P1: push the partner's half (the one it owns) to the pair partner; receive ours
         other_half = 1 - h
