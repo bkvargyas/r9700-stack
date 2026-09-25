@@ -10,7 +10,10 @@ Env:
   R9K_AR4_BITS (4)       4 or 6 bits per element on the wire
   R9K_AR4_MAX_MB (64)    largest message (bf16 bytes) this path accepts; scratch is sized from it
   R9K_AR4_PAIRS          "0,1;2,3": the two same-switch pairs by TP rank (default: consecutive pairs)
-  R9K_AR4_BLOCKS (64)    blocks per phase kernel
+  R9K_AR4_BLOCKS (128)   blocks per phase kernel (64: pushes unchanged, decode/reduce 2x slower; 256: regresses)
+  R9K_AR4_SDMA (0)       1 = pack locally and move the bytes with the DMA engine (hipMemcpyAsync, 11.6 GB/s) with a
+                         one-block flag handshake. Measured slower end to end (11 MB: 757 vs 691 us): pack and copy
+                         no longer overlap and each flag kernel costs 20-28 us. Kept for experiments.
 """
 from __future__ import annotations
 
@@ -46,6 +49,14 @@ def _lib():
     L.r9k_ar4_decode.argtypes = [c_long] * 3 + [c_int, c_int, c_long, c_long, c_int, c_int, c_long]
     L.r9k_ar4_push2.restype = c_int
     L.r9k_ar4_push2.argtypes = [c_long] * 5 + [c_int] + [c_long] * 5 + [c_int, c_long]
+    L.r9k_ar4_pack.restype = c_int
+    L.r9k_ar4_pack.argtypes = [c_long] * 3 + [c_int, c_int, c_long]
+    L.r9k_ar4_reduce_pack.restype = c_int
+    L.r9k_ar4_reduce_pack.argtypes = [c_long] * 4 + [c_int, c_int, c_long]
+    L.r9k_ar4_flag.restype = c_int
+    L.r9k_ar4_flag.argtypes = [c_long] * 5
+    L.r9k_ar4_dma.restype = c_int
+    L.r9k_ar4_dma.argtypes = [c_long] * 4
     # IPC helpers shared with r9k_ar.hip
     L.r9k_ar_ipc_handle_size.restype = c_int
     L.r9k_ar_ipc_alloc.restype = c_int
@@ -82,7 +93,8 @@ class R9kAllReduce4:
         if self.bits not in (4, 6):
             raise RuntimeError(f"R9K_AR4_BITS={self.bits} unsupported (4 or 6)")
         self.max_bytes = int(float(os.environ.get("R9K_AR4_MAX_MB", "64")) * 2**20)
-        self.nblocks = min(int(os.environ.get("R9K_AR4_BLOCKS", "64")), L.r9k_ar4_max_blocks())
+        self.nblocks = min(int(os.environ.get("R9K_AR4_BLOCKS", "128")), L.r9k_ar4_max_blocks())
+        self.sdma = os.environ.get("R9K_AR4_SDMA", "0") == "1"
         pairs = _pairs(self.world)
         pos = {r: (pi, h) for pi, p in enumerate(pairs) for h, r in enumerate(p)}
         if len(pos) != 4:
@@ -140,10 +152,14 @@ class R9kAllReduce4:
         # one sequence counter array per phase (device-resident, graph-safe)
         self.seq = torch.zeros((4, self.max_blocks), dtype=torch.int32, device=self.device)
         self.partial = torch.empty(max_groups // 2 * GROUP, dtype=torch.bfloat16, device=self.device)
-        self.own_packed = torch.empty(2 * self.stride[self.P3], dtype=torch.uint8, device=self.device)
+        self.own_packed = torch.empty(self.stride[self.P3], dtype=torch.uint8, device=self.device)
+        # DMA mode sources: packed half (P1) and packed quarter (P2)
+        self.pk_half = torch.empty(self.stride[self.P1], dtype=torch.uint8, device=self.device)
+        self.pk_quarter = torch.empty(self.stride[self.P2], dtype=torch.uint8, device=self.device)
         self.disabled = False
-        logger.info("r9700: ar4 compressed all-reduce installed (rank %d, %d-bit, pair %d cross %d, <= %d MiB)",
-                    self.rank, self.bits, self.pair_peer, self.cross_peer, self.max_bytes >> 20)
+        logger.info("r9700: ar4 compressed all-reduce installed (rank %d, %d-bit, pair %d cross %d, <= %d MiB, %s)",
+                    self.rank, self.bits, self.pair_peer, self.cross_peer, self.max_bytes >> 20,
+                    "dma pushes" if self.sdma else "fused pushes")
 
     def should(self, x: torch.Tensor) -> bool:
         if self.disabled or x.dtype not in _DTYPE or not x.is_contiguous():
@@ -186,6 +202,8 @@ class R9kAllReduce4:
             e0 = torch.cuda.Event(enable_timing=True)
             e0.record()
             timing.append(("start", e0))
+        if self.sdma:
+            return self._all_reduce_dma(x, out, G, chk)
 
         # P1: push the partner's half (the one it owns) to the pair partner; receive ours
         other_half = 1 - h
@@ -227,4 +245,55 @@ class R9kAllReduce4:
             qk = 2 * other_h + k
             chk(L.r9k_ar4_decode(self._recv(self.P4, self.rank) + k * pb_q, self.stride[self.P4], seq[self.P4].data_ptr(),
                                  0, 1, gq, out.data_ptr() + qk * gq * GROUP * 2, bits, nb, st), f"D4 q{qk}")
+        return out
+
+    def _all_reduce_dma(self, x: torch.Tensor, out: torch.Tensor, G: int, chk) -> torch.Tensor:
+        """Same four phases, bytes moved by the DMA engine; receive areas single-buffered (see the kernel header)."""
+        L, st = self.L, torch.cuda.current_stream().cuda_stream
+        gh, gq = G // 2, G // 4
+        h, q, nb, bits, seq = self.half, self.quarter, self.nblocks, self.bits, self.seq
+        xp, pp = x.data_ptr(), self.partial.data_ptr()
+        pb_h, pb_q = int(L.r9k_ar4_packed_bytes(gh, bits)), int(L.r9k_ar4_packed_bytes(gq, bits))
+        r1_peer, r1_me = self._recv(self.P1, self.pair_peer), self._recv(self.P1, self.rank)
+        r2_peer, r2_me = self._recv(self.P2, self.cross_peer), self._recv(self.P2, self.rank)
+        r3_peer, r3_me = self._recv(self.P3, self.cross_peer), self._recv(self.P3, self.rank)
+        r4_peer, r4_me = self._recv(self.P4, self.pair_peer), self._recv(self.P4, self.rank)
+        # P1: pack the partner's half locally, DMA it over, handshake
+        chk(L.r9k_ar4_pack(xp + (1 - h) * gh * GROUP * 2, gh, self.pk_half.data_ptr(), bits, nb, st), "P1 pack")
+        chk(L.r9k_ar4_dma(r1_peer, self.pk_half.data_ptr(), pb_h, st), "P1 dma")
+        chk(L.r9k_ar4_flag(self._flags(self.P1, self.pair_peer), self._flags(self.P1, self.rank),
+                           seq[self.P1].data_ptr(), r1_peer + pb_h - 16, st), "P1 flag")
+        # R1: pair partial of our half (single-buffered area: stride 0 makes the parity offset vanish)
+        chk(L.r9k_ar4_reduce_bf16(xp + h * gh * GROUP * 2, r1_me, 0, seq[self.P1].data_ptr(), 0, gh, pp, bits, nb, st),
+            "R1")
+        # P2: the cross partner's quarter of our partial
+        other_q = 1 - self.pair_idx
+        chk(L.r9k_ar4_pack(pp + other_q * gq * GROUP * 2, gq, self.pk_quarter.data_ptr(), bits, nb, st), "P2 pack")
+        chk(L.r9k_ar4_dma(r2_peer, self.pk_quarter.data_ptr(), pb_q, st), "P2 dma")
+        chk(L.r9k_ar4_flag(self._flags(self.P2, self.cross_peer), self._flags(self.P2, self.rank),
+                           seq[self.P2].data_ptr(), r2_peer + pb_q - 16, st), "P2 flag")
+        # R2 + P3: final quarter packed locally, DMA to the cross partner, handshake
+        chk(L.r9k_ar4_reduce_pack(pp + self.pair_idx * gq * GROUP * 2, r2_me, gq, self.own_packed.data_ptr(), bits, nb,
+                                  st), "R2")
+        chk(L.r9k_ar4_dma(r3_peer, self.own_packed.data_ptr(), pb_q, st), "P3 dma")
+        chk(L.r9k_ar4_flag(self._flags(self.P3, self.cross_peer), self._flags(self.P3, self.rank),
+                           seq[self.P3].data_ptr(), r3_peer + pb_q - 16, st), "P3 flag")
+        # D3: our quarter (own packed bytes) and the cross partner's
+        chk(L.r9k_ar4_decode(self.own_packed.data_ptr(), 0, seq[self.P3].data_ptr(), 0, 0, gq,
+                             out.data_ptr() + q * gq * GROUP * 2, bits, nb, st), "D3 own")
+        cross_q = 2 * h + (1 - self.pair_idx)
+        chk(L.r9k_ar4_decode(r3_me, 0, seq[self.P3].data_ptr(), 0, 0, gq, out.data_ptr() + cross_q * gq * GROUP * 2,
+                             bits, nb, st), "D3 cross")
+        # P4: forward our half as [q_lo][q_hi] to the pair partner: own packed quarter + the cross partner's
+        mine_off, other_off = (0, pb_q) if self.pair_idx == 0 else (pb_q, 0)
+        chk(L.r9k_ar4_dma(r4_peer + mine_off, self.own_packed.data_ptr(), pb_q, st), "P4 dma own")
+        chk(L.r9k_ar4_dma(r4_peer + other_off, r3_me, pb_q, st), "P4 dma fwd")
+        chk(L.r9k_ar4_flag(self._flags(self.P4, self.pair_peer), self._flags(self.P4, self.rank),
+                           seq[self.P4].data_ptr(), r4_peer + 2 * pb_q - 16, st), "P4 flag")
+        # D4: the partner's two quarters
+        other_h = 1 - h
+        for k in range(2):
+            qk = 2 * other_h + k
+            chk(L.r9k_ar4_decode(r4_me + k * pb_q, 0, seq[self.P4].data_ptr(), 0, 0, gq,
+                                 out.data_ptr() + qk * gq * GROUP * 2, bits, nb, st), f"D4 q{qk}")
         return out

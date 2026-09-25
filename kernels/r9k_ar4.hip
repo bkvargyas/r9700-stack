@@ -369,6 +369,89 @@ __global__ void __launch_bounds__(NT) ar4_push2_kernel(
   __syncthreads();
 }
 
+// ---------------------------------------------------------------- DMA-push variant (R9K_AR4_SDMA)
+// A shader storing 16-byte lanes into a peer's BAR tops out at ~9 GB/s on this fabric while hipMemcpyAsync (the
+// SDMA engine) reaches the 13.5 GB/s link rate (tuning/ar_push_bench.py, and the per-phase timings of the fused
+// kernels above at any block count). So: pack into a LOCAL buffer, let the DMA engine move it, and handshake with a
+// one-block flag kernel. The receive areas are single-buffered in this mode -- with the four handshakes in
+// sequence every consumer of an area finishes before its producer can begin the next call's copy (each write of
+// call s+1 is ordered after a wait that the consumer publishes only after its read of call s) -- so the DMA
+// destinations are fixed addresses and the sequence is cudagraph-safe.
+
+// Pack `ngroups` groups of `x` into a local packed buffer (codes then scales, 16-byte aligned regions).
+template <int B>
+__global__ void __launch_bounds__(NT) ar4_pack_kernel(const uint16_t* __restrict__ x, long ngroups,
+                                                      u8* __restrict__ out) {
+  __shared__ __attribute__((aligned(16))) u8 lds_codes[GPB * Wire<B>::cbytes];
+  __shared__ __attribute__((aligned(16))) uint16_t lds_scales[GPB];
+  u8* out_scales = out + codes_bytes(ngroups, Wire<B>::cbytes);
+  const long iters = (ngroups + GPB - 1) / GPB;
+  for (long it = blockIdx.x; it < iters; it += gridDim.x) {
+    const long g0 = it * GPB;
+    const int gn = (int)min((long)GPB, ngroups - g0);
+    pack_block<B>(x, g0, ngroups, lds_codes, lds_scales);
+    __syncthreads();
+    lds_to_global16(lds_codes, out + g0 * Wire<B>::cbytes, (int)align16((long)gn * Wire<B>::cbytes));
+    lds_to_global16(reinterpret_cast<const u8*>(lds_scales), out_scales + g0 * 2, (int)align16((long)gn * 2));
+    __syncthreads();
+  }
+}
+
+// R2 (DMA mode): final quarter = own partial quarter + received (single-buffered `recv`), quantised into `out`.
+template <int B>
+__global__ void __launch_bounds__(NT) ar4_reduce_pack_kernel(
+    const uint16_t* __restrict__ own, const u8* __restrict__ recv, long ngroups, u8* __restrict__ out) {
+  __shared__ __attribute__((aligned(16))) u8 lds_codes[GPB * Wire<B>::cbytes];
+  __shared__ __attribute__((aligned(16))) uint16_t lds_scales[GPB];
+  const u8* recv_scales = recv + codes_bytes(ngroups, Wire<B>::cbytes);
+  u8* out_scales = out + codes_bytes(ngroups, Wire<B>::cbytes);
+  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
+  const long iters = (ngroups + GPB - 1) / GPB;
+  for (long it = blockIdx.x; it < iters; it += gridDim.x) {
+    const long g0 = it * GPB;
+    const int gn = (int)min((long)GPB, ngroups - g0);
+#pragma unroll
+    for (int i = 0; i < GPW; i++) {
+      const int gl = wave * GPW + i;
+      const long g = g0 + gl;
+      if (g >= ngroups) break;
+      float a = bf2f(own[g * GROUP + lane]), bb = bf2f(own[g * GROUP + 32 + lane]);
+      wht64(a, bb, lane);
+      a *= 0.125f; bb *= 0.125f;
+      int ca, cbb;
+      codes_from<B>(recv + g * Wire<B>::cbytes, lane, ca, cbb);
+      const float sc = bf2f(reinterpret_cast<const uint16_t*>(recv_scales)[g]);
+      a += (float)ca * sc;
+      bb += (float)cbb * sc;
+      const float amax = wave_amax(a, bb);
+      u32 qa, qb; float scale;
+      quant2<B>(a, bb, amax, qa, qb, scale);
+      codes_to_lds<B>(qa, qb, lane, lds_codes + gl * Wire<B>::cbytes);
+      if (lane == 0) lds_scales[gl] = f2bf(scale);
+    }
+    __syncthreads();
+    lds_to_global16(lds_codes, out + g0 * Wire<B>::cbytes, (int)align16((long)gn * Wire<B>::cbytes));
+    lds_to_global16(reinterpret_cast<const u8*>(lds_scales), out_scales + g0 * 2, (int)align16((long)gn * 2));
+    __syncthreads();
+  }
+}
+
+// Handshake after a DMA copy: one block. `check` (may be 0) is the last 16-byte word of the region we just copied
+// into the peer -- reading it back forces our earlier posted writes on the link to complete before the flag goes
+// out (a PCIe read request cannot pass posted writes on the same path). Then publish and wait for the peer's flag.
+__global__ void ar4_flag_kernel(u32* __restrict__ peer_flags, u32* __restrict__ flags, int* __restrict__ seq,
+                                const uint4* __restrict__ check) {
+  if (threadIdx.x != 0) return;
+  const int s = seq[0]++;
+  if (check) {
+    const volatile u32* c = reinterpret_cast<const volatile u32*>(check);
+    const u32 v0 = c[0], v1 = c[1], v2 = c[2], v3 = c[3];
+    if (v0 == 0xFFFFFFFFu && v1 == 0xFFFFFFFFu && v2 == 0xFFFFFFFFu && v3 == 0x12345678u) flags[1] = 0;  // never
+  }
+  publish(peer_flags, (u32)(s + 1));
+  wait_for(flags, (u32)(s + 1));
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------- C entry points (pointers as integers)
@@ -452,4 +535,33 @@ extern "C" int r9k_ar4_push2(long own, long recv3_base, long recv3_stride, long 
       (const u8*)own, (const u8*)recv3_base, recv3_stride, (const int*)seq3, qbytes, own_first, (u8*)peer_recv,
       recv_stride, (u32*)peer_flags, (u32*)flags, (int*)seq);
   return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+extern "C" int r9k_ar4_pack(long x, long ngroups, long out, int bits, int nblocks, long stream) {
+  AR4_CHECK
+  hipStream_t st = (hipStream_t)stream;
+  if (bits == 4) ar4_pack_kernel<4><<<nblocks, NT, 0, st>>>((const uint16_t*)x, ngroups, (u8*)out);
+  else ar4_pack_kernel<6><<<nblocks, NT, 0, st>>>((const uint16_t*)x, ngroups, (u8*)out);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+extern "C" int r9k_ar4_reduce_pack(long own, long recv, long ngroups, long out, int bits, int nblocks, long stream) {
+  AR4_CHECK
+  hipStream_t st = (hipStream_t)stream;
+  if (bits == 4)
+    ar4_reduce_pack_kernel<4><<<nblocks, NT, 0, st>>>((const uint16_t*)own, (const u8*)recv, ngroups, (u8*)out);
+  else
+    ar4_reduce_pack_kernel<6><<<nblocks, NT, 0, st>>>((const uint16_t*)own, (const u8*)recv, ngroups, (u8*)out);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+extern "C" int r9k_ar4_flag(long peer_flags, long flags, long seq, long check, long stream) {
+  ar4_flag_kernel<<<1, 32, 0, (hipStream_t)stream>>>((u32*)peer_flags, (u32*)flags, (int*)seq, (const uint4*)check);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// DMA copy on the stream (SDMA engine): device -> peer-mapped device memory
+extern "C" int r9k_ar4_dma(long dst, long src, long nbytes, long stream) {
+  return hipMemcpyAsync((void*)dst, (const void*)src, (size_t)nbytes, hipMemcpyDeviceToDevice, (hipStream_t)stream)
+             == hipSuccess ? 0 : -6;
 }
