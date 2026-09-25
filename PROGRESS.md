@@ -378,6 +378,24 @@ Prefill is at parity with Rob's image through 8k (5,279 / 5,711) and 4-9% behind
 -13..-15% under sampling remain. Removing the CPU floor itself (capturing prefill chunks in cudagraphs
 at 1024/2048/4096) is being measured; it is what would pass Rob at short prompts.
 
+### 2026-09-25: final default and where it stands
+
+Default now: our QSA attention, N-rank + compressed (4-bit) all-reduce, hybrid block-fp8, mxfp4 LM heads, fused
+qk-norm/rope, prefix caching off, prefill cudagraphs to 2048 tokens, vLLM 0.30. Full 20-pass BetterBench, same box
+and checkpoint as Rob's image (tcclaviger 29.04.4, MTP-4, fp8 KV, expert offload):
+
+| | ours (2026-09-24 morning) | **ours now** | Rob's image |
+|---|--:|--:|--:|
+| decode score | 125.1 | 125.0 | 134.1 |
+| step p50 | 21.22 ms | 21.15 ms | 20.44 ms |
+| TTFT p50 | 137 ms | **104 ms** | 145 ms |
+| prefill 2k / 8k / 16k / 32k | 2,853 / 4,637 / 4,701 / 4,614 | **5,106 / 5,624 / 5,726 / 5,532** | 5,279 / 5,711 / 5,977 / 6,106 |
+| concurrency 1 / 2 / 4 / 8 / 16 | 117 / 193 / 283 / 374 / 478 | **118 / 197 / 292 / 433 / 543** | 126 / 197 / 303 / 427 / 542 |
+
+Concurrency at parity, TTFT 28% better, prefill within 1.5-9%, single-stream decode 7% behind (his MTP-4 vs our
+MTP-3; our MTP-4 probe: +9% single-stream, -8% concurrency). Every lossy default passed two null paired evals at
+conc=1 (300 short-answer, 800 chain-of-thought); the served config's sanity check passes.
+
 ### Next
 1. Long-chain paired eval (`EVAL_THINK=1`, 800 q) of the candidate config; then make it the default.
 2. Prefill CPU floor (~285 ms per forward): cudagraph capture of prefill chunks, or less Python per op. The
