@@ -4,7 +4,7 @@
 # "hidden_global_offset_x" so the runtime never sets up hostcall for those kernels (none of them calls printf/
 # malloc on device; the buffer is only requested because of -O0/assert paths). BINARY PATCH: overlay-only.
 set -e
-IMG=${IMG:-vllm/vllm-openai-rocm:nightly-rocm100-dee37d89115db4c94a820a79a78a7828e141c910}
+IMG=${IMG:-vllm/vllm-openai-rocm:nightly-rocm100-e9757321527ca1ecd514c07c1418dd2c53da3d19}
 OUT=${OUT:-$HOME/p2p-patched-nightly}
 mkdir -p "$OUT"
 docker run --rm --entrypoint bash -v "$OUT":/out -v "$(dirname "$(realpath "$0")")/hcnames.sh":/h.sh "$IMG" -c '

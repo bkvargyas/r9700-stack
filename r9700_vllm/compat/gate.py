@@ -13,7 +13,7 @@ logger = init_logger("vllm." + __name__)
 
 TESTED = {
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
-    "mtp_allowlist": (("dee37d891",), "vllm-project/vllm#55292"),
+    "mtp_allowlist": (("dee37d891", "e97573215"), "vllm-project/vllm#55292"),
 }
 
 

@@ -4,6 +4,8 @@
 SDKLIB=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_libraries/lib
 VLIB=/usr/local/lib/python3.12/dist-packages/vllm
 RCCL=${RCCL:-$HOME/rccl10/rocm-systems/projects/rccl/build-nightly/librccl.so.1.0}
+# PATCHED must match the served image's vLLM build (patch-hostcall.sh, one dir per image); on VM100
+# ~/p2p-patched-nightly is a symlink to the current one (2026-09-25: ~/p2p-patched-030 for the vLLM 0.30 nightly).
 PATCHED=${PATCHED:-$HOME/p2p-patched-nightly}
 [ -f "$RCCL" ] || { echo "overlay emulated-switch: $RCCL missing (run rccl/build-nightly.sh)" >&2; exit 1; }
 [ -f "$PATCHED/_rocm_C.abi3.so" ] || { echo "overlay emulated-switch: run patch-hostcall.sh" >&2; exit 1; }
