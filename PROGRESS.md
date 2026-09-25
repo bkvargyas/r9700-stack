@@ -322,10 +322,35 @@ BetterBench is reserved for a finalist. Step time is single-request MTP-3 (`~/tp
 - Prefill gap that remains (12.7k tokens, rank 0): all-reduce 1,019 ms (RCCL) vs Rob's 607 (compressed two-shot);
   attention now ~250 vs his 159; MoE/dense/elementwise ~180 ms combined.
 
+### 2026-09-25: compressed hierarchical all-reduce, vLLM 0.30 default
+
+- **Base image switched to the vLLM 0.30 nightly** (`nightly-rocm100-e975732`, torch 2.12). Final-config probe on
+  it: 21.60 ms/step, 148.0 / 484 / 752 / 4,685 -- identical to the dee37d89 image. On VM100 `r9700/vllm:dev` is now
+  the 0.30 build (old image kept as `dev-0918`), `~/p2p-patched-nightly` links to the 0.30 patched extensions.
+- **`kernels/r9k_ar4.hip` + `comm/r9k_ar4.py`: the all-reduce from notes/ar4-plan.md.** Hierarchical 2x2 over the
+  switch pairs, Walsh-Hadamard 4/6-bit wire fused into the push kernels (two elements per lane; no LDS in the
+  transform), rotated-domain sums, seven launches, four handshakes, bit-identical outputs on all ranks.
+  `tests/test_ar4.py` (torchrun, 4 ranks): PASS at 4 and 6 bits, graph replay interleaved with the exact kernels.
+
+| message | RCCL | ar4 4-bit | ar4 6-bit | exact two-shot |
+|---|--:|--:|--:|--:|
+| 1 MB | 204 us | 118 | 143 | 222 |
+| 5 MB | 773 | 371 | 495 | 1,194 |
+| 11 MB | 1,640 | **739** | 1,009 | 2,723 |
+| 21 MB | 3,107 | **1,352** | 1,863 | -- |
+
+  Rob's kernel: ~580 / ~1,200 us at 11 / 21 MB. Relative RMS error on a heavy-tailed input: 0.12 (4-bit), 0.027
+  (6-bit); an already-quantised input round-trips to bf16 rounding.
+- **Serving (Flash-Next TP=4 probe):** 8k prefill 4,685 -> **5,621 tok/s with 4-bit (+20%)**, 5,319 with 6-bit;
+  decode 147-149, c8 497-506, c16 738-768 -- unchanged within noise. Prefill is now 87% of Rob's image (from 73%).
+- **Quality (300 GSM8K, conc=1, same image):** default 96.67% vs 4-bit 96.00%, discordant 4/2, McNemar p=0.69: no
+  detectable difference. The 800-question chain-of-thought paired eval decides whether R9K_AR4 becomes the default
+  (opt-in `R9K_AR4=1` until then; `R9K_AR4_BITS=6` is the conservative wire).
+
 ### Next
 1. Long-chain paired eval (`EVAL_THINK=1`, 800 q) of the candidate config; then make it the default.
-2. **Prefill all-reduce (the next kernel):** compressed, topology-aware 4-rank two-shot. Targets: 0.58 ms at 11 MB,
-   1.2 ms at 21 MB (Rob's). Worth ~25-35% prefill. Needs a paired eval (quantizes twice).
+2. Prefill all-reduce: built (r9k_ar4). Remaining: long-chain eval -> default; close the last ~25% to Rob's per-call
+   time (his 0.58 ms at 11 MB vs our 0.74); short-prompt (2k) prefill re-measured with BetterBench.
 3. Single-request decode: remaining 0.8 ms/step + MTP-4 acceptance (his 3.35 vs our 3.13 tok/step).
 4. Switch the default base image to vLLM 0.30.
 
