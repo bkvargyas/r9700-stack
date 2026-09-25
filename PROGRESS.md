@@ -372,7 +372,10 @@ Fixes measured (TTFT, tokens -> ms): 1,325: 563 -> 313; 2,166: 564 -> 373; 3,086
 | KV cache capacity | 296k tokens | 99k (mamba pages padded 9x) | 296k |
 
 `serve/flashnext.sh` now defaults `PREFIX_CACHE=0` (serve.sh knob; `=1` restores prefix reuse across requests --
-a serving-behaviour change, flagged to Brian). Removing the CPU floor itself (capturing prefill chunks in cudagraphs
+a serving-behaviour change, flagged to Brian). **Full BetterBench of this default:** decode 125.1, step p50 21.12 ms,
+TTFT 144 ms, prefill 5,267 / 5,702 / 5,723 / 5,530 (2k / 8k / 16k / 32k), concurrency 116 / 190 / 277 / 370 / 463.
+Prefill is at parity with Rob's image through 8k (5,279 / 5,711) and 4-9% behind at 16-32k; decode -7%, concurrency
+-13..-15% under sampling remain. Removing the CPU floor itself (capturing prefill chunks in cudagraphs
 at 1024/2048/4096) is being measured; it is what would pass Rob at short prompts.
 
 ### Next
