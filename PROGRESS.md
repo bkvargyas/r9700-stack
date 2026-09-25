@@ -264,12 +264,71 @@ peer traffic only stays in the switch with ACS redirect off **and** guest GPU ad
   OVMF packs its 64-bit window contiguously and the two banks' host apertures are ~0.5 TB apart).
 - Correction carried forward: the 2026-09-18 Flash-Next "P2P gives nothing" A/B is invalid (P2P IPC in both arms).
 
+### 2026-09-24: Flash-Next at TP=4 on four cards (target: tcclaviger 29.04.4 on the same box)
+
+Rob's published Flash-Next TP4/MTP4 run (163.8 BetterBench decode, 687 @16, 7.2k prefill) is on his hardware; his
+image on OUR box (`~/serve-rob-tp4.sh`, hostcall-patched copies in `~/p2p-patched-2904`) is the real target. All
+numbers below are the 1-minute probe (`~/probe.py`: 4 mixed prompts greedy / conc 8 and 16 / one 8.7k prefill);
+BetterBench is reserved for a finalist. Step time is single-request MTP-3 (`~/tp4tune.sh` step.txt).
+
+| config | step ms | dec 1 | c8 | c16 | prefill 8k |
+|---|--:|--:|--:|--:|--:|
+| ours, start of day (TP=4, RCCL all-reduce, stock QSA) | 28.1 | -- | 299* | 508* | 3,767* |
+| + our 4-rank P2P all-reduce | 22.9 | 140 | 299 | 508 | 3,767 |
+| + our QSA sparse attention | 22.9 | 139 | 479 | 770 | 4,689 |
+| + hybrid block-fp8 + mxfp4 heads + fused qk-norm/rope | **21.6** | **148** | **501** | **770** | **4,688** |
+| Rob's image (29.04.4, MTP-4, fp8 KV, expert offload) | 20.8 | 169 | 503 | 769 | 6,446 |
+
+(*) measured after the all-reduce change; the RCCL baseline's probe was not run.
+
+- **N-rank P2P all-reduce** (`kernels/r9k_ar.hip` `r9k_ar_oneshot_nrank` / `r9k_ar_twoshot_nrank`, `comm/r9k_ar.py`
+  `R9kAllReduceN`, installed for TP>2): one-shot <= 16 KB, two-shot <= 512 KB, RCCL above. Graph-timed at 20 KB
+  11 us vs RCCL 73; 320 KB 73 vs 102. Decode step 28.1 -> 22.9 ms. At prefill sizes (20 MB) the exact two-shot
+  loses to RCCL's ring (4.05 vs 2.97 ms even at 256 blocks): the all-to-all push saturates the inter-switch uplink.
+  Only compression or a topology-aware schedule would win there; parked.
+- **Our QSA sparse attention** (`kernels/r9k_qsa.hip`, `attn/qsa.py`, bound per layer; `R9K_QSA=stock` reverts).
+  Reformulation: a row's selection is a union of whole 4-token groups plus the causal tail, so each row becomes a
+  bitmap over groups and a tile of 16 rows walks the UNION of its groups, staging K/V once per tile (the stock
+  Triton kernel gathers ~2 MB per row per layer). Bit-for-bit the same attended set; fp32 online softmax either
+  way. 3.6x on the 12k prefill chunk (14.0 -> 3.9 ms), 13x on a 4k prefill, 2.4x decode; `tests/test_qsa_r9k.py`.
+  Bug found on the way and worth remembering: a row that has met no valid key yet (m = -inf) riding along another
+  row's rescale computes exp2(-inf - -inf) = NaN; impossible in causal attention (every row sees key 0 first),
+  routine in QSA. Guarded.
+- **Decode profile, ours vs Rob (torch profiler, `~/step-audit.py` per-layer):** GPU time per layer is at parity
+  (415 vs 462 us, his including ~62 us of host expert streaming); we launch 78 kernels per layer to his 37. Enabling
+  stock's fused qk-norm/rope Triton kernel on ROCm (`R9K_FUSED_QKROPE`, off in stock only because of an
+  `is_cuda()` check; `tests/test_fused_qk_rope.py`) removed ~30 launches per QSA layer for ~0.06 ms/step: launch
+  count is worth far less than assumed. The remaining eager glue is the indexer's norm + rope; not worth fusing.
+- **Knobs that paid:** `R9K_FP8_BLOCK=block` (exact block scales, our split-K GEMM) at decode widths with stock's
+  Triton kernel above M=64 (`R9K_FP8_BLOCK_MAXM`); the dispatch lives INSIDE a custom op (`r9700.fp8_block_dispatch`,
+  layer registry keyed by registration index) because a Python branch on M in compiled code is resolved once at the
+  M=4096 profile pass and then serves decode with the wrong kernel, and because `id(layer)` baked into the AOT
+  artifact differs per rank process. mxfp4 LM heads (`R9K_TARGET_LMHEAD` / `R9K_DRAFT_LMHEAD`) halve the head's bytes.
+- **Knobs that did not:** MTP-4 (acceptance up, step +1.7 ms, net loss); fp8 or mxfp4 for the hyper-connection
+  mixers (latency-bound at these sizes; the merged down+inject matrix is 324 rows and fails the %16 check anyway);
+  MoE decode config sweep for TP=4 shapes (`tuning/decode_moe_sweep.py`: served configs within 2-11% of best;
+  gate_up now keyed by N in `moe/experts.py`); fp8 KV is refused by stock QSA ("requires a BF16 main KV cache").
+- **Quality gate** (`bench/eval.py`, 300 GSM8K, conc=1): reference 96.0% vs candidate 97.0%, McNemar p=0.51, sanity
+  8/8 both. Long-chain paired eval still to run before the candidate becomes the default.
+- **vLLM 0.30** (`nightly-rocm100-e975732`, torch 2.12): whole stack runs unchanged (`r9700/vllm:dev030`,
+  `~/p2p-patched-030`); probe at parity with the 0.29-era nightly.
+- **Full BetterBench (20 passes), final default vs Rob's image, same box:** decode 125.1 vs 134.1; step p50 21.22
+  vs 20.44 ms; TTFT p50 137 vs 145 ms; prefill 2,853 / 4,637 / 4,701 / 4,614 vs 5,279 / 5,711 / 5,977 / 6,106
+  (2k / 8k / 16k / 32k); concurrency 117 / 193 / 283 / 374 / 478 vs 126 / 197 / 303 / 427 / 542 (1 / 2 / 4 / 8 / 16).
+  The greedy probe overstated concurrency parity (-12% under sampling); short prefill (2k) is the worst ratio.
+- **2k prefill profile (2,142 tokens, rank 0): our all-reduce is 387 ms of 671 ms GPU time (222 RCCL calls at
+  1.73 ms for 11 MB messages); Rob's 116 ms (0.58 ms per call, compressed two-shot).** Everything else is within
+  ~50 ms of his. The short-prefill 2x is the all-reduce alone.
+- Prefill gap that remains (12.7k tokens, rank 0): all-reduce 1,019 ms (RCCL) vs Rob's 607 (compressed two-shot);
+  attention now ~250 vs his 159; MoE/dense/elementwise ~180 ms combined.
+
 ### Next
-1. Unit tests on GPU; VM100 RAM 128 -> 256 GB (host has 364 GB free) so experts (70 GB) + PLE (42 GB) fit pinned.
-2. Stock + plugin bring-up (eager), correctness (GSM8K subset, needle), then cudagraphs + MTP.
-3. Perf: rocprof of our stack vs tcclaviger; fused LRU+align, fused silu-quant, QSA fp8 KV + WMMA indexer,
-   GDN HIP (libr4d), FP8 GEMM path, P2P AR communicator.
+1. Long-chain paired eval (`EVAL_THINK=1`, 800 q) of the candidate config; then make it the default.
+2. **Prefill all-reduce (the next kernel):** compressed, topology-aware 4-rank two-shot. Targets: 0.58 ms at 11 MB,
+   1.2 ms at 21 MB (Rob's). Worth ~25-35% prefill. Needs a paired eval (quantizes twice).
+3. Single-request decode: remaining 0.8 ms/step + MTP-4 acceptance (his 3.35 vs our 3.13 tok/step).
+4. Switch the default base image to vLLM 0.30.
 
 ### Open questions for Brian
-- Licenses: libr4d (StillDeadcode) and vllm-mxfp4 (GGZ14) have none — our MoE kernel is derived from libr4d.
-- Canonical checkpoint: tcclaviger GPTQ int6-PLE (current) vs MXFP4-FP8 vs davetha heretic2.
+- mxfp4 for the TARGET LM head (Rob's w4a16 does the same): ~0.5 ms/step, changes logits; eval says null so far.
+- Whether to spend on the compressed prefill all-reduce (estimated ~8% prefill) vs the 27B.
