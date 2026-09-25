@@ -61,6 +61,12 @@ if [ -n "$CHAT_TEMPLATE" ]; then MNT+=(-v "$CHAT_TEMPLATE:/opt/chat_template.jin
 # OFFLOAD_GB=0: no expert offload (models that fit in VRAM, e.g. the dense 27B checkpoints)
 OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts)
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
+# PREFIX_CACHE=0: disable prefix caching. On hybrid (GDN + attention) models prefix caching puts the mamba cache in
+# "align" mode, and the scheduler then aligns every prefill chunk end to the mamba block size, so a prompt that is
+# not a multiple of it costs an extra forward pass (~285 ms of CPU-bound Python each; a 1.5k prompt ran as two).
+# Measured 2026-09-25 (Flash-Next TP=4): 1325-token TTFT 563 -> 313 ms, 3086 tokens 564 -> 512 ms; KV capacity
+# unchanged (the alternative, --block-size 4096, pads the mamba pages 9x and loses 2/3 of the KV cache).
+[ "${PREFIX_CACHE:-1}" = 0 ] && ARGS+=(--no-enable-prefix-caching)
 # CGMODE=PIECEWISE|FULL|FULL_DECODE_ONLY|FULL_AND_PIECEWISE|NONE -- how much of the model is captured into HIP
 # graphs. Decode is captured either way; the interesting part is whether PREFILL / mixed batches are, because an
 # eager prefill forward is ~1950 kernel launches and about 46 ms of launch gaps on a short prompt (see

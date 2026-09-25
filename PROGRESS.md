@@ -347,10 +347,39 @@ BetterBench is reserved for a finalist. Step time is single-request MTP-3 (`~/tp
   detectable difference. The 800-question chain-of-thought paired eval decides whether R9K_AR4 becomes the default
   (opt-in `R9K_AR4=1` until then; `R9K_AR4_BITS=6` is the conservative wire).
 
+### 2026-09-25 (cont.): the short-prefill floor, root-caused
+
+BetterBench 2k prefill was 2,779 tok/s against Rob's 5,279 while 8k+ was within 3-8%. A TTFT-vs-length sweep
+(`~/pfsweep.py`) showed TTFT quantized: ~285 ms for anything up to ~700 tokens, ~563 ms for 1.3k-3.1k tokens
+regardless of length, then linear at ~5,650 tok/s. Two mechanisms, found with the torch profiler's CPU-side trace:
+
+- **The prefill forward pass is CPU-bound at ~285 ms.** For a 672-token prefill the CPU issued ops for 407 of the
+  426 ms span: 20,230 CPU ops per forward (compiled-graph pieces 267 ms, MoE Python 96, GDN 77, 351 unquantized
+  GEMM dispatches 54, 101 all-reduces 32). Decode hides this behind cudagraphs; prefill runs the compiled graph
+  eagerly. The rank skew this creates is what the all-reduce kernels spin on (ar4_pack_push at 498 us per call in
+  the profile against ~40 us in the bench). Rob's stack has the same floor: his linear rate is 5,711 tok/s.
+- **Prompts were split at the mamba block size.** With prefix caching on (default), the hybrid model runs the mamba
+  cache in "align" mode and vLLM's scheduler aligns every chunk end to the mamba block size, so a 1,302-token prompt
+  ran as two forward passes (202 all-reduces, 98 MoE calls, 26 QSA calls: exactly 2x the 672-token run), each paying
+  the CPU floor. `--mamba-block-size` is ignored in align mode.
+
+Fixes measured (TTFT, tokens -> ms): 1,325: 563 -> 313; 2,166: 564 -> 373; 3,086: 564 -> 512 (6,022 tok/s).
+
+| | before | `--block-size 4096` | **`--no-enable-prefix-caching`** |
+|---|--:|--:|--:|
+| 1,325 tokens | 563 ms | 296 | 313 |
+| 3,086 tokens | 564 ms | 510 | 512 |
+| KV cache capacity | 296k tokens | 99k (mamba pages padded 9x) | 296k |
+
+`serve/flashnext.sh` now defaults `PREFIX_CACHE=0` (serve.sh knob; `=1` restores prefix reuse across requests --
+a serving-behaviour change, flagged to Brian). Removing the CPU floor itself (capturing prefill chunks in cudagraphs
+at 1024/2048/4096) is being measured; it is what would pass Rob at short prompts.
+
 ### Next
 1. Long-chain paired eval (`EVAL_THINK=1`, 800 q) of the candidate config; then make it the default.
-2. Prefill all-reduce: built (r9k_ar4). Remaining: long-chain eval -> default; close the last ~25% to Rob's per-call
-   time (his 0.58 ms at 11 MB vs our 0.74); short-prompt (2k) prefill re-measured with BetterBench.
+2. Prefill CPU floor (~285 ms per forward): cudagraph capture of prefill chunks, or less Python per op. The
+   compressed all-reduce is default (r9k_ar4, 691 us at 11 MB vs Rob's ~580); pipelining message halves across the
+   two links is the remaining ~5% there.
 3. Single-request decode: remaining 0.8 ms/step + MTP-4 acceptance (his 3.35 vs our 3.13 tok/step).
 4. Switch the default base image to vLLM 0.30.
 
