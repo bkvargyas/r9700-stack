@@ -393,7 +393,8 @@ and checkpoint as Rob's image (tcclaviger 29.04.4, MTP-4, fp8 KV, expert offload
 | concurrency 1 / 2 / 4 / 8 / 16 | 117 / 193 / 283 / 374 / 478 | **118 / 197 / 292 / 433 / 543** | 126 / 197 / 303 / 427 / 542 |
 
 Concurrency at parity, TTFT 28% better, prefill within 1.5-9%, single-stream decode 7% behind (his MTP-4 vs our
-MTP-3; our MTP-4 probe: +9% single-stream, -8% concurrency). Every lossy default passed two null paired evals at
+MTP-3). The same full run with MTP-4: decode 130.5, step p50 22.48 ms, concurrency 122 / 197 / 294 / 402 / 466 --
++4.4% single-stream for -14% at 16 concurrent, so MTP-3 stays the default and `MTP=4` is the single-stream knob. Every lossy default passed two null paired evals at
 conc=1 (300 short-answer, 800 chain-of-thought); the served config's sanity check passes.
 
 ### Next
