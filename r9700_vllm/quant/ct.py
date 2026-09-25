@@ -179,6 +179,23 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         note_shape("fp8_" + self.r9k_mode, w.shape[0], w.shape[1])
         if self.r9k_mode == "block":
             layer._r9k_fp8b = (F8.permute_fp8(w.view(torch.uint8)), bs.float().contiguous(), w.shape[0], w.shape[1])
+            maxm = int(os.environ.get("R9K_FP8_BLOCK_MAXM", "64"))
+            if maxm > 0:
+                # Hybrid: ours is tuned for decode widths (tuned.json buckets up to M=64) and loses to stock's Triton
+                # block GEMM at prefill widths (-9% prefill at TP=4 when used for every M). Keep stock's own layout
+                # as well (its post-load path reassigns the buffers) and dispatch on M INSIDE a custom op: a Python
+                # branch on x.shape[0] in compiled code is resolved once at trace time (the M=4096 profile run) and
+                # then serves decode with the stock kernel (measured: -0.4 ms/step). The op body runs at call time
+                # and at each cudagraph capture size, so every width gets the right kernel.
+                super().process_weights_after_loading(layer)
+                layer.input_scale = None
+                _register_dispatch_op()
+                # Registration order, not id(layer): the constant is baked into the compiled graph, and vLLM's
+                # AOT artifact is shared by every TP rank process (and across restarts), where object ids differ.
+                layer._r9k_lid = len(_HYB_LAYERS)
+                _HYB_LAYERS[layer._r9k_lid] = (layer, self._stock_apply, maxm)
+                logger.info_once("r9700: block-fp8 linears -> libr9k split-K fp8 GEMM for M <= %d, stock above", maxm)
+                return
         else:
             from ..linear.fp8_block import requant_rowwise
             layer._r9k_fp8 = requant_rowwise(w.view(torch.float8_e4m3fn), bs, blk)
@@ -188,11 +205,18 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         layer.input_scale = None
         logger.info_once("r9700: block-fp8 linears -> libr9k split-K fp8 GEMM (%s)", self.r9k_mode)
 
+    def _stock_apply(self, layer, x, bias=None):
+        return super().apply_weights(layer, x, bias)
+
     def apply_weights(self, layer, x, bias=None):
         from .. import ops
         mx = getattr(layer, "_r9k_mx", None)
         if mx is not None:
             return mx.apply_weights(layer, x, bias)
+        lid = getattr(layer, "_r9k_lid", None)
+        if lid is not None and isinstance(x, torch.Tensor):
+            out = torch.ops.r9700.fp8_block_dispatch(x, lid)
+            return out + bias if bias is not None else out
         Wb = getattr(layer, "_r9k_fp8b", None)
         W = getattr(layer, "_r9k_fp8", None)
         if Wb is None and W is None:
@@ -202,6 +226,35 @@ class R9kW8A8Fp8(CompressedTensorsW8A8Fp8):
         out = ops.fp8_block_linear(x, *Wb) if Wb is not None else ops.fp8_linear(x, W)
         return out + bias if bias is not None else out
 
+
+
+# ------------------------------------------------------------------------------------------ hybrid block-fp8 op
+_HYB_LAYERS: dict = {}      # registration index -> (layer, stock apply_weights bound to the scheme, width cap)
+_DISPATCH_DONE = False
+
+
+def _fp8_block_dispatch(x: torch.Tensor, lid: int) -> torch.Tensor:
+    layer, stock_apply, maxm = _HYB_LAYERS[lid]
+    if x.shape[0] <= maxm:
+        from .. import ops
+        return ops.fp8_block_linear(x, *layer._r9k_fp8b)
+    return stock_apply(layer, x, None)
+
+
+def _fp8_block_dispatch_fake(x: torch.Tensor, lid: int) -> torch.Tensor:
+    return x.new_empty((x.shape[0], _HYB_LAYERS[lid][0]._r9k_fp8b[2]))
+
+
+def _register_dispatch_op() -> None:
+    global _DISPATCH_DONE
+    if _DISPATCH_DONE:
+        return
+    from .. import ops
+    from vllm.utils.torch_utils import direct_register_custom_op
+    ops.register()
+    direct_register_custom_op("fp8_block_dispatch", _fp8_block_dispatch, mutates_args=[],
+                              fake_impl=_fp8_block_dispatch_fake, target_lib=ops._LIB)
+    _DISPATCH_DONE = True
 
 # ------------------------------------------------------------------------------------------ fp8 unquantized
 class R9kFp8UnquantMethod(UnquantizedLinearMethod):

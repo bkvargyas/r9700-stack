@@ -25,12 +25,14 @@ SHAPES = {
     # Qwen3.8-27B-NVFP4: NVFP4 MLPs (fp8 in the last 8 layers), fp8 attention / GDN / LM head
     "nvfp4": [(17408, 5120), (5120, 8704)],
     "fp8row": [(17408, 5120), (5120, 8704), (7168, 5120), (5120, 3072), (8192, 5120), (124160, 5120),
+               # Flash-Next hyper-connection input_mix "up" (replicated, K=320; hipBLASLt picks a 23 us tile for it)
+               (10240, 320),
                # Flash-Next: fp8 LM head shadows (target + MTP draft)
                (124160, 2560),
                # GDN in_proj_ba (27B: 2*48 heads / TP2) when served fp8 (R9K_FP8_LINEARS=in_proj_ba)
                (48, 5120)],
     # Flash-Next shared expert (dense MXFP4) + 27B converted path (R9K_NVFP4=mxfp4)
-    "mxfp4": [(640, 2560), (2560, 320), (17408, 5120), (5120, 8704),
+    "mxfp4": [(640, 2560), (2560, 320), (17408, 5120), (5120, 8704), (10240, 320),
               # R9K_FP8_TO_MXFP4: 27B attention / GDN, Flash-Next attention / GDN (block fp8 requantized)
               (7168, 5120), (8192, 5120), (5120, 3072), (8192, 2560), (6656, 2560), (2560, 3072),
               # GDN in_proj_qkvz + in_proj_ba merged (models/gdn.py), 27B

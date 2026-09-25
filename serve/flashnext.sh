@@ -11,5 +11,11 @@ exec env \
   R9K_FOLD=1 `        # folded-exponent MXFP4 experts (bit-exact on this checkpoint): +5% prefill, +4% conc-8` \
   R9K_AR_QUANT=1 `    # wht6 all-reduce >= 128 KB (decode single-stream messages stay exact)` \
   MTP=3 `             # the checkpoint's own MTP head` \
+  R9K_FP8_BLOCK=${R9K_FP8_BLOCK-block} `   # block-fp8 projections on our split-K GEMM at decode widths, stock's
+                                           # Triton kernel above M=64 (R9K_FP8_BLOCK_MAXM); 2026-09-24: +6% decode` \
+  R9K_DRAFT_LMHEAD=${R9K_DRAFT_LMHEAD-mxfp4} `   # MTP draft head at 4 bits: draft-only, cannot change outputs` \
+  R9K_TARGET_LMHEAD=${R9K_TARGET_LMHEAD-mxfp4} ` # target head at 4 bits (as Rob's w4a16): ~0.5 ms/step. Paired evals
+                                                 # 2026-09-24, conc=1: 300 short 96.0 -> 97.0% p=0.51; 800 CoT
+                                                 # 97.62 -> 97.50% p=1.0. =fp8 restores the exact-er head.` \
   "${@}" \
   bash "$(dirname "$(realpath "$0")")/serve.sh"

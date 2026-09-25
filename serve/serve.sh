@@ -3,7 +3,7 @@
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
 # Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
-#   GPUS=0,1 (HIP ordinals), TP=2 (4 = RCCL all-reduce: ours is 2-rank), PORT=8080, NAME=vllmstock (two servers
+#   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
 #   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
@@ -68,14 +68,16 @@ OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34
 [ -n "$CGMODE" ] && ARGS+=(--compilation-config "{\"cudagraph_mode\": \"$CGMODE\"}")
 # WRAP=rocprof: rocprofv3 kernel trace, collection window ROCPROF_WINDOW="delay_s:dur_s" after process start
 ENTRY=(); PRE=()
+# (ROCPROF_WINDOW=all traces the whole run; PROFDIR=host dir, default ~/stock-prof)
 if [ "$WRAP" = rocprof ]; then
-  mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
+  PD=${PROFDIR:-$HOME/stock-prof}; mkdir -p $PD; MNT+=(-v $PD:/prof)
   ENTRY=(--entrypoint /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin/rocprofv3)
-  PRE=(--kernel-trace --memory-copy-trace --stats -f csv -d /prof/rp -o %nid%_%pid%
-       --collection-period "${ROCPROF_WINDOW:-600:20}:1" --collection-period-unit sec -- vllm serve)
+  PRE=(--kernel-trace --memory-copy-trace --stats -f csv -d /prof/rp -o %nid%_%pid%)
+  [ "${ROCPROF_WINDOW:-600:20}" != all ] && PRE+=(--collection-period "${ROCPROF_WINDOW:-600:20}:1" --collection-period-unit sec)
+  PRE+=(-- vllm serve)
 fi
 # PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels)
-[ "${PROF:-0}" = 1 ] && { mkdir -p $HOME/stock-prof; MNT+=(-v $HOME/stock-prof:/prof)
+[ "${PROF:-0}" = 1 ] && { PD=${PROFDIR:-$HOME/stock-prof}; mkdir -p $PD; MNT+=(-v $PD:/prof)
   ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
 MTP=${MTP-3}
 # DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP

@@ -38,9 +38,15 @@ def _cfg(env: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
 # K.legal_cfg, which swaps in pick_cfg when another TP size shards K to a shape the tuned SK does not divide.
 CFG_GATE_UP = _cfg("R9K_MOE_CFG1", (2, 4, 2))
 CFG_DOWN = _cfg("R9K_MOE_CFG2", (4, 2, 1))
+# Per-rank shapes at other TP sizes, swept with tuning/decode_moe_sweep.py (2026-09-24, TP=4: w13 320x2560,
+# 1-64 tokens): (1, 8, 1) is 8-11% faster than the TP=2 gate_up default; the down GEMM's legal_cfg fallback
+# (4, 1, 1) is within 2% of its best, so only gate_up is keyed. An explicit R9K_MOE_CFG1 still wins.
+CFG_GATE_UP_BY_N = {320: (1, 8, 1)}
 
 
 def _legal(cfg: tuple[int, int, int], W) -> tuple[int, int, int]:
+    if cfg is CFG_GATE_UP and "R9K_MOE_CFG1" not in os.environ:
+        cfg = CFG_GATE_UP_BY_N.get(W.N, cfg)
     return K.legal_cfg(cfg, W.N, W.K, 16 if isinstance(W, K.Nvfp4Experts) else K.GROUP)
 
 
