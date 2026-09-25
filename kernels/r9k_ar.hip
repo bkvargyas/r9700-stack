@@ -40,7 +40,7 @@
 #include <hip/hip_bf16.h>
 #include <cstdint>
 
-#define R9K_AR_MAX_BLOCKS 64
+#define R9K_AR_MAX_BLOCKS 256   // prefill-sized two-shot pushes want most CUs issuing stores
 #define AR_WAVE 32
 
 typedef unsigned int  u32;
@@ -247,3 +247,265 @@ extern "C" int r9k_ar_ipc_open(const void* handle, long* out_ptr) {
 }
 
 extern "C" int r9k_ar_ipc_handle_size() { return (int)sizeof(hipIpcMemHandle_t); }
+
+// ---------------------------------------------------------------- one-shot N-rank all-reduce (TP=4)
+// The same one-shot pattern for N <= R9K_AR_MAX_RANKS ranks: every rank pushes its whole input into slot `rank`
+// of every peer's scratch, publishes one flag per peer, waits for the N-1 flags addressed to it, then reduces all
+// N inputs locally. Latency-optimal for decode-sized messages (one handshake, no second pass); for large
+// messages it moves (N-1)x the input per rank, so the caller keeps RCCL above a size threshold.
+//
+// Layout (per rank):  scratch[buf][src rank][slot16 words],  flags[src rank][R9K_AR_MAX_BLOCKS]
+// Every rank sums the N inputs in rank order 0..N-1 in fp32 and rounds once, so all ranks produce bit-identical
+// outputs (the order differs from RCCL's ring, so the result is not bit-equal to RCCL -- it is equal to an
+// fp32-accumulated reference). Double buffering is safe for the same reason as the 2-rank kernel: a rank reaches
+// call s+2 only after every peer has published call s+1, which each peer does only after its call-s kernel
+// (and therefore its reads of buffer s&1) finished in stream order.
+#define R9K_AR_MAX_RANKS 8
+
+struct R9kArPeers {
+  uint4* scratch[R9K_AR_MAX_RANKS];   // scratch[q] = rank q's scratch, mapped into this process (own for q == rank)
+  u32* flags[R9K_AR_MAX_RANKS];       // flags[q]   = rank q's flag array, mapped likewise
+};
+
+template <typename T, int N>
+__global__ void __launch_bounds__(1024) r9k_ar_oneshot_nrank_kernel(
+    R9kArPeers P, int rank, int* __restrict__ seq, long slot16, const uint4* __restrict__ in,
+    uint4* __restrict__ out, long n16, int drain, int acq) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  const int s = s_seq;
+  const long base = (long)(s & 1) * N * slot16;
+  const long per = (n16 + nb - 1) / nb;
+  const long lo = per * b, hi = min(lo + per, n16);
+
+  // 1. push our slice into slot `rank` of every peer
+  for (long i = lo + tid; i < hi; i += nt) {
+    const uint4 v = in[i];
+#pragma unroll
+    for (int q = 0; q < N; q++)
+      if (q != rank) P.scratch[q][base + (long)rank * slot16 + i] = v;
+  }
+
+  // 2. publish to each peer; 3. wait for every peer's publish to us
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  if (tid < N && tid != rank) {
+    u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
+    if (drain >= 4) __hip_atomic_store(f, (u32)(s + 1), __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    else __hip_atomic_store(f, (u32)(s + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], s + 1, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 4. reduce all N in rank order, fp32 accumulate, one rounding
+  constexpr int NE = 16 / sizeof(T);
+  const uint4* own = P.scratch[rank] + base;
+  for (long i = lo + tid; i < hi; i += nt) {
+    float acc[NE];
+#pragma unroll
+    for (int e = 0; e < NE; e++) acc[e] = 0.f;
+#pragma unroll
+    for (int q = 0; q < N; q++) {
+      const uint4 c = q == rank ? in[i] : own[(long)q * slot16 + i];
+      const T* pc = (const T*)&c;
+#pragma unroll
+      for (int e = 0; e < NE; e++) acc[e] += ar_ld(pc[e]);
+    }
+    uint4 r;
+    T* pr = (T*)&r;
+#pragma unroll
+    for (int e = 0; e < NE; e++) ar_st(pr[e], acc[e]);
+    out[i] = r;
+  }
+}
+
+extern "C" int r9k_ar_max_ranks() { return R9K_AR_MAX_RANKS; }
+
+// scratch_ptrs / flag_ptrs: host arrays of `nranks` device pointers (own + opened peer mappings), indexed by rank.
+extern "C" int r9k_ar_oneshot_nrank(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                    long seq, long slot16, long in, long out, long numel, int dtype,
+                                    long stream, int nblocks, int nthreads, int drain, int acq) {
+  const int esz = dtype == 2 ? 4 : 2;
+  const long nbytes = numel * esz;
+  if (nbytes % 16) return -1;
+  const long n16 = nbytes / 16;
+  if (nblocks <= 0 || nblocks > R9K_AR_MAX_BLOCKS) return -2;
+  if (nranks < 2 || nranks > R9K_AR_MAX_RANKS || rank < 0 || rank >= nranks) return -5;
+  if (n16 <= 0) return 0;
+  if (n16 > slot16) return -7;
+  if (nthreads <= 0) {
+    const long per = (n16 + nblocks - 1) / nblocks;
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < AR_WAVE ? AR_WAVE : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads < R9K_AR_MAX_RANKS) nthreads = AR_WAVE;    // the flag lanes are tid < nranks
+  if (nthreads > 1024 || nthreads % AR_WAVE) return -3;
+  if ((long)nblocks > n16) nblocks = (int)n16;
+  R9kArPeers P{};
+  for (int q = 0; q < nranks; q++) { P.scratch[q] = (uint4*)scratch_ptrs[q]; P.flags[q] = (u32*)flag_ptrs[q]; }
+  hipStream_t st = (hipStream_t)stream;
+#define ARN_LAUNCH(T, N)                                                                                   \
+  hipLaunchKernelGGL((r9k_ar_oneshot_nrank_kernel<T, N>), dim3(nblocks), dim3(nthreads), 0, st, P, rank,  \
+                     (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, drain, acq)
+#define ARN_DT(N)                                                                                          \
+  switch (dtype) {                                                                                         \
+    case 0: ARN_LAUNCH(__hip_bfloat16, N); break;                                                          \
+    case 1: ARN_LAUNCH(_Float16, N); break;                                                                \
+    case 2: ARN_LAUNCH(float, N); break;                                                                   \
+    default: return -4;                                                                                    \
+  }
+  switch (nranks) {
+    case 2: ARN_DT(2); break;
+    case 4: ARN_DT(4); break;
+    case 8: ARN_DT(8); break;
+    default: return -5;
+  }
+#undef ARN_DT
+#undef ARN_LAUNCH
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// ---------------------------------------------------------------- two-shot N-rank all-reduce
+// Reduce-scatter then all-gather in one kernel, for messages where one-shot's (N-1)x push is bandwidth-bound:
+// each rank moves 2(N-1)/N of the input instead of (N-1)x (1.5x vs 3x at N=4). The message is cut into N
+// chunks of 16-byte words; rank c owns chunk c.
+//   1. push chunk q of our input into slot `rank` of rank q's scratch; publish 2s+1 to every peer
+//   2. wait for 2s+1 from every peer; reduce OUR chunk over all N in rank order (fp32, one rounding)
+//   3. push the reduced chunk into the gather area of every peer (and our own out); publish 2s+2
+//   4. wait for 2s+2 from every peer; copy their reduced chunks from our gather area into out
+// One flag word per (source rank, block) carries both phases: 2s+2 >= 2s+1, so a peer that is already in
+// phase 3 also satisfies a phase-1 wait. Only the chunk's owner reduces it, so all ranks hold identical bits.
+// Double buffering (s & 1) on both areas is safe by the same stream-order argument as the one-shot kernel.
+// Layout (per rank): scratch[buf][ rs: N slots of slot16 | ag: slot16 ] -- the caller sizes it 2*(N+1)*slot16.
+template <typename T, int N>
+__global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
+    R9kArPeers P, int rank, int* __restrict__ seq, long slot16, const uint4* __restrict__ in,
+    uint4* __restrict__ out, long n16, int drain, int acq) {
+  const int b = blockIdx.x, nb = gridDim.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  const int s = s_seq;
+  const long base = (long)(s & 1) * (N + 1) * slot16;
+  const long ag = base + (long)N * slot16;
+  const long csz = (n16 + N - 1) / N;                 // words per chunk (the last one may be short)
+  const long per = (csz + nb - 1) / nb;               // this block's slice of every chunk
+  const long lo = per * b, hi = min(lo + per, csz);
+
+  // 1. scatter: chunk q -> rank q (4 words per lane per iteration so several stores are in flight per lane)
+#pragma unroll
+  for (int q = 0; q < N; q++) {
+    if (q == rank) continue;
+    const long c0 = (long)q * csz, cn = min(csz, n16 - c0), end = min(hi, cn);
+    uint4* dst = P.scratch[q] + base + (long)rank * slot16;
+    long i = lo + tid;
+    for (; i + 3 * nt < end; i += 4 * nt) {
+      const uint4 v0 = in[c0 + i], v1 = in[c0 + i + nt], v2 = in[c0 + i + 2 * nt], v3 = in[c0 + i + 3 * nt];
+      dst[i] = v0; dst[i + nt] = v1; dst[i + 2 * nt] = v2; dst[i + 3 * nt] = v3;
+    }
+    for (; i < end; i += nt) dst[i] = in[c0 + i];
+  }
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  auto publish = [&](u32 v) {
+    if (tid < N && tid != rank) {
+      u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
+      if (drain >= 4) __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      else __hip_atomic_store(f, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  };
+  publish((u32)(2 * s + 1));
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], 2 * s + 1, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 2+3. reduce our chunk, write it to out and to every peer's gather area
+  constexpr int NE = 16 / sizeof(T);
+  const uint4* own = P.scratch[rank] + base;
+  {
+    const long c0 = (long)rank * csz, cn = min(csz, n16 - c0);
+    for (long i = lo + tid; i < min(hi, cn); i += nt) {
+      float acc[NE];
+#pragma unroll
+      for (int e = 0; e < NE; e++) acc[e] = 0.f;
+#pragma unroll
+      for (int q = 0; q < N; q++) {
+        const uint4 c = q == rank ? in[c0 + i] : own[(long)q * slot16 + i];
+        const T* pc = (const T*)&c;
+#pragma unroll
+        for (int e = 0; e < NE; e++) acc[e] += ar_ld(pc[e]);
+      }
+      uint4 r;
+      T* pr = (T*)&r;
+#pragma unroll
+      for (int e = 0; e < NE; e++) ar_st(pr[e], acc[e]);
+      out[c0 + i] = r;
+#pragma unroll
+      for (int q = 0; q < N; q++)
+        if (q != rank) P.scratch[q][ag + c0 + i] = r;   // gather area is indexed by global word
+    }
+  }
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  publish((u32)(2 * s + 2));
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], 2 * s + 2, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 4. collect the peers' reduced chunks
+  const uint4* gat = P.scratch[rank] + ag;
+#pragma unroll
+  for (int q = 0; q < N; q++) {
+    if (q == rank) continue;
+    const long c0 = (long)q * csz, cn = min(csz, n16 - c0);
+    for (long i = lo + tid; i < min(hi, cn); i += nt) out[c0 + i] = gat[c0 + i];
+  }
+}
+
+// Same arguments as r9k_ar_oneshot_nrank; scratch must be 2*(nranks+1)*slot16 words and the flag values are
+// NOT compatible with the one-shot kernel's, so the two need separate seq counters AND separate flag arrays.
+extern "C" int r9k_ar_twoshot_nrank(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                    long seq, long slot16, long in, long out, long numel, int dtype,
+                                    long stream, int nblocks, int nthreads, int drain, int acq) {
+  const int esz = dtype == 2 ? 4 : 2;
+  const long nbytes = numel * esz;
+  if (nbytes % 16) return -1;
+  const long n16 = nbytes / 16;
+  if (nblocks <= 0 || nblocks > R9K_AR_MAX_BLOCKS) return -2;
+  if (nranks < 2 || nranks > R9K_AR_MAX_RANKS || rank < 0 || rank >= nranks) return -5;
+  if (n16 <= 0) return 0;
+  if (n16 > slot16) return -7;
+  const long csz = (n16 + nranks - 1) / nranks;
+  if (nthreads <= 0) {
+    const long per = (csz + nblocks - 1) / nblocks;
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < AR_WAVE ? AR_WAVE : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE) return -3;
+  if ((long)nblocks > csz) nblocks = (int)csz;
+  R9kArPeers P{};
+  for (int q = 0; q < nranks; q++) { P.scratch[q] = (uint4*)scratch_ptrs[q]; P.flags[q] = (u32*)flag_ptrs[q]; }
+  hipStream_t st = (hipStream_t)stream;
+#define ARN_LAUNCH(T, N)                                                                                   \
+  hipLaunchKernelGGL((r9k_ar_twoshot_nrank_kernel<T, N>), dim3(nblocks), dim3(nthreads), 0, st, P, rank,  \
+                     (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, drain, acq)
+#define ARN_DT(N)                                                                                          \
+  switch (dtype) {                                                                                         \
+    case 0: ARN_LAUNCH(__hip_bfloat16, N); break;                                                          \
+    case 1: ARN_LAUNCH(_Float16, N); break;                                                                \
+    case 2: ARN_LAUNCH(float, N); break;                                                                   \
+    default: return -4;                                                                                    \
+  }
+  switch (nranks) {
+    case 2: ARN_DT(2); break;
+    case 4: ARN_DT(4); break;
+    case 8: ARN_DT(8); break;
+    default: return -5;
+  }
+#undef ARN_DT
+#undef ARN_LAUNCH
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}

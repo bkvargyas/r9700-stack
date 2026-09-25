@@ -210,3 +210,134 @@ class R9kAllReduce:
         if rc:
             raise RuntimeError(f"r9k_wht_reduce_at failed ({rc})")
         return out
+
+
+class R9kAllReduceN:
+    """P2P all-reduce for TP > 2 (kernels/r9k_ar.hip), same contract as R9kAllReduce. Exact only.
+
+    Three regimes by message size, measured 2026-09-24 on 4x R9700 (two PEX 8747 switches), bf16, HIP graphs
+    (tests/test_ar_nrank.py):
+      <= R9K_ARN_1S_KB  one-shot: every rank pushes its whole input to every peer, one handshake. Latency-optimal
+                        (20 KB: 13.4 us vs RCCL 72.9) but moves (N-1)x the bytes, so it loses above ~190 KB.
+      <= R9K_ARN_MAX_KB two-shot: reduce-scatter + all-gather in one kernel, 2(N-1)/N the bytes, two handshakes.
+      larger            RCCL.
+    Graph-timed, us (tokens x 2560 bf16):  rccl / one-shot / two-shot
+       1 tok    5 KB    59.2 /   6.8 /   9.7
+       4 tok   20 KB    72.6 /  13.4 /  11.3
+      16 tok   80 KB    71.2 /  37.2 /  24.2
+      64 tok  320 KB   102.0 / 130.4 /  73.2
+     128 tok  640 KB   142.1 / 252.0 / 139.9
+    1024 tok    5 MB   770.1 /1965.3 /1140.7   (the switch uplinks are the limit; RCCL's ring spreads it better)"""
+
+    def __init__(self, group, device):
+        self.disabled = True
+        self.world_size = dist.get_world_size(group)
+        self.rank = dist.get_rank(group)
+        L = _lib()
+        if not hasattr(L, "r9k_ar_oneshot_nrank"):
+            logger.warning("r9700: libr9k.so has no r9k_ar_oneshot_nrank; TP=%d stays on RCCL", self.world_size)
+            return
+        L.r9k_ar_max_ranks.restype = ctypes.c_int
+        if self.world_size not in (2, 4, 8) or self.world_size > L.r9k_ar_max_ranks():
+            return
+        at = [ctypes.POINTER(ctypes.c_long)] * 2 + [ctypes.c_int, ctypes.c_int] + \
+            [ctypes.c_long] * 5 + [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 4
+        for fn in ("r9k_ar_oneshot_nrank", "r9k_ar_twoshot_nrank"):
+            if hasattr(L, fn):
+                getattr(L, fn).restype = ctypes.c_int
+                getattr(L, fn).argtypes = at
+        self.L = L
+        self.device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
+        torch.cuda.set_device(self.device)
+        kb = lambda k, d: (int(float(os.environ.get(k, d)) * 1024) // 16) * 16
+        self.max1 = kb("R9K_ARN_1S_KB", "16")
+        self.max_bytes = max(self.max1, kb("R9K_ARN_MAX_KB", "512")) if hasattr(L, "r9k_ar_twoshot_nrank") \
+            else self.max1
+        self.max_nb = min(int(os.environ.get("R9K_ARN_MAX_BLOCKS", "16")), L.r9k_ar_max_blocks())
+        self.words_per_block = int(os.environ.get("R9K_ARN_WPB", "512"))
+        self.min_nb = int(os.environ.get("R9K_ARN_MIN_BLOCKS", "2"))
+        self.max_nb2 = min(int(os.environ.get("R9K_ARN2_MAX_BLOCKS", "64")), L.r9k_ar_max_blocks())
+        self.words_per_block2 = int(os.environ.get("R9K_ARN2_WPB", "1024"))
+        N = self.world_size
+        self.slot1 = self.max1 // 16
+        self.slot2 = self.max_bytes // 16
+        one = self._share(group, 2 * N * self.max1, N * L.r9k_ar_max_blocks() * 4)
+        two = self._share(group, 2 * (N + 1) * self.max_bytes, N * L.r9k_ar_max_blocks() * 4) \
+            if self.max_bytes > self.max1 else None
+        if one is None or (self.max_bytes > self.max1 and two is None):
+            logger.warning("r9700: r9k N-rank all-reduce IPC setup failed; staying on RCCL")
+            return
+        self._sp, self._fp = one
+        self._sp2, self._fp2 = two or (None, None)
+        self._seq = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
+        self._seq2 = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
+        self.drain, self.acq = 4, 2
+        if os.environ.get("R9K_AR_FENCE"):
+            self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
+        self.disabled = False
+        logger.info("r9700: r9k %d-rank P2P all-reduce installed (rank %d, one-shot <= %d KiB, two-shot <= %d KiB)",
+                    N, self.rank, self.max1 >> 10, self.max_bytes >> 10)
+
+    def _share(self, group, scratch_bytes, flag_bytes):
+        """Allocate fine-grained scratch + flags, exchange IPC handles, open every peer's. Collective."""
+        L, N = self.L, self.world_size
+        hsz = L.r9k_ar_ipc_handle_size()
+
+        def alloc(nbytes):
+            ptr, h = ctypes.c_long(0), (ctypes.c_char * hsz)()
+            rc = L.r9k_ar_ipc_alloc(nbytes, 1, ctypes.byref(ptr), ctypes.byref(h))
+            return (ptr.value, bytes(h)) if rc == 0 else (None, None)
+
+        scratch, sh = alloc(scratch_bytes)
+        flags, fh = alloc(flag_bytes)
+        oks = [None] * N
+        dist.all_gather_object(oks, scratch is not None and flags is not None, group=group)
+        if not all(oks):
+            return None
+        shs, fhs = [None] * N, [None] * N
+        dist.all_gather_object(shs, sh, group=group)
+        dist.all_gather_object(fhs, fh, group=group)
+        sp, fp, good = [0] * N, [0] * N, True
+        for q in range(N):
+            if q == self.rank:
+                sp[q], fp[q] = scratch, flags
+                continue
+            ps, pf = ctypes.c_long(0), ctypes.c_long(0)
+            if L.r9k_ar_ipc_open(shs[q], ctypes.byref(ps)) or L.r9k_ar_ipc_open(fhs[q], ctypes.byref(pf)):
+                good = False
+                break
+            sp[q], fp[q] = ps.value, pf.value
+        goods = [None] * N
+        dist.all_gather_object(goods, good, group=group)
+        if not all(goods):
+            return None
+        return (ctypes.c_long * N)(*sp), (ctypes.c_long * N)(*fp)
+
+    def should(self, x: torch.Tensor) -> bool:
+        if self.disabled or x.dtype not in _DTYPE or not x.is_contiguous():
+            return False
+        n = x.numel() * x.element_size()
+        return 0 < n <= self.max_bytes and n % 16 == 0
+
+    def nblocks(self, nbytes: int, two: bool = False) -> int:
+        if two:
+            c16 = nbytes // 16 // self.world_size
+            return max(1, min(max(self.min_nb, min(self.max_nb2, c16 // self.words_per_block2)), max(c16, 1)))
+        n16 = nbytes // 16
+        return max(1, min(max(self.min_nb, min(self.max_nb, n16 // self.words_per_block)), n16))
+
+    def all_reduce(self, x: torch.Tensor, nb: int | None = None, nt: int = 0, mode: int | None = None) -> torch.Tensor:
+        """mode: None = by size, 1 = force one-shot, 2 = force two-shot (tests/benchmarks)."""
+        out = torch.empty_like(x)
+        nbytes = x.numel() * x.element_size()
+        two = (nbytes > self.max1) if mode is None else mode == 2
+        if two:
+            fn, sp, fp, seq, slot = self.L.r9k_ar_twoshot_nrank, self._sp2, self._fp2, self._seq2, self.slot2
+        else:
+            fn, sp, fp, seq, slot = self.L.r9k_ar_oneshot_nrank, self._sp, self._fp, self._seq, self.slot1
+        rc = fn(sp, fp, self.world_size, self.rank, seq.data_ptr(), slot, x.data_ptr(), out.data_ptr(),
+                x.numel(), _DTYPE[x.dtype], torch.cuda.current_stream().cuda_stream,
+                nb or self.nblocks(nbytes, two), nt, self.drain, self.acq)
+        if rc:
+            raise RuntimeError(f"r9k_ar_{'two' if two else 'one'}shot_nrank failed ({rc})")
+        return out

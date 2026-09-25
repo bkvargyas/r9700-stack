@@ -138,8 +138,16 @@ class R9kCommunicator(CudaCommunicator):
             return
         try:
             from ..moe.experts import r9k_available
-            if "tp" in (getattr(self, "unique_name", "") or "") and getattr(self, "world_size", 1) == 2 \
-                    and r9k_available():
+            ws = getattr(self, "world_size", 1)
+            if "tp" in (getattr(self, "unique_name", "") or "") and ws > 2 and r9k_available() \
+                    and os.environ.get("R9K_ARN", "1") == "1":
+                # TP=4: one-shot N-rank P2P for decode-sized messages (5x lower latency than RCCL at 20 KB);
+                # larger messages fall through to RCCL, whose ring moves fewer bytes per rank.
+                from .r9k_ar import R9kAllReduceN
+                ar = R9kAllReduceN(self.cpu_group, self.device)
+                if not ar.disabled:
+                    self._r9k_ar = ar
+            elif "tp" in (getattr(self, "unique_name", "") or "") and ws == 2 and r9k_available():
                 # Ours is the default (kernels/r9k_ar.hip + r9k_ar_wht.hip, no libr4d). R9K_AR_IMPL=r4d keeps
                 # libr4d's for A/B. Together with R9K_PAGED_ATTN=r9k this makes the default configuration
                 # free of libr4d at runtime -- r4d.so is not loaded at all. Costs ~6% prefill against libr4d's
