@@ -13,6 +13,9 @@ exec env \
   MTP=3 `             # the checkpoint's own MTP head` \
   PREFIX_CACHE=${PREFIX_CACHE-0} `  # off: avoids the mamba-aligned prefill chunking (2k prefill 2.8k -> ~4.7k tok/s,
                                     # see serve.sh); =1 restores prefix reuse across requests` \
+  CGSIZES=${CGSIZES-1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1280,1536,1792,2048} `  # graphs for
+                                    # prefill chunks <= 2048 tokens (short-prompt TTFT 336 -> 91 ms); CGSIZES= for
+                                    # vLLM's default (max 512)` \
   R9K_FP8_BLOCK=${R9K_FP8_BLOCK-block} `   # block-fp8 projections on our split-K GEMM at decode widths, stock's
                                            # Triton kernel above M=64 (R9K_FP8_BLOCK_MAXM); 2026-09-24: +6% decode` \
   R9K_DRAFT_LMHEAD=${R9K_DRAFT_LMHEAD-mxfp4} `   # MTP draft head at 4 bits: draft-only, cannot change outputs` \

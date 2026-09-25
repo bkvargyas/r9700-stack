@@ -71,7 +71,16 @@ OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34
 # graphs. Decode is captured either way; the interesting part is whether PREFILL / mixed batches are, because an
 # eager prefill forward is ~1950 kernel launches and about 46 ms of launch gaps on a short prompt (see
 # notes/picking-up.md). Leave unset for vLLM's default.
-[ -n "$CGMODE" ] && ARGS+=(--compilation-config "{\"cudagraph_mode\": \"$CGMODE\"}")
+# CGSIZES=a,b,...: cudagraph capture sizes (the last is the max). Prefill chunks whose token count is at or below the
+# max are padded to the next size and replayed as graphs; larger ones run eagerly. The eager prefill forward costs
+# ~285 ms of CPU-bound Python regardless of length (2026-09-25 profiles), so capturing up to ~2048 tokens removes
+# that floor for short prompts (236 tokens: 336 -> 91 ms TTFT; 1325: 313 -> 259) while staying below the point where
+# padding costs more than it saves (GPU time passes the floor near 1.7k tokens). The graph pool costs KV cache
+# capacity, more so with larger sizes (4096: -20%).
+CC=()
+[ -n "$CGMODE" ] && CC+=("\"cudagraph_mode\": \"$CGMODE\"")
+[ -n "$CGSIZES" ] && CC+=("\"cudagraph_capture_sizes\": [$CGSIZES], \"max_cudagraph_capture_size\": ${CGSIZES##*,}")
+[ ${#CC[@]} -gt 0 ] && ARGS+=(--compilation-config "{$(IFS=,; echo "${CC[*]}")}")
 # WRAP=rocprof: rocprofv3 kernel trace, collection window ROCPROF_WINDOW="delay_s:dur_s" after process start
 ENTRY=(); PRE=()
 # (ROCPROF_WINDOW=all traces the whole run; PROFDIR=host dir, default ~/stock-prof)
