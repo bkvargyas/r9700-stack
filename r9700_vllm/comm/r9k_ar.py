@@ -274,9 +274,19 @@ class R9kAllReduceN:
         self.drain, self.acq = 4, 2
         if os.environ.get("R9K_AR_FENCE"):
             self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
+        # Prefill-sized messages: the compressed hierarchical path (comm/r9k_ar4.py, R9K_AR4=1), which beats RCCL's
+        # ring 2.2x at 4 bits / 1.6x at 6 bits (tests/test_ar4.py); the exact kernels cannot on this topology.
+        # Its constructor is collective (all ranks must take the same branch): R9K_AR4 is read on every rank.
+        self.ar4 = None
+        if N == 4 and os.environ.get("R9K_AR4", "0") == "1":
+            from .r9k_ar4 import R9kAllReduce4
+            a4 = R9kAllReduce4(group, device)
+            if not a4.disabled:
+                self.ar4 = a4
         self.disabled = False
-        logger.info("r9700: r9k %d-rank P2P all-reduce installed (rank %d, one-shot <= %d KiB, two-shot <= %d KiB)",
-                    N, self.rank, self.max1 >> 10, self.max_bytes >> 10)
+        logger.info("r9700: r9k %d-rank P2P all-reduce installed (rank %d, one-shot <= %d KiB, two-shot <= %d KiB%s)",
+                    N, self.rank, self.max1 >> 10, self.max_bytes >> 10,
+                    f", compressed {self.ar4.bits}-bit above" if self.ar4 is not None else "")
 
     def _share(self, group, scratch_bytes, flag_bytes):
         """Allocate fine-grained scratch + flags, exchange IPC handles, open every peer's. Collective."""
@@ -317,6 +327,8 @@ class R9kAllReduceN:
         if self.disabled or x.dtype not in _DTYPE or not x.is_contiguous():
             return False
         n = x.numel() * x.element_size()
+        if n > self.max_bytes:
+            return self.ar4 is not None and self.ar4.should(x)
         return 0 < n <= self.max_bytes and n % 16 == 0
 
     def nblocks(self, nbytes: int, two: bool = False) -> int:
@@ -328,8 +340,10 @@ class R9kAllReduceN:
 
     def all_reduce(self, x: torch.Tensor, nb: int | None = None, nt: int = 0, mode: int | None = None) -> torch.Tensor:
         """mode: None = by size, 1 = force one-shot, 2 = force two-shot (tests/benchmarks)."""
-        out = torch.empty_like(x)
         nbytes = x.numel() * x.element_size()
+        if mode is None and nbytes > self.max_bytes:
+            return self.ar4.all_reduce(x)
+        out = torch.empty_like(x)
         two = (nbytes > self.max1) if mode is None else mode == 2
         if two:
             fn, sp, fp, seq, slot = self.L.r9k_ar_twoshot_nrank, self._sp2, self._fp2, self._seq2, self.slot2
