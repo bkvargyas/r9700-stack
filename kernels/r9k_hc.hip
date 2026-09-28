@@ -9,8 +9,9 @@
 // combine_norm: per (n, s): inj = 2 * sigmoid(l[n, s] / HC)
 //               out[n, s*HD + i] = bf16(res + block[n, i] * inj)                             (materialized, bf16)
 //               rrms = rsqrt(mean_i(out^2) + eps);  y = out * rrms;  y += y * w[(s*HD +) i]  -> bf16
-// One wave per (row, stream) for combine_norm: 2560 bf16 = 32 lanes x 10 chunks of 16 B, kept in registers between
-// the two passes; one wave per (row, 512-column chunk) for gate_mix. Any HD % 8 == 0. No device printf/assert.
+// One 128-thread workgroup per (row, stream) for combine_norm (the combine result kept in registers as bf16 between
+// the two passes); one wave per (row, 256-column chunk) for gate_mix. HD % 8 == 0, HD <= 4096, HC <= 8. No device
+// printf/assert.
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include <stdint.h>
@@ -23,6 +24,7 @@ constexpr int WAVES = 4, NT = 32 * WAVES;
 // definition): 4 VGPRs per chunk. Two instantiations keep the register footprint (and so occupancy) tight for the
 // served HD=2560 (10 chunks) while allowing HD <= 4096.
 constexpr int MAXHD = 4096;
+constexpr int MAXHC = 8;
 
 __device__ __forceinline__ float bf2f(uint16_t u) { return __uint_as_float((unsigned)u << 16); }
 __device__ __forceinline__ uint16_t f2bf(float f) {    // round to nearest even (matches torch's bf16 conversion)
@@ -38,16 +40,18 @@ __device__ __forceinline__ float wave_sum(float v) {
   return v;
 }
 
-// grid (rows * HC + WAVES - 1) / WAVES; wave w of block b handles (row, stream) = divmod(b * WAVES + w, HC)
+// One 128-thread workgroup per (row, stream): thread t owns chunks t, t+128, ... of the 2560-element stream, so a
+// stream's loads are spread over 4 waves (a single wave per stream was 12.5 us vs Triton's 3.7 in graph replay at
+// decode widths: one wave issuing 10 dependent-latency chunks serially). Cross-wave sum of squares through LDS.
 template <int MAXCH>
 __global__ void __launch_bounds__(NT) r9k_hc_combine_norm_kernel(
     const uint16_t* __restrict__ res, long s_res, const uint16_t* __restrict__ blk, long s_blk,
     const uint16_t* __restrict__ inj, long s_inj, const uint16_t* __restrict__ w, int w_shared,
     uint16_t* __restrict__ out, long s_out, uint16_t* __restrict__ y, long s_y,
     int rows, int HC, int HD, float eps) {
-  const int lane = threadIdx.x & 31, wave = threadIdx.x >> 5;
-  const int item = blockIdx.x * WAVES + wave;
-  if (item >= rows * HC) return;
+  __shared__ float part[WAVES];
+  const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+  const int item = blockIdx.x;
   const int n = item / HC, s = item - n * HC;
   const float g = 2.f * sigmoidf_(bf2f(inj[(long)n * s_inj + s]) / (float)HC);
   const uint16_t* rp = res + (long)n * s_res + (long)s * HD;
@@ -56,18 +60,25 @@ __global__ void __launch_bounds__(NT) r9k_hc_combine_norm_kernel(
   uint16_t* op = out + (long)n * s_out + (long)s * HD;
   uint16_t* yp = y + (long)n * s_y + (long)s * HD;
   const int nch = HD / 8;                              // 16 B chunks per row segment
+  v8u16 rv[MAXCH], bv[MAXCH];
+#pragma unroll
+  for (int c = 0; c < MAXCH; c++) {                    // issue every load before consuming any
+    const int ch = t + NT * c;
+    if (ch < nch) {
+      rv[c] = *reinterpret_cast<const v8u16*>(rp + ch * 8);
+      bv[c] = *reinterpret_cast<const v8u16*>(bp + ch * 8);
+    }
+  }
   v8u16 o[MAXCH];
   float ss = 0.f;
 #pragma unroll
   for (int c = 0; c < MAXCH; c++) {
-    const int ch = lane + 32 * c;
+    const int ch = t + NT * c;
     if (ch < nch) {
-      const v8u16 rv = *reinterpret_cast<const v8u16*>(rp + ch * 8);
-      const v8u16 bv = *reinterpret_cast<const v8u16*>(bp + ch * 8);
       v8u16 ov;
 #pragma unroll
       for (int i = 0; i < 8; i++) {
-        const float v = fmaf(bf2f(bv[i]), g, bf2f(rv[i]));
+        const float v = fmaf(bf2f(bv[c][i]), g, bf2f(rv[c][i]));
         const uint16_t ob = f2bf(v);
         ov[i] = ob;
         const float of = bf2f(ob);
@@ -78,10 +89,15 @@ __global__ void __launch_bounds__(NT) r9k_hc_combine_norm_kernel(
     }
   }
   ss = wave_sum(ss);
-  const float rrms = rsqrtf(ss / (float)HD + eps);
+  if (lane == 0) part[wave] = ss;
+  __syncthreads();
+  float tot = 0.f;
+#pragma unroll
+  for (int i = 0; i < WAVES; i++) tot += part[i];
+  const float rrms = rsqrtf(tot / (float)HD + eps);
 #pragma unroll
   for (int c = 0; c < MAXCH; c++) {
-    const int ch = lane + 32 * c;
+    const int ch = t + NT * c;
     if (ch < nch) {
       const v8u16 wv = *reinterpret_cast<const v8u16*>(wp + ch * 8);
       v8u16 yv;
@@ -109,12 +125,19 @@ __global__ void __launch_bounds__(NT) r9k_hc_gate_mix_kernel(
   const uint16_t* xp = x + (long)n * s_x + c0;
   const uint16_t* gp = gt + (long)n * s_g + c0;
   float acc[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-  for (int s = 0; s < HC; s++) {
-    const v8u16 xv = *reinterpret_cast<const v8u16*>(xp + (long)s * HD);
-    const v8u16 gv = *reinterpret_cast<const v8u16*>(gp + (long)s * HD);
+  v8u16 xv[MAXHC], gv[MAXHC];
 #pragma unroll
-    for (int i = 0; i < 8; i++) acc[i] = fmaf(sigmoidf_(bf2f(gv[i])), bf2f(xv[i]), acc[i]);
-  }
+  for (int s = 0; s < MAXHC; s++)                      // all HC streams' loads in flight before the math
+    if (s < HC) {
+      xv[s] = *reinterpret_cast<const v8u16*>(xp + (long)s * HD);
+      gv[s] = *reinterpret_cast<const v8u16*>(gp + (long)s * HD);
+    }
+#pragma unroll
+  for (int s = 0; s < MAXHC; s++)
+    if (s < HC) {
+#pragma unroll
+      for (int i = 0; i < 8; i++) acc[i] = fmaf(sigmoidf_(bf2f(gv[s][i])), bf2f(xv[s][i]), acc[i]);
+    }
   const float inv = 1.f / (float)HC;
   v8u16 yv;
 #pragma unroll
@@ -130,13 +153,13 @@ extern "C" int r9k_hc_combine_norm(long res, long s_res, long blk, long s_blk, l
                                    long stream) {
   if (HD % 8 || HD > MAXHD || HC < 1 || rows < 0) return -1;
   if (rows == 0) return 0;
-  dim3 grid((rows * HC + WAVES - 1) / WAVES), block(NT);
-  if (HD <= 2560)
-    r9k_hc_combine_norm_kernel<10><<<grid, block, 0, (hipStream_t)stream>>>(
+  dim3 grid(rows * HC), block(NT);
+  if (HD <= 3 * 8 * NT)
+    r9k_hc_combine_norm_kernel<3><<<grid, block, 0, (hipStream_t)stream>>>(
         (const uint16_t*)res, s_res, (const uint16_t*)blk, s_blk, (const uint16_t*)inj, s_inj, (const uint16_t*)w,
         w_shared, (uint16_t*)out, s_out, (uint16_t*)y, s_y, rows, HC, HD, eps);
   else
-    r9k_hc_combine_norm_kernel<16><<<grid, block, 0, (hipStream_t)stream>>>(
+    r9k_hc_combine_norm_kernel<4><<<grid, block, 0, (hipStream_t)stream>>>(
         (const uint16_t*)res, s_res, (const uint16_t*)blk, s_blk, (const uint16_t*)inj, s_inj, (const uint16_t*)w,
         w_shared, (uint16_t*)out, s_out, (uint16_t*)y, s_y, rows, HC, HD, eps);
   return (int)hipGetLastError();
@@ -144,7 +167,7 @@ extern "C" int r9k_hc_combine_norm(long res, long s_res, long blk, long s_blk, l
 
 extern "C" int r9k_hc_gate_mix(long x, long s_x, long g, long s_g, long y, long s_y, int rows, int HC, int HD,
                                long stream) {
-  if (HD % 8 || HC < 1 || rows < 0) return -1;
+  if (HD % 8 || HC < 1 || HC > MAXHC || rows < 0) return -1;
   if (rows == 0) return 0;
   const int nchunks = (HD + 255) / 256;
   dim3 grid((rows * nchunks + WAVES - 1) / WAVES), block(NT);

@@ -20,6 +20,8 @@ from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm, hc_gate_mix  # noq
 
 from r9700_vllm import hc as R  # noqa: E402
 
+R.MIN_ROWS_COMBINE = R.MIN_ROWS_GATE = 0          # exercise our kernels at every row count here
+
 dev = torch.device("cuda")
 HC, HD = 4, 2560
 EPS = 1e-6

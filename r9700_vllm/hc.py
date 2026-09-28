@@ -7,7 +7,8 @@ gate_mix (322 us x 100). Ours are one wave per (row, stream) / (row, 256 columns
 Registered as torch.ops.r9700.hc_gate_mix / hc_combine_norm (custom ops: the callers sit inside the compiled model
 graph) and bound over the names ``hyperconnection.py`` imported (``install``). Same bf16 rounding points as stock
 (the combine result is rounded to bf16 before the norm). Geometry outside the kernels' reach (HD % 8, HD <= 4096,
-bf16) falls back to the stock op per call. R9K_HC=stock keeps vLLM's kernels.
+bf16) and small row counts (R9K_HC_MIN_ROWS / _GATE: decode widths, where stock is at the launch floor) fall back
+to the stock op per call. R9K_HC=stock keeps vLLM's kernels.
 """
 from __future__ import annotations
 
@@ -23,6 +24,11 @@ logger = init_logger("vllm." + __name__)
 
 _L = None
 _DONE = False
+# Below these row counts the stock Triton kernels are at the launch floor (~3.4 us in graph replay) and ours are
+# 0.5-2 us slower (one workgroup per (row, stream) still pays an LDS reduction); ours win from a few hundred rows
+# (4096 rows: combine_norm 607 -> 469 us, gate_mix 318 -> 310). Decode / MTP verify (1-64 rows) stay on stock.
+MIN_ROWS_COMBINE = int(os.environ.get("R9K_HC_MIN_ROWS", "256"))
+MIN_ROWS_GATE = int(os.environ.get("R9K_HC_MIN_ROWS_GATE", "1024"))
 
 
 def lib():
@@ -53,7 +59,7 @@ def _fits(*ts, hd: int) -> bool:
 def gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     N, DIM = gate.shape
     HD = DIM // hc_count
-    if not _fits(x, gate, hd=HD) or x.shape != gate.shape:
+    if N < MIN_ROWS_GATE or not _fits(x, gate, hd=HD) or x.shape != gate.shape:
         return torch.ops.vllm.qwen4_exp_hc_gate_mix(x, gate, hc_count)
     y = x.new_empty((N, HD))
     rc = lib().r9k_hc_gate_mix(x.data_ptr(), x.stride(0), gate.data_ptr(), gate.stride(0), y.data_ptr(), y.stride(0),
@@ -67,7 +73,8 @@ def combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection_l
                  norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     N, DIM = residual.shape
     HD = DIM // hc_count
-    if not _fits(residual, block_output, injection_logits, norm_weight, hd=HD) or block_output.shape != (N, HD) \
+    if N < MIN_ROWS_COMBINE or not _fits(residual, block_output, injection_logits, norm_weight, hd=HD) \
+            or block_output.shape != (N, HD) \
             or injection_logits.shape != (N, hc_count) or norm_weight.numel() not in (HD, DIM) \
             or not norm_weight.is_contiguous():
         return torch.ops.vllm.qwen4_exp_hc_combine_norm(residual, block_output, injection_logits, norm_weight, eps,
