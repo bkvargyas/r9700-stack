@@ -100,6 +100,15 @@ def main():
     if not R.available():
         print("libr9k.so has no r9k_hc_combine_norm: rebuild kernels/")
         sys.exit(1)
+    # the registered custom ops (what the compiled model graph calls) must build and agree with the direct calls
+    R.register()
+    x, gate, blk, inj, w = rnd(64, HC * HD), rnd(64, HC * HD), rnd(64, HD), rnd(64, HC), rnd(HD).contiguous()
+    global bad
+    bad += not torch.equal(torch.ops.r9700.hc_gate_mix(x, gate, HC), R.gate_mix(x, gate, HC))
+    o1, y1 = torch.ops.r9700.hc_combine_norm(x, blk, inj, w, EPS, HC)
+    o2, y2 = R.combine_norm(x, blk, inj, w, EPS, HC)
+    bad += not (torch.equal(o1, o2) and torch.equal(y1, y2))
+    print(f"  {'torch.ops.r9700.hc_* registered and equal to direct calls':<34} {'ok' if bad == 0 else 'FAIL'}")
     check("rows 1 shared w", 1)
     check("rows 5 per-stream w", 5, shared=False)
     check("rows 333 shared w", 333)

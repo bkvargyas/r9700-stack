@@ -63,7 +63,8 @@ def gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor
     return y
 
 
-def combine_norm(residual, block_output, injection_logits, norm_weight, eps: float, hc_count: int):
+def combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+                 norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     N, DIM = residual.shape
     HD = DIM // hc_count
     if not _fits(residual, block_output, injection_logits, norm_weight, hd=HD) or block_output.shape != (N, HD) \
@@ -83,11 +84,12 @@ def combine_norm(residual, block_output, injection_logits, norm_weight, eps: flo
     return out, y
 
 
-def _gate_mix_fake(x, gate, hc_count: int):
+def _gate_mix_fake(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     return x.new_empty((x.shape[0], x.shape[1] // hc_count))
 
 
-def _combine_norm_fake(residual, block_output, injection_logits, norm_weight, eps: float, hc_count: int):
+def _combine_norm_fake(residual: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+                       norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     return residual.new_empty(residual.shape), residual.new_empty(residual.shape)
 
 
@@ -102,11 +104,12 @@ def register() -> None:
     _DONE = True
 
 
-def op_gate_mix(x, gate, hc_count: int):
+def op_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor:
     return torch.ops.r9700.hc_gate_mix(x, gate, hc_count)
 
 
-def op_combine_norm(residual, block_output, injection_logits, norm_weight, eps: float, hc_count: int):
+def op_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+                    norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops.r9700.hc_combine_norm(residual, block_output, injection_logits, norm_weight, eps, hc_count)
 
 
