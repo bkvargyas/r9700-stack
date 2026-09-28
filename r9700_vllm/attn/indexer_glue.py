@@ -32,7 +32,7 @@ def lib():
         L = KM.lib()
         L.r9k_gemma_norm_rope.restype = ctypes.c_int
         L.r9k_gemma_norm_rope.argtypes = [ctypes.c_long] * 7 + [ctypes.c_int] * 3 + [ctypes.c_float] + \
-            [ctypes.c_long] * 2 + [ctypes.c_int] * 2 + [ctypes.c_long] + [ctypes.c_int] * 4 + [ctypes.c_long]
+            [ctypes.c_long] * 2 + [ctypes.c_int] * 2 + [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_long]
         _L = L
     return _L
 
@@ -47,14 +47,20 @@ def available() -> bool:
 def _run(x: torch.Tensor, w: torch.Tensor, eps: float, cs: torch.Tensor | None, pos: torch.Tensor | None,
          rotary_dim: int, out: torch.Tensor, section: tuple[int, int, int] = (0, 0, 0), interleaved: bool = False
          ) -> None:
-    """x, out: [T, H, D] (x may be a strided view of a wider row; out contiguous). pos: int64 [T] or [3, T]."""
+    """x, out: [T, H, D] (x may be a strided view of a wider row; out contiguous). pos: int64 [T] or [3, T], any
+    strides (serving passes the indexer a [T] column view of a [T, 3] buffer)."""
     T, H, D = x.shape
     assert x.stride(2) == 1 and out.is_contiguous() and w.is_contiguous()
-    prow, pstride = (1, 0) if pos is None or pos.dim() == 1 else (pos.shape[0], pos.stride(0))
+    if pos is None:
+        prow, pstride, ptok = 1, 0, 1
+    elif pos.dim() == 1:
+        prow, pstride, ptok = 1, 0, pos.stride(0)
+    else:
+        prow, pstride, ptok = pos.shape[0], pos.stride(0), pos.stride(1)
     rc = lib().r9k_gemma_norm_rope(x.data_ptr(), x.stride(0), x.stride(1), w.data_ptr(), out.data_ptr(), out.stride(0),
                                    out.stride(1), T * H, H, D, float(eps),
                                    cs.data_ptr() if cs is not None else 0, pos.data_ptr() if pos is not None else 0,
-                                   rotary_dim, prow, pstride, int(section[0]), int(section[1]), int(section[2]),
+                                   rotary_dim, prow, pstride, ptok, int(section[0]), int(section[1]), int(section[2]),
                                    1 if interleaved else 0, torch.cuda.current_stream().cuda_stream)
     if rc:
         raise RuntimeError(f"r9k_gemma_norm_rope failed ({rc}) T={T} H={H} D={D} R2={rotary_dim} pos={tuple(pos.shape) if pos is not None else None}")
@@ -84,7 +90,7 @@ def _fits(x: torch.Tensor, w: torch.Tensor) -> bool:
 
 def _rope_fits(x: torch.Tensor, cs: torch.Tensor, pos: torch.Tensor, rotary_dim: int) -> bool:
     return (cs.dtype == torch.bfloat16 and cs.dim() == 2 and cs.shape[1] == rotary_dim and cs.is_contiguous()
-            and pos.dtype == torch.int64 and pos.stride(-1) == 1 and pos.shape[-1] == x.shape[0]
+            and pos.dtype == torch.int64 and pos.shape[-1] == x.shape[0]
             and (pos.dim() == 1 or (pos.dim() == 2 and pos.shape[0] == 3))
             and 16 <= rotary_dim <= x.shape[2] and rotary_dim % 16 == 0)
 

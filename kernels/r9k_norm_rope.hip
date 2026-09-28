@@ -41,7 +41,8 @@ __device__ __forceinline__ float wave_sum(float v) {
 
 struct MRope {
   int prow;            // position rows: 1 or 3
-  long pstride;        // elements between position rows (T)
+  long pstride;        // elements between position rows
+  long ptok;           // elements between consecutive tokens within a row (1 when contiguous)
   int sec_t, sec_h, sec_w;
   int interleaved;
   int trunc;           // products rounded toward zero (the Triton MRoPE path)
@@ -98,7 +99,7 @@ __global__ void __launch_bounds__(NT) r9k_gemma_norm_rope_kernel(
       const int cj = (first ? lane : lane - hc) * 8;
       const uint16_t* cp[3];
 #pragma unroll
-      for (int q = 0; q < 3; q++) cp[q] = cs + (long)pos[(q < mr.prow ? q : 0) * mr.pstride + t] * R2;
+      for (int q = 0; q < 3; q++) cp[q] = cs + (long)pos[(q < mr.prow ? q : 0) * mr.pstride + (long)t * mr.ptok] * R2;
 #pragma unroll
       for (int i = 0; i < 8; i++) {
         const int j = cj + i;
@@ -116,20 +117,22 @@ __global__ void __launch_bounds__(NT) r9k_gemma_norm_rope_kernel(
 }  // namespace
 
 // out[rows of D] = norm(x)[, rope on the first R2 with cos_sin[pos[token]]]. Row r: token r / H, head r % H.
-// Strides in elements. pos: int64 [prow, T] (prow 1 or 3, row stride pstride); sec_* / interleaved are the MRoPE
-// section rule for prow == 3. cs / pos may be 0 when R2 == 0 (norm only). Returns 0 or a negative shape code.
+// Strides in elements. pos: int64 [prow, T] (prow 1 or 3, row stride pstride, token stride ptok -- serving hands the
+// indexer a [T] column view of a [T, 3] buffer, ptok 3); sec_* / interleaved are the MRoPE section rule for prow == 3.
+// cs / pos may be 0 when R2 == 0 (norm only). Returns 0 or a negative shape code.
 extern "C" int r9k_gemma_norm_rope(long x, long sx, long sh, long w, long out, long so, long soh, int rows, int H,
-                                   int D, float eps, long cs, long pos, int R2, int prow, long pstride, int sec_t,
-                                   int sec_h, int sec_w, int interleaved, long stream) {
+                                   int D, float eps, long cs, long pos, int R2, int prow, long pstride, long ptok,
+                                   int sec_t, int sec_h, int sec_w, int interleaved, long stream) {
   if (rows < 0 || H < 1 || D < 8 || D > 256 || D % 8) return -1;
   if (R2 < 0 || R2 > D || R2 % 16) return -2;
   if (R2 > 0 && (cs == 0 || pos == 0)) return -3;
   if ((sx | sh | so | soh) & 7) return -4;
   if (prow != 1 && prow != 3) return -5;
+  if (R2 > 0 && ptok < 0) return -5;
   if (rows == 0) return 0;
   hipStream_t st = (hipStream_t)stream;
   const dim3 grid((rows + WAVES - 1) / WAVES), block(NT);
-  const MRope mr{prow, pstride, sec_t, sec_h, sec_w, interleaved, prow == 3 ? 1 : 0};
+  const MRope mr{prow, pstride, ptok, sec_t, sec_h, sec_w, interleaved, prow == 3 ? 1 : 0};
   if (R2 > 0)
     hipLaunchKernelGGL(r9k_gemma_norm_rope_kernel<true>, grid, block, 0, st, (const uint16_t*)x, sx, sh,
                        (const uint16_t*)w, (uint16_t*)out, so, soh, rows, H, D, eps, (const uint16_t*)cs,

@@ -614,8 +614,11 @@ nodes. Where our extra ~1,600 nodes per step come from (48 layers + 3 MTP passes
    (interleaved or concatenated, [3, T] positions) so both q (1-D or MRoPE positions) and k (MRoPE) are fused.
    Bound as `project_qk` / `normalize_compressed_keys` on every QSAIndexer (`R9K_QSA_GLUE=stock` reverts).
    `tests/test_indexer_glue_r9k.py`: bit-equal to the stock functions except fp32-order flips of the sum of squares.
-   Graph-timed at 4 tokens: stock norm+rope 58.5 us -> 6.0; norm 34 -> 4.0. In serving the q path still falls back to
-   stock's rope after our norm (12 calls/step; reason being logged), the k path is fully fused.
+   Graph-timed at 4 tokens: stock norm+rope 58.5 us -> 6.0; norm 34 -> 4.0. The first serving build still took
+   stock's rope after our norm on 12 calls/step: `normalize_compressed_keys` gets its positions as `[:, 0]` of a
+   `[T, 3]` buffer (1-D, element stride 3) and the fit check demanded unit stride. The kernel now takes a token
+   stride for the positions (`ptok`; the MRoPE `[3, T]` transpose view with row stride 1 / token stride 3 is covered
+   the same way), and the test has stride-3 / stride-5 / MRoPE stride-2 cases (RESULT_STRIDE_FIX).
 4. **Hyper-connection decode mix** (router kernel with an `hc_silu` epilogue on the merged down+inject GEMM, and
    `r9k_hc_up_mix` in `kernels/r9k_hc.hip`: up GEMM + sigmoid + gated mean over the four streams in one wave per
    four output dims, gate rounded to bf16 as the GEMM output was, streams summed in stock's order). Bound as

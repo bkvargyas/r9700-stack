@@ -64,19 +64,22 @@ def stock_mrope(x, cs, pos, rd, sec, interleaved):
     return out.reshape(T, H, D)
 
 
-def check(name, T, H, D, rd, strided=True, rope=True, mrope=None, same_pos=False):
-    """mrope: (section, interleaved) -> [3, T] positions through the Triton MRoPE reference."""
+def check(name, T, H, D, rd, strided=True, rope=True, mrope=None, same_pos=False, pos_stride=1):
+    """mrope: (section, interleaved) -> [3, T] positions through the Triton MRoPE reference. pos_stride > 1 hands the
+    kernel a strided column view of a wider int64 buffer (serving's 1-D positions are a [T] view of [T, 3], stride 3;
+    for MRoPE the [3, T] rows get token stride pos_stride)."""
     global bad
     norm = make_norm(D)
     wide = rnd(T, (H + 2) * D) if strided else rnd(T, H * D)
     x = wide[:, : H * D].view(T, H, D)
     cs = (torch.rand((MAXPOS, rd), generator=g) * 2 - 1).to(torch.bfloat16).to(dev)
     if mrope is None:
-        pos = torch.randint(0, MAXPOS, (T,), generator=g).to(dev)
+        pos = torch.randint(0, MAXPOS, (T, pos_stride), generator=g).to(dev)[:, 0]
     elif same_pos:
         pos = torch.randint(0, MAXPOS, (1, T), generator=g).expand(3, T).contiguous().to(dev)
     else:
-        pos = torch.randint(0, MAXPOS, (3, T), generator=g).to(dev)
+        pos = torch.randint(0, MAXPOS, (3, T, pos_stride), generator=g).to(dev)[:, :, 0]
+    assert pos.stride(-1) == pos_stride
     with torch.no_grad():
         s_n = norm.forward_native(x.reshape(-1, D)).reshape(T, H, D)
         o_n = G.gemma_norm(x, norm.weight, norm.variance_epsilon)
@@ -155,12 +158,16 @@ def main():
     check("q: 333 tokens, contiguous", 333, 4, 128, 32, strided=False)
     check("k: 700 rows, 1 head, norm only", 700, 1, 128, 32, strided=False, rope=False)
     check("k: 700 rows, 1 head, rope", 700, 1, 128, 32, strided=False)
+    check("q: 2048 tokens, 1 head, positions stride 3", 2048, 1, 128, 64, strided=True, pos_stride=3)
+    check("q: 64 tokens, positions stride 5", 64, 4, 128, 32, pos_stride=5)
     check("D=64 rd=16, 2 heads", 77, 2, 64, 16)
     check("D=256 rd=64, 3 heads", 50, 3, 256, 64)
     check("full rotary rd=D=128", 40, 4, 128, 128)
     check("mrope [11,11,10] interleaved, 4 heads", 64, 4, 128, 32, mrope=((11, 11, 10), True))
     check("mrope interleaved, equal T/H/W rows", 64, 4, 128, 32, mrope=((11, 11, 10), True), same_pos=True)
     check("mrope [6,5,5] concatenated, 1 head", 300, 1, 128, 32, strided=False, mrope=((6, 5, 5), False))
+    check("mrope [6,5,5] concat, pos stride 2", 300, 1, 128, 32, strided=False, mrope=((6, 5, 5), False),
+          pos_stride=2)
     check("mrope interleaved rd=64 D=256", 30, 3, 256, 64, mrope=((11, 11, 10), True))
     print("correctness:", "PASS" if bad == 0 else f"FAIL ({bad})")
     if os.environ.get("BENCH", "1") == "1":
