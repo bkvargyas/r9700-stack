@@ -397,14 +397,69 @@ MTP-3). The same full run with MTP-4: decode 130.5, step p50 22.48 ms, concurren
 +4.4% single-stream for -14% at 16 concurrent, so MTP-3 stays the default and `MTP=4` is the single-stream knob. Every lossy default passed two null paired evals at
 conc=1 (300 short-answer, 800 chain-of-thought); the served config's sanity check passes.
 
+### 2026-09-28: QSA indexer scoring kernel (r9k_qsa_score)
+
+The 4k-chunk profile of 2026-09-25 (final stack vs Rob, `~/chain-pf4k.out`) put our GPU-busy at 731 ms vs his 625:
+all-reduce 149 vs 200 (ours now faster), MoE 177 vs 141, elementwise 161 vs 97, QSA 96 vs 46. The QSA gap was
+one kernel: vLLM's Triton `_qsa_mqa_paged_kernel` (indexer scoring) at 80 ms per chunk, 43 calls x 1.85 ms. It
+launches a program per (row, 32 columns) over the whole context capacity, re-reads the compressed keys once per
+row, and writes every column of an fp32 [rows, capacity] logits buffer (128 MB per layer at 4096 rows), although
+`top_k_per_row_decode` reads row r only up to its visible count (position / 4).
+
+`kernels/r9k_qsa_score.hip` (independent implementation from the stock kernel's documented semantics, same WMMA
+pipeline as r9k_attn): one workgroup = 16 query rows x one column part; K[64 x 128] staged once per tile through
+the page table, per head S^T = K . Q_h^T on 8 WMMA 16x16x16 bf16, relu, sum over heads, scale; the tile stops at
+its last visible column and leaves the rest of the logits row untouched. Few-row batches (decode, MTP verify)
+split the column range across workgroups (R9K_QSA_SCORE_SPLITS). `attn/qsa_score.py` mirrors the stock
+`qsa_select_paged_tokens` (same 128 MB chunking, stock top-k and expansion) and is bound as `_select` on every
+`QSAIndexer` instance from `qsa.install`; `R9K_QSA_SCORE=stock` keeps vLLM's kernel. The indexer runs inside
+vLLM's `qwen4_exp_qsa_with_output` custom op, so the ctypes launch is outside torch.compile and cudagraph-safe.
+
+`tests/test_qsa_score.py` (single GPU, 15 cases: prefill tiles, chunked prefill to 32k, mixed batches with
+padding rows and forced splits, decode, MTP verify, tiny contexts, page sizes 4/16/64, 1/2/4/8 heads): logits on
+every visible column vs an fp32 reference, ours 1.4-4.2e-7 relative vs stock 1.4e-7-1.1e-6; visible counts equal;
+selected token lists identical except where the differing blocks tie with the k-th best reference score
+(4041/4096 rows identical on the random 4k case, the rest ties). Timing, 4 heads, page 16, scorer alone / end to
+end (score + top-k + expand):
+
+| shape | stock | **ours** | stock e2e | **ours e2e** |
+|---|--:|--:|--:|--:|
+| 4k chunk, ctx 12288 | 2,430 us | **752** | 2,547 | **1,049** |
+| 4k chunk, ctx 32768 | 6,561 | **2,029** | 7,253 | **2,511** |
+| 2k prefill | 210 | **65** | 273 | **184** |
+| decode 1 row, ctx 8000 | 79 | **38** | 214 | **180** |
+| MTP 16 reqs x 4 rows | 82 | **57** | 219 | **179** |
+
+Expected serving effect: ~-65 ms per 4k chunk at 12k context (~9% of GPU-busy), more at 32k. Serving A/B by probe,
+same day, TP=4 (`~/tp4tune/{qsc-r9k,qsc-stock}`): decode 148.5 -> 149.6 tok/s, c8 556 -> 533 (probe spread on c8
+across earlier identical configs is 517-562), c16 768 -> 770, **prefill 8k 5,549 -> 6,188 tok/s (+11.5%)**. Full
+20-pass BetterBench of the new default (`~/tp4tune/bb-final5`; same box, checkpoint and settings as bb-final4):
+
+| | bb-final4 (stock scorer) | **bb-final5 (r9k scorer)** | Rob's image |
+|---|--:|--:|--:|
+| decode score | 125.0 | 123.2 | 134.1 |
+| step p50 | 21.15 ms | 21.27 ms | 20.44 ms |
+| TTFT p50 | 104 ms | 103 ms | 145 ms |
+| prefill 2k / 8k / 16k / 32k | 5,106 / 5,624 / 5,726 / 5,532 | **5,607 / 6,281 / 6,406 / 6,158** | 5,279 / 5,711 / 5,977 / 6,106 |
+| concurrency 1 / 2 / 4 / 8 / 16 | 118 / 197 / 292 / 433 / 543 | 117 / 193 / 311 / 437 / 561 | 126 / 197 / 303 / 427 / 542 |
+
+Prefill +10-12% at every length and now ahead of Rob's image at all four (+6 / +10 / +7 / +1%); concurrency at
+parity or better (the probe's c8 dip was noise); decode -1.4%, inside the spread of identical earlier runs
+(123.1-125.1). Remaining gap to Rob: single-stream decode (his MTP-4) and step p50. Numerics: scores differ from stock only in fp32 summation order, so
+selections differ only at exact ties; no paired eval needed. Commit fd950d4 (local).
+
 ### Next
-1. Long-chain paired eval (`EVAL_THINK=1`, 800 q) of the candidate config; then make it the default.
-2. Prefill CPU floor (~285 ms per forward): cudagraph capture of prefill chunks, or less Python per op. The
-   compressed all-reduce is default (r9k_ar4, 691 us at 11 MB vs Rob's ~580); pipelining message halves across the
-   two links is the remaining ~5% there.
-3. Single-request decode: remaining 0.8 ms/step + MTP-4 acceptance (his 3.35 vs our 3.13 tok/step).
-4. Switch the default base image to vLLM 0.30.
+1. Serving numbers for the r9k QSA scorer (`~/chain-qsc.out`); if the probe and BetterBench confirm, it stays the
+   default (already on) and the 4k-chunk profile is re-taken.
+2. Remaining per-family gaps at 4096-token chunks vs Rob (2026-09-25 profile): MoE 177 vs 141 ms (our
+   `r9k_moe_mxfp4a8<4,1>` x147 + `4bit_prefill` x49 vs his m64 kernels), elementwise 161 vs 97 (`hc_combine_norm`
+   57 vs 41, `hc_gate_mix` 32 vs 27, ~450 eager ATen glue launches in the QSA region = 30 ms).
+3. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill).
+4. Single-request decode: 0.7 ms/step of per-step overhead (MTP drafts, sampling) vs Rob; MTP-4 acceptance
+   (his 3.35 vs our 3.13 tok/step).
 
 ### Open questions for Brian
-- mxfp4 for the TARGET LM head (Rob's w4a16 does the same): ~0.5 ms/step, changes logits; eval says null so far.
-- Whether to spend on the compressed prefill all-reduce (estimated ~8% prefill) vs the 27B.
+- MTP default: MTP-3 recommended (MTP-4 is +4.4% single-stream, -14% at 16 concurrent; `MTP=4` stays a knob).
+- Prefix caching off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse).
+- Push: commits ecdf7b8..fd950d4 are local only.
+- mxfp4 for the TARGET LM head (Rob's w4a16 does the same): ~0.5 ms/step, changes logits; two null paired evals.
