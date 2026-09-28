@@ -530,15 +530,43 @@ cfg 17 at one strip. TP=4 folded 4096 tokens: down 811 -> 690 us (1,932 on the d
 the row tables at the slab end, so cfg 17's stage overwrote them (memory fault): the tables now sit past
 max(slabs, stage). Probe: decode 150.6, c8 522, c16 794, prefill 8k 7,346 tok/s.
 
+**Re-profile after round 2 (`~/tprof-ours-prefill4kc`, 4189-token prompt, TP=4):** GPU-busy **548 ms vs Rob's
+625** (731 this morning), span 602 vs 666; 8,051 kernel launches vs his 5,393.
+
+| family | ours | Rob | biggest items |
+|---|--:|--:|---|
+| all-reduce | 146.6 | 200.0 | ar4_pack_push 58.2 x202, push2 27.1, reduce_pack_push 26.6, decode 8.3 x404 |
+| dense GEMM | 127.1 | 117.9 | `_w8a8_triton_block_scaled_mm` 34.1 x196 vs his fp8hip 28.7; hipBLASLt bf16 equal in total |
+| MoE | 118.3 | 141.1 | cfg 17 gate_up 34.8 + down 28.2 vs his m64 pair 101.7; moe_sum 21.4 vs 23.7 |
+| elementwise | 112.5 | 97.0 | hc_combine_norm 41.2 vs 41.4 (equal now), hc_gate_mix 32.7 vs 26.9, misc glue +9 |
+| QSA | 18.6 | 46.2 | |
+| GDN | 14.4 | 20.3 | |
+
+Kernel-side gaps are single digits now. The largest remaining item on eager 4k chunks is the 54 ms of launch gaps
+(span - busy; Rob 41 ms), i.e. the CPU floor: cudagraph capture of prefill chunks above 2048 tokens was rejected
+on 2026-09-25 for padding cost, when a chunk's GPU time was 25% higher than now -- re-measured and **rejected
+again** (`~/chain-cg4k.out`, same day, TTFT ms): 2166 tokens 293 -> 323, 3086 394 -> 435 (padding to the next
+capture size), 6076 798 -> 797, 12.7k 1731 -> 1726, 25k 3514 -> 3505 (no gain: the eager 4k chunk is not
+CPU-bound in practice), KV capacity 258,389 -> 176,128 tokens. Capture sizes stay dense to 2048.
+
+Current TTFT sweep (tokens: ms / tok/s): 236: 86 / 2,736; 695: 134 / 5,184; 1,325: 228 / 5,800; 2,166: 293 / 7,391;
+3,086: 394 / 7,825; 6,076: 798 / 7,612; 12,746: 1,731 / 7,365; 25,367: 3,514 / 7,219 (2026-09-25: 287 / 284 / 259 /
+564 / 564 / 1,075 / 2,248 / 4,509 ms).
+
+Remaining elementwise glue after the hc kernels (38.6 ms vs Rob's ~29): `r9k_silu_mul_quant_fp8` 6.4 ms x102,
+`__amd_rocclr_copyBuffer` 5.0 ms x244, stock `per_token_group_quant_8bit` 4.2 x196 (input quant of the block-fp8
+GEMM), `r9k_quant_rows_fp8` 5.4, `aten::mul` in the compiled MoE graph 2.9 -- nothing above 1% of the chunk.
+
 ### Next
-1. Serving numbers for the r9k QSA scorer (`~/chain-qsc.out`); if the probe and BetterBench confirm, it stays the
-   default (already on) and the 4k-chunk profile is re-taken.
-2. Remaining per-family gaps at 4096-token chunks vs Rob (2026-09-25 profile): MoE 177 vs 141 ms (our
-   `r9k_moe_mxfp4a8<4,1>` x147 + `4bit_prefill` x49 vs his m64 kernels), elementwise 161 vs 97 (`hc_combine_norm`
-   57 vs 41, `hc_gate_mix` 32 vs 27, ~450 eager ATen glue launches in the QSA region = 30 ms).
-3. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill).
-4. Single-request decode: 0.7 ms/step of per-step overhead (MTP drafts, sampling) vs Rob; MTP-4 acceptance
-   (his 3.35 vs our 3.13 tok/step).
+Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
+remaining items are each ~1% of a chunk unless noted:
+1. **Decode** (the one metric behind Rob: 125.4 vs 134.1 single-stream, his MTP-4 at 3.35 tok/step vs our MTP-3 at
+   3.13; step p50 21.06 vs 20.44 ms): per-step overhead (MTP drafts, sampling), or MTP-4 acceptance.
+2. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill; the
+   all-reduce is 147 ms = 27% of a 4k chunk's GPU time, pack_push 58 ms x202 the largest single kernel).
+3. `hc_gate_mix` 327 us x100 vs Rob's 269 (+6 ms per chunk); block-fp8 projections: stock Triton 34.1 ms x196 vs
+   his fp8hip 28.7 (+5 ms) -- a WMMA fp8-block GEMM for prefill widths would replace it.
+4. The 244 `copyBuffer` device copies (5 ms) and the stock per-token quant of the block GEMM (4.2 ms).
 
 ### Open questions for Brian
 - MTP default: MTP-3 recommended (MTP-4 is +4.4% single-stream, -14% at 16 concurrent; `MTP=4` stays a knob).
