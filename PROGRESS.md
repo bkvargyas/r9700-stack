@@ -684,7 +684,18 @@ fold), so the output is rounded once. Large M takes the same prefill / A-tiled G
 reference as stock (equal or better on 13 of 14 cases, within 0.7% on the other), 0.3-0.9% from stock in relative
 norm (the activation's fp8 codes). `R9K_SHARED_EXPERT=stock` restores vLLM's forward.
 
-RESULT_GDN_BENCH
+**Unit timing (graph replay, idle GPU, `~/gates-gdn.out`), per layer call:**
+
+| | stock | ours |
+|---|---|---|
+| GDN core, 1 sequence x 4 tokens (fp32 state) | 43.3 us (9 nodes) | 13.8 us (1) |
+| GDN core, 4 sequences | 52.7 | 19.5 |
+| GDN core, 16 sequences (fp32 / bf16 state) | 79.0 / 80.0 | 51.9 / 53.9 |
+| shared expert, M = 1 / 4 / 16 | 44.1 / 46.1 / 46.7 (8 launches) | 18.3 / 18.5 / 18.9 (4) |
+
+At batch 1 that is ~1.1 ms/step over the 36 GDN layers and ~1.2 ms over the 48 shared experts, against a 19.0 ms
+step. At 16 sequences the GDN kernel is state-bandwidth bound (4 x 64 KB of state stores per head per layer, as
+stock's); a split-V variant would help there if the concurrency numbers ask for it.
 
 RESULT_GDN_SERVING
 
