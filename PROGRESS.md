@@ -631,8 +631,20 @@ nodes. Where our extra ~1,600 nodes per step come from (48 layers + 3 MTP passes
 **Probe with all three (`mix-r9k`, vs `rt-r9k` / this morning's `epi-r9k`):** step 19.64 ms (20.93 / 21.37),
 decode 163.4 tok/s (154.9 / 150.6), c8 559 (525 / 522), c16 868 (843 / 794), prefill 8k 7,387 (flat). -8.1% step
 time in the round. Rob's probe on this box: 169 / 503 / 769 / 6,446. Paired 800-question chain-of-thought eval
-(round-2 default vs round 3) and the full BetterBench (`bb-final7`) were started as `~/chain-r3.sh` on VM100 and
-**interrupted for a hardware move (2026-09-28 ~15:40 UTC); rerun them before making round 3 the default.**
+(round-2 default vs round 3) and the full BetterBench (`bb-final7`) ran after the hardware move (2026-09-29):
+
+**bb-final7 (round 3, TP=4, MTP-3):** decode 139.1 tok/s, step p50 19.01 ms, TTFT p50 88 ms, prefill
+6444 / 7514 / 7630 / 7349 at 2k / 8k / 16k / 32k, concurrency 131 / 216 / 324 / 457 / 598 at c1..c16, sanity 8/8.
+Against bb-final6 (round 2): decode +11%, step -10%, prefill +2..+3%, c8 +3%, c16 +9%; single-stream decode is
+ahead of Rob's image (134.1) for the first time.
+
+**Paired eval: round 3 is WORSE.** 800 chain-of-thought questions at conc 1: qt-r2 (round-2 default) 98.00% vs
+qt-r3 96.88%; discordant 10 (r2-only right) vs 1 (r3-only right), McNemar p = 0.012; identical output on 31.5%.
+One of the three round-3 defaults perturbs the answers -- the router GEMM is the suspect (its near-tie flips change
+expert selection; the glue and hc mix differ from stock only in fp32 summation order). Bisect queued
+(`~/chain-bisect.sh`): router off / router alone / everything on (with round 4), each paired against qt-r2. Round 3
+must not stay the default until the culprit is found or reverted (the knobs: `R9K_ROUTER=stock`,
+`R9K_QSA_GLUE=stock`, `R9K_HC_MIX=stock`).
 
 Remaining node budget (eager profile with Python stacks, `~/dec-stack.py`, ~2,770 kernels/step after the round):
 GDN spec-decode glue in `qwen_gdn_linear_attn.py` (cat / reshape / contiguous / zeros / copies, ~9 per layer x 36:
@@ -688,6 +700,8 @@ remaining items are each ~1% of a chunk unless noted:
 4. The 244 `copyBuffer` device copies (5 ms) and the stock per-token quant of the block GEMM (4.2 ms).
 
 ### Open questions for Brian
+- **Round 3 quality regression (2026-09-29):** paired eval p = 0.012 against round 2; bisect running. Until it lands,
+  the shipped default (master) is round 3 -- consider `R9K_ROUTER=stock` in the serve scripts meanwhile.
 - MTP default: MTP-3 recommended (MTP-4 is +4.4% single-stream, -14% at 16 concurrent; `MTP=4` stays a knob).
 - Prefix caching off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse).
 - Push: commits ecdf7b8..fd950d4 are local only.
