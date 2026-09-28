@@ -557,6 +557,85 @@ Remaining elementwise glue after the hc kernels (38.6 ms vs Rob's ~29): `r9k_sil
 `__amd_rocclr_copyBuffer` 5.0 ms x244, stock `per_token_group_quant_8bit` 4.2 x196 (input quant of the block-fp8
 GEMM), `r9k_quant_rows_fp8` 5.4, `aten::mul` in the compiled MoE graph 2.9 -- nothing above 1% of the chunk.
 
+### 2026-09-28 round 3: decode -- where the 21 ms/step goes
+
+Target: decode 125.4 vs Rob's 134.1 (step 21.06 vs 20.44 ms, MTP-3 vs his MTP-4). Decode profiles at MTP-3, MTP-4 and
+of Rob's image (`~/tprof-{ours-decode3,ours-decode4,rob-decode}`, 256-token generation, rank 0; per-step scripts
+`~/dec-step.py`, `~/dec-gaps.py`, `~/dec-eager.py`, `~/dec-tail.py` on VM100):
+
+| per step | ours MTP-3 | ours MTP-4 | Rob MTP-4 |
+|---|--:|--:|--:|
+| kernel nodes | 3,254 | 3,363 | 1,639 |
+| GPU busy (ms) | 15.8 | 17.1 | 18.1 |
+| unprofiled step (ms) | 21.06 | 22.5 | 20.8 |
+
+**Our GPU time per step is lower than Rob's; the deficit is the node count.** The target forward is one HIP graph
+(2,823 nodes); the gaps sit inside its replay, not at eager launches (97% of kernels come from `hipGraphLaunch`,
+the CPU runs ~30 ms ahead). Rob's gaps are a uniform ~5.6 us per node under the profiler; ours bunch after runs
+of tiny ATen nodes. A microbench of graph replay on this ROCm (`~/graphnode-bench.py`) puts a tiny dependent node
+at 2.85 us (eager launch 8.7), and unprofiled arithmetic gives ~1.6 us of non-busy time per node for both stacks
+(ours 5.2 ms over 3,254, Rob 2.4 over 1,639). `hipGraphLaunch` of the 2,823-node graph also costs the CPU ~6 us
+per node under the profiler (16.8 ms per call), so bursts of small nodes starve the GPU. Either way: fewer, fatter
+nodes. Where our extra ~1,600 nodes per step come from (48 layers + 3 MTP passes):
+
+- QSA indexer glue (~30 per QSA layer, 15 passes): GemmaRMSNorm takes ir.ops.rms_norm's native path (fp32
+  `1 + w` weight, ~10 ATen launches per norm, two norms), and the 1-D neox rope runs `ApplyRotaryEmb.forward_static`
+  (~9 launches; flash_attn's Triton rotary is not in the image). ~400 nodes.
+- Hyper-connection per block: two wvSplitK skinny GEMMs (the merged 336x10240 down+inject at 14.4 us, the 10240x320
+  up at 12.2 us: 6.5 MB each at ~500 GB/s) plus Triton `hc_silu`, `hc_gate_mix`, `hc_combine_norm`. Rob runs one
+  `hc_fused_kernel` (38 us). ~200 excess nodes, and ~26 us of GEMM per block that a streaming kernel could halve.
+- Shared expert as a separate dense path: two mxfp4 GEMMs on the default (2,4,2) config = 5 workgroups for the
+  320-wide gate_up (18 us for 0.4 MB), two row quants, Triton silu-mul, a 6 us wvSplitK for the [1 x 2560] expert
+  gate, sigmoid, mul. ~250 nodes.
+- GDN layer glue (conv update, cat, index copies, elementwise) ~10 per layer; MoE align/count/topk 3 per layer;
+  10 NCCL all-gathers per step (the MTP head's `fc_embedding` / `fc_hidden` are built with `gather_output=True`,
+  2 per draft at ~47 us, plus the logits all-gather per head: 79 us drafts, 199 us target). Rob pays 5 x 170 us
+  through libr4d.
+- GPU-time items on top: the router gate is a plain bf16 `ReplicatedLinear` -> hipBLASLt picks a 16x16x32 tile
+  (19.6 us x 51 for 2.6 MB); the TP=4 block-fp8 and dense shapes were all untuned (`tuned.json` only had TP=2 and
+  27B shapes); block-fp8 projections run at ~480 GB/s whatever the config (kernel-bound, 22 + 10 us per layer).
+
+**Done, in order, each measured with the 1-minute probe (`~/tp4tune.sh`, TP=4, MTP-3):**
+
+1. `tuned.json` for the TP=4 shapes (`tuning/tune_dense.py` SHAPES extended): mxfp4 320x2560 11.2 -> 6.7 us,
+   2560x160 6.9 -> 5.6, LM head 62080x2560 156 -> 143; fp8block 4096x2560 23.0 -> 21.9, 2560x1536 9.5 -> 8.3,
+   3584x2560 20.9 -> 19.7 (M=4, graph-timed).
+2. **Router GEMM** (`kernels/r9k_router.hip`, `r9700_vllm/router.py`): bf16 x bf16 -> fp32 accumulate, one wave per
+   (expert, K split), rounded once to bf16 as hipBLASLt's bf16 output is (differs only in summation order;
+   `tests/test_router_r9k.py`: top-10 agreement 1.0, flips only on near-ties). Bound as the forward of every
+   `mlp.gate` (48 + MTP). 5.4 us at 4 rows vs 7.5 warm / 19.6 served; above 8 rows it loses to hipBLASLt (re-reads
+   the activations per expert), so the op switches to `torch.mm(out_dtype=fp32)` + cast at run time. Split 4/8 at
+   4 rows is anomalously slow (30 us) -- unexplained, split 2 is the default.
+   Probe `rt-r9k` (1 + 2): step 21.37 -> 20.93 ms, decode 150.6 -> 154.9 tok/s, c8 522 -> 525, c16 794 -> 843,
+   prefill 8k 7,346 -> 7,324.
+3. **QSA indexer glue** (`kernels/r9k_norm_rope.hip`, `r9700_vllm/attn/indexer_glue.py`): one launch per
+   (Gemma norm [+ rope]) per head set, fp32 math with the native path's rounding points, neox rope on bf16 cos/sin
+   with the three bf16 roundings of `forward_static`, and the MRoPE section rule of `_triton_mrope_forward`
+   (interleaved or concatenated, [3, T] positions) so both q (1-D or MRoPE positions) and k (MRoPE) are fused.
+   Bound as `project_qk` / `normalize_compressed_keys` on every QSAIndexer (`R9K_QSA_GLUE=stock` reverts).
+   `tests/test_indexer_glue_r9k.py`: bit-equal to the stock functions except fp32-order flips of the sum of squares.
+   Graph-timed at 4 tokens: stock norm+rope 58.5 us -> 6.0; norm 34 -> 4.0. In serving the q path still falls back to
+   stock's rope after our norm (12 calls/step; reason being logged), the k path is fully fused.
+4. **Hyper-connection decode mix** (router kernel with an `hc_silu` epilogue on the merged down+inject GEMM, and
+   `r9k_hc_up_mix` in `kernels/r9k_hc.hip`: up GEMM + sigmoid + gated mean over the four streams in one wave per
+   four output dims, gate rounded to bf16 as the GEMM output was, streams summed in stock's order). Bound as
+   `GatedResidual.mix` / `combine_and_mix` (`hc.install_mix`, `R9K_HC_MIX=stock` reverts); rows above 8 take
+   stock's path inside the ops. `tests/test_hc_mix_r9k.py`. Cold microbench at 4 rows: stock down GEMM 17.6 us ->
+   9.6 (split 8), up GEMM 9.4 -> up+mix 13.2 (weight rows read 64 B per lane-group; still slower than wvSplitK's
+   up GEMM alone but it absorbs sigmoid + mean); the whole mix 48 -> 25.5 us.
+
+**Probe with all three (`mix-r9k`, vs `rt-r9k` / this morning's `epi-r9k`):** step 19.64 ms (20.93 / 21.37),
+decode 163.4 tok/s (154.9 / 150.6), c8 559 (525 / 522), c16 868 (843 / 794), prefill 8k 7,387 (flat). -8.1% step
+time in the round. Rob's probe on this box: 169 / 503 / 769 / 6,446. Paired 800-question chain-of-thought eval
+(round-2 default vs round 3) and the full BetterBench (`bb-final7`) were started as `~/chain-r3.sh` on VM100 and
+**interrupted for a hardware move (2026-09-28 ~15:40 UTC); rerun them before making round 3 the default.**
+
+Remaining node budget (eager profile with Python stacks, `~/dec-stack.py`, ~2,770 kernels/step after the round):
+GDN spec-decode glue in `qwen_gdn_linear_attn.py` (cat / reshape / contiguous / zeros / copies, ~9 per layer x 36:
+vLLM fuses only the non-speculative decode path), the shared expert's own quant + silu + expert-gate GEMM + sigmoid
++ mul (~5 per layer), `moe_align_block_size` + `count_and_sort` + `topk_softmax` + `moe_sum` + the top-k weight copy
+(5 per layer, stock), the block-fp8 input quant (2 per layer), 10 NCCL all-gathers.
+
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
 remaining items are each ~1% of a chunk unless noted:
