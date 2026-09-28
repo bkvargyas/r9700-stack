@@ -521,6 +521,15 @@ checkpoint and settings (`~/tp4tune/bb-final6`):
 Prefill +19 / +30 / +26 / +19% over Rob's image at 2k / 8k / 16k / 32k (+24-31% over this morning's default);
 concurrency at parity; single-stream decode unchanged (-6.5% vs his MTP-4). Sanity check below.
 
+**Staged C stores in the prefill epilogues.** The WMMA D layout leaves each lane 8 rows of one column, so the
+direct store was 2 bytes per lane. Each wave now writes its TM*16 x 16-column strip into LDS (the slab buffers,
+free after the K loop) and stores whole 16 B row chunks. Whole-wave-tile staging (JS = TN) needs more LDS than the
+slabs on cfg 17 and measured worse (down 745 us) than one strip at a time (690), so `PF_STAGE_MAX` = 16 KB keeps
+cfg 17 at one strip. TP=4 folded 4096 tokens: down 811 -> 690 us (1,932 on the decode kernel this morning), gate_up
+899 -> 883; TP=2: down 1,169 -> 1,077, gate_up 1,531 -> 1,510. A first cut put the stage past the slabs but left
+the row tables at the slab end, so cfg 17's stage overwrote them (memory fault): the tables now sit past
+max(slabs, stage). Probe: decode 150.6, c8 522, c16 794, prefill 8k 7,346 tok/s.
+
 ### Next
 1. Serving numbers for the r9k QSA scorer (`~/chain-qsc.out`); if the probe and BetterBench confirm, it stays the
    default (already on) and the 4k-chunk profile is re-taken.
