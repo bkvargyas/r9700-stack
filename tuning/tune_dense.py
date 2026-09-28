@@ -33,6 +33,9 @@ SHAPES = {
                (48, 5120)],
     # Flash-Next shared expert (dense MXFP4) + 27B converted path (R9K_NVFP4=mxfp4)
     "mxfp4": [(640, 2560), (2560, 320), (17408, 5120), (5120, 8704), (10240, 320),
+              # Flash-Next at TP=4: shared expert gate_up / down per rank, and the mxfp4 LM-head shadows
+              # (vocab 248320 / 4; the default (2,4,2) ran the 320-wide gate_up on 5 workgroups: 18 us for 0.4 MB)
+              (320, 2560), (2560, 160), (62080, 2560),
               # R9K_FP8_TO_MXFP4: 27B attention / GDN, Flash-Next attention / GDN (block fp8 requantized)
               (7168, 5120), (8192, 5120), (5120, 3072), (8192, 2560), (6656, 2560), (2560, 3072),
               # GDN in_proj_qkvz + in_proj_ba merged (models/gdn.py), 27B
@@ -41,6 +44,8 @@ SHAPES = {
               (3072, 5120), (5120, 2048)],
     # Flash-Next attention / GDN block-fp8 projections
     "fp8block": [(8192, 2560), (6656, 2560), (2560, 3072),
+                 # Flash-Next at TP=4: GDN in_proj_qkvz / out_proj, QSA qkv per rank
+                 (4096, 2560), (2560, 1536), (3584, 2560),
                  # DFlash2 drafter for the 27B (block fp8): qkv, o, gate_up, down per rank
                  (3072, 5120), (5120, 2048), (17408, 5120), (5120, 8704)],
 }
