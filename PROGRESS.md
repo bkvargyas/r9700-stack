@@ -448,6 +448,79 @@ parity or better (the probe's c8 dip was noise); decode -1.4%, inside the spread
 (123.1-125.1). Remaining gap to Rob: single-stream decode (his MTP-4) and step p50. Numerics: scores differ from stock only in fp32 summation order, so
 selections differ only at exact ties; no paired eval needed. Commit fd950d4 (local).
 
+### 2026-09-28 (cont.): re-profiled, the TP=4 down GEMM, and the PLE transposes
+
+4k-chunk profile with the r9k scorer (`~/tprof-ours-prefill4kb`): GPU-busy 731 -> 653 ms (Rob 625); QSA 96 -> 19 ms
+(Rob 46). Remaining per family: elementwise 160 vs 97, MoE 176 vs 141, dense GEMM 125 vs 118, all-reduce 148 vs 200,
+GDN 14.5 vs 20. Per kernel:
+
+- **Down GEMM at TP=4 ran on the decode kernel.** Per rank K=160; `r9k_moe_4bit_prefill` and `pick_moe_prefill`
+  required K % 64 although the BK=32 tiles (cfgs 8-11) walk K as whole 32-slabs. 49 calls x 1.5 ms = 73 ms per
+  chunk. Guard is now per tile (`r9k_moe_prefill_bk`), plus a 64x128 BK=32 tile (cfg 17). Bench (E=512, top-10,
+  4096 tokens, `tuning/prefill_moe_bench.py --tp 4`): down 1,946 us (old) -> 1,222 (cfg 11) / 1,250 (cfg 17);
+  folded variants slower (1,328 / 1,429); cfg 11 stays the default. Still only 27 TFLOPs: the epilogue writes 2-byte
+  scattered elements (a wave's store covers two 32 B row fragments) and the down output is 210 MB per chunk --
+  ablation queued (`-DR9K_PF_ABL=8`, no epilogue stores) to size an LDS-staged epilogue.
+- **`torch.zeros` of the down buffer** (168 MB, 260 us x 49 = 10.6 ms per chunk) dropped when there is no expert
+  map: the hot and cold passes write every routed row (`R9K_MOE_ZERO_DOWN=1` restores it).
+- **PLE short conv: 27.5 ms per chunk, of which 23.4 ms are six ATen strided copies** -- the two
+  `transpose(1, 2).contiguous()` around `F.conv1d` on [prefills, 4096, 10240] bf16 at ~14 GB/s (5.9 ms each; the
+  depthwise conv itself is 1.1 ms). `kernels/r9k_transpose.hip` (64x64 LDS tiles, 16 B coalesced both ways) +
+  `ple/short_conv.py`: the stock prefill method with the two transposes on our kernel, bound per PLE layer
+  (`R9K_PLE_CONV=stock` keeps vLLM's). Test vs the stock method (bit-identical output and conv state) pending.
+- Also seen: `hc_combine_norm` 575 us x 97 (Rob ~420), `hc_gate_mix` 322 us x 100 (Rob ~270) -- stock Triton, one
+  program per row, 512-wide blocks; a HIP rewrite is the next elementwise item. `aten::mul` in the compiled MoE
+  graph 2.8 ms; `w8a8_triton_block_scaled_mm` 34 ms (Rob's fp8 GEMM 29).
+
+Serving probe (TP=4) after the down tile + no zero fill: decode 149.6 -> 148.8, c8 533 -> 550, c16 770 -> 783,
+**prefill 8k 6,188 -> 6,639 tok/s** (+7.3%; +20% over the stock-scorer 5,549 of the same morning). Commit 115ae91.
+
+**Prefill epilogue root cause (ablations, cfg 11 down GEMM, TP=4, 4096 tokens):** 1,191 us as is; 976 with the
+stores skipped; **447 with no epilogue at all**. The epilogue gathered `As[row]` and `topk_w[row]` per output
+element, re-read for every column tile: ~45% of the K=160 kernel. Both prefill kernels now build a per-row scale
+table in LDS next to `sRow` once per routing block. Single-buffered BK=32 tiles (cfgs 18/19, half the LDS) had
+been tried first and changed nothing, which ruled out occupancy. With the fix, folded weights, 4096 tokens:
+
+| routed GEMM | MT kernel | cfg 11 / 15 (old defaults) | **cfg 17 (64x128 BK=32)** |
+|---|--:|--:|--:|
+| TP=4 down 2560x160 | 1,982 us | 855 | **811** |
+| TP=4 gate_up 320x2560 | 969 | 980 | **899** |
+| TP=2 down 2560x320 | 2,719 | 1,270 | **1,169** |
+| TP=2 gate_up 640x2560 | 2,085 | 1,638 | **1,531** |
+
+cfg 17 is the default for both GEMMs (`R9K_MOE_PREFILL_CFG` / `_CFG1` still override). Remaining epilogue cost is
+the 2-byte scattered C stores (~200-350 us of the 811); staging the C tile through LDS for 16 B row stores is the
+next step there. `tests/test_prefill_4bit.py`, `test_atiled_4bit.py`, `test_cache_moe.py` pass.
+
+**PLE short conv:** `r9k_transpose16` 3,121 -> 444 us on the [1, 4096, 10240] transpose; the prefill method
+26.5 -> 4.1 ms per call, output and conv state bit-identical to stock on one long prefill, a mixed batch with a
+decode prefix, tiny lengths, NULL-block and empty-state cases (`tests/test_ple_conv.py`).
+
+**Hyper-connection kernels (`kernels/r9k_hc.hip`, `hc.py`):** one 128-thread workgroup per (row, stream) for
+combine_norm (combine result held as packed bf16 between the two passes; the first cut, one wave per stream with
+fp32 registers, was register-bound at 558 us and, worse, 12.5 us vs stock's 3.7 in graph replay at decode widths --
+it cost 0.8 ms/step in the first serving probe), one wave per (row, 256 columns) for gate_mix. Graph-timed, 4096
+rows: combine_norm 607 -> 469 us, gate_mix 318 -> 310; at 1-64 rows stock is at the launch floor (3.4 us) and ours
+0.5-2 us behind, so rows below `R9K_HC_MIN_ROWS` (256; gate_mix 1024) stay on stock -- decode never sees ours.
+Combine output bit-identical to stock, norm output at stock's own bf16 error (`tests/test_hc_r9k.py`). Installed by
+binding over `hyperconnection.py`'s imported names as torch.ops.r9700 custom ops before tracing (they sit inside the
+compiled graph; the op signatures need full type annotations or the engine refuses to start).
+
+**Round-2 serving result (2026-09-28, TP=4).** Probe after all of the above: decode 150.1, c8 521, c16 794,
+prefill 8k 7,287 tok/s (5,549 with the stock scorer this morning: +31%). Full 20-pass BetterBench, same box,
+checkpoint and settings (`~/tp4tune/bb-final6`):
+
+| | bb-final4 (stock QSA scorer) | bb-final5 (r9k scorer) | **bb-final6 (round 2)** | Rob's image |
+|---|--:|--:|--:|--:|
+| decode score | 125.0 | 123.2 | **125.4** | 134.1 |
+| step p50 | 21.15 ms | 21.27 ms | **21.06 ms** | 20.44 ms |
+| TTFT p50 | 104 ms | 103 ms | **100 ms** | 145 ms |
+| prefill 2k / 8k / 16k / 32k | 5,106 / 5,624 / 5,726 / 5,532 | 5,607 / 6,281 / 6,406 / 6,158 | **6,308 / 7,415 / 7,537 / 7,254** | 5,279 / 5,711 / 5,977 / 6,106 |
+| concurrency 1 / 2 / 4 / 8 / 16 | 118 / 197 / 292 / 433 / 543 | 117 / 193 / 311 / 437 / 561 | 118 / 193 / 308 / 442 / 550 | 126 / 197 / 303 / 427 / 542 |
+
+Prefill +19 / +30 / +26 / +19% over Rob's image at 2k / 8k / 16k / 32k (+24-31% over this morning's default);
+concurrency at parity; single-stream decode unchanged (-6.5% vs his MTP-4). Sanity check below.
+
 ### Next
 1. Serving numbers for the r9k QSA scorer (`~/chain-qsc.out`); if the probe and BetterBench confirm, it stays the
    default (already on) and the 4k-chunk profile is re-taken.
