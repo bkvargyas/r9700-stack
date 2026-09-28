@@ -146,8 +146,9 @@ def _forward_qsa(self, layer, query, key, value, kv_cache, attn_metadata, output
 def install(model: torch.nn.Module) -> int:
     """Bind our forward_qsa on every QSA impl under `model` (and our indexer scoring, qsa_score.py; independent
     knob R9K_QSA_SCORE). Returns how many attention layers were switched."""
-    from . import qsa_score
+    from . import indexer_glue, qsa_score
     qsa_score.install_indexers(model)
+    indexer_glue.install(model)                 # independent knob R9K_QSA_GLUE (norm + rope glue per head)
     if os.environ.get("R9K_QSA", "r9k") != "r9k" or not available():
         return 0
     n = nf = 0
