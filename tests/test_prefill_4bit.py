@@ -95,7 +95,7 @@ for kind in ("mxfp4", "nvfp4"):
 
 # ---- routed MoE (Flash-Next shapes): E experts, many rows per expert, padding blocks, a_row_div = topk, topk_w
 E, M, topk = 16, 1200, 4
-for cfg in (0, 2, 3, 6, 11, 15):      # 11 / 15 = the tiles experts.py uses for the routed down / gate_up GEMMs (block 64)
+for cfg in (0, 2, 3, 6, 11, 15, 17):  # 17 = the tile experts.py uses for both routed GEMMs (block 64); 11 / 15 its predecessors
     W1, wd1 = make_w("mxfp4", 640, 2560, E)
     W2, wd2 = make_w("mxfp4", 2560, 320, E)
     blk = K.prefill_block(cfg)
@@ -156,7 +156,7 @@ for cfg in (11, 17):
     except RuntimeError:
         pass
 assert K.pick_moe_prefill(4, 160) == K.MOE_PREFILL_CFG, K.pick_moe_prefill(4, 160)
-assert K.pick_moe_prefill(4, 160, gate_up=True) is None or K.prefill_bk(K.MOE_PREFILL_CFG_GATE_UP) == 32
+assert K.pick_moe_prefill(4, 2560, gate_up=True) == K.MOE_PREFILL_CFG_GATE_UP
 print("pick_moe_prefill(MT=4, K=160) ->", K.pick_moe_prefill(4, 160), "(down tile at TP=4)")
 
 # ---- ops-level dispatch (torch.ops.r9700.*_linear) picks the prefill path at large M and the old one at decode M

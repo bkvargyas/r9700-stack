@@ -299,7 +299,8 @@ def silu_mul_quant_fp8(gu: torch.Tensor):
 # kPfCfgs in r9k_moe_mxfp4a8.hip (the kernel is the source of truth: prefill_block() asks it).
 PREFILL_TILES = {0: (256, 64), 1: (256, 128), 2: (128, 128), 3: (128, 64), 4: (128, 64), 5: (256, 32),
                  6: (64, 64), 7: (256, 128), 8: (256, 128), 9: (256, 128), 10: (128, 128), 11: (64, 64),
-                 12: (256, 128), 13: (128, 128), 14: (64, 64), 15: (64, 128), 16: (256, 128), 17: (64, 128)}
+                 12: (256, 128), 13: (128, 128), 14: (64, 64), 15: (64, 128), 16: (256, 128), 17: (64, 128),
+                 18: (64, 64), 19: (64, 128)}
 PREFILL_MIN_M = int(os.environ.get("R9K_PREFILL_MIN_M", "128"))   # dense calls at M >= this use the prefill path
 # Untuned shapes: 256x128 BK=64 double-buffered (cfg 12) from M >= 512, 128x128 double-buffered (cfg 10) below (grid fill).
 PREFILL_DEFAULT = int(os.environ.get("R9K_PREFILL_CFG", "12"))
@@ -483,18 +484,18 @@ def pick_mt(numel: int, num_experts: int) -> int:
     return 4 if per >= 32 else (2 if per >= 16 else 1)
 
 
-MOE_PREFILL_CFG = int(os.environ.get("R9K_MOE_PREFILL_CFG", "11"))     # -1: routed MoE never uses the prefill tile
-MOE_PREFILL_CFG_GATE_UP = int(os.environ.get("R9K_MOE_PREFILL_CFG1", "15"))   # -1: gate_up stays on the MT kernel
+MOE_PREFILL_CFG = int(os.environ.get("R9K_MOE_PREFILL_CFG", "17"))     # -1: routed MoE never uses the prefill tile
+MOE_PREFILL_CFG_GATE_UP = int(os.environ.get("R9K_MOE_PREFILL_CFG1", "17"))   # -1: gate_up stays on the MT kernel
 
 
 def pick_moe_prefill(MT: int, K_down: int, gate_up: bool = False) -> int | None:
     """Prefill tile for the routed-MoE GEMMs of a step whose routing block is 16*MT rows (None: keep the MT kernel).
-    Both tiles share block 64 with MT=4, so one moe_align_block_size table serves both GEMMs:
-      * down (K=320): the 64x64 double-buffered tile (cfg 11), 1.6-1.7x faster than the split-K decode kernel
-        (Flash-Next 2048/4096-token chunks: 1631 -> 1023 / 2802 -> 1669 us steady-state);
-      * gate_up (N=640, K=2560): the 64x128 BK=64 double-buffered tile (cfg 15: five column tiles instead of ten,
-        half the barriers per K), 1347 -> 1230 / 2282 -> 1907 us at 2048 / 4096 tokens (the 64x64 tiles were a
-        wash to -10% against the MT kernel, which is why the first pass left gate_up on it)."""
+    Both tiles share block 64 with MT=4, so one moe_align_block_size table serves both GEMMs. Since the epilogue
+    reads its per-row scales from LDS (2026-09-28) the 64x128 BK=32 double-buffered tile (cfg 17) is the best of
+    the block-64 tiles for both GEMMs at both TP sizes (tuning/prefill_moe_bench.py, folded, 4096 tokens):
+      * TP=2: gate_up 640x2560 1531 us (cfg 15: 1638, MT kernel: 2085); down 2560x320 1169 (cfg 11: 1270, MT 2719)
+      * TP=4: gate_up 320x2560  899 us (cfg 15:  980, MT kernel:  969); down 2560x160  811 (cfg 11:  855, MT 1982)
+    BK=32 also admits K=160 (TP=4 down), which the BK=64 tiles reject."""
     cfg = MOE_PREFILL_CFG_GATE_UP if gate_up else MOE_PREFILL_CFG
     if cfg < 0 or 16 * MT != prefill_block(cfg) or K_down % prefill_bk(cfg):
         return None

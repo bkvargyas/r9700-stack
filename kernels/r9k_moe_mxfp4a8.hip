@@ -582,7 +582,7 @@ extern "C" int r9k_moe_nvfp4a8(long a, long as, long wq, long ws, long wg, long 
 // accumulator with explicit fmaf (exact weight math, no folded / flushed exponents; FOLD = the folded variant), epilogue
 // bf16(acc * (Wg[n] *) As[row] (* topk_w[row])). Split-K is not used (K is walked whole by one workgroup).
 #ifndef R9K_PF_ABL
-#define R9K_PF_ABL 0      // timing ablations (never in production builds): 1 no reloads, 2 no WMMA, 4 no barriers
+#define R9K_PF_ABL 0      // timing ablations (never in production builds): 1 no reloads, 2 no WMMA, 4 no barriers, 8 no epilogue stores
 #endif
 #ifndef R9K_AT_RESCALE
 #define R9K_AT_RESCALE 0  // EXPERIMENT (A-tiled, FOLD = false only; not a production build): accumulator rescaling
@@ -622,6 +622,7 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
   constexpr int BUF_BYTES = SA_BYTES + SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
   extern __shared__ __align__(16) unsigned char pf_smem[];
   int* const sRow = (int*)(pf_smem + NBUF * BUF_BYTES);
+  float* const sSc = (float*)(sRow + BM);          // per-row output scale: A row scale (x router weight), once per block
 
   // Workgroups are dispatched x-fastest: all column tiles of routing block 0, then of block 1, ... so a block's A
   // rows stay in L2 while the weight streams from MALL / DRAM once per routing block. A grouped swizzle (gm
@@ -646,7 +647,9 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
 
   for (int r = tid; r < BM; r += NT) {
     const int fl = sorted_ids[by * BM + r];
-    sRow[r] = (fl < 0 || fl >= numel) ? -1 : fl;            // -1: padding row (loaded as `first`, never stored)
+    const bool live = fl >= 0 && fl < numel;
+    sRow[r] = live ? fl : -1;                                // -1: padding row (loaded as `first`, never stored)
+    sSc[r] = live ? As[fl / a_row_div] * (topk_w ? topk_w[fl] : 1.f) : 0.f;
   }
   __syncthreads();
 
@@ -864,6 +867,17 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
 #undef PF_LOAD
 
   // Epilogue: lane holds rows mhalf..+8 of column nlane in every 16x16 tile; rows scatter through sRow.
+  if (R9K_PF_ABL & 8) {            // ablation: no epilogue memory traffic at all (keeps the WMMAs live)
+    float t = 0.f;
+#pragma unroll
+    for (int j = 0; j < TN; j++)
+#pragma unroll
+      for (int i = 0; i < TM; i++)
+#pragma unroll
+        for (int q = 0; q < 8; q++) t += acc[i][j][q];
+    if (t == 12345.f) C[threadIdx.x] = 0;
+    return;
+  }
 #pragma unroll
   for (int j = 0; j < TN; j++) {
     const int n = (nt0 + wn * TN + j) * 16 + nlane;
@@ -873,10 +887,11 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     for (int i = 0; i < TM; i++) {
 #pragma unroll
       for (int q = 0; q < 8; q++) {
-        const int fr = sRow[wm * TM * 16 + i * 16 + mhalf + q];
+        const int rr = wm * TM * 16 + i * 16 + mhalf + q;
+        const int fr = sRow[rr];
         if (fr < 0) continue;
-        float sc = wg * As[fr / a_row_div];
-        if (topk_w) sc *= topk_w[fr];
+        const float sc = wg * sSc[rr];                     // the per-element As / topk_w gathers were ~45% of the
+                                                           // K=160 down GEMM (1191 -> ~650 us at 4096 tokens)
         C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
       }
     }
@@ -905,6 +920,8 @@ static const PfCfg kPfCfgs[] = {
   {4, 4, 4, 2, 64, 1},   // 16: 256 x 128, 8 waves,  BK=64 double-buffered
   {2, 4, 2, 2, 32, 1},   // 17: 64 x 128,  4 waves,  BK=32 double-buffered (routed down at TP=4: K=160 = 5 slabs;
                          //     8 waves would split the 64x32 A slab into half-chunks per thread)
+  {2, 2, 2, 2, 32, 0},   // 18: 64 x 64,   4 waves,  BK=32 single-buffered (half the LDS of 11: occupancy for tiny K)
+  {2, 4, 2, 2, 32, 0},   // 19: 64 x 128,  4 waves,  BK=32 single-buffered
 };
 #define PF_NCFG ((int)(sizeof(kPfCfgs) / sizeof(kPfCfgs[0])))
 
@@ -936,7 +953,7 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
     constexpr int G = BKv / (NVv ? 16 : GROUP);                                                            \
     constexpr size_t ssb = FOv ? 0 : (((size_t)BN * G + 15) & ~(size_t)15);                                \
     constexpr size_t buf = (size_t)BM * (BKv + 8) + (size_t)BN * BKv + ssb;                                \
-    const size_t smem = (DBv ? 2 : 1) * buf + (size_t)BM * 4;                                              \
+    const size_t smem = (DBv ? 2 : 1) * buf + (size_t)BM * 8;                                              \
     if (smem > 64 * 1024) return -4;                                                                       \
     dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
     hipLaunchKernelGGL((r9k_moe_4bit_prefill_kernel<TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv>), grid, block, smem, st, \
@@ -967,6 +984,8 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
     case 15: PLN(2, 2, 2, 4, 64, true); break;
     case 16: PLN(4, 4, 4, 2, 64, true); break;
     case 17: PLN(2, 4, 2, 2, 32, true); break;
+    case 18: PLN(2, 2, 2, 2, 32, false); break;
+    case 19: PLN(2, 4, 2, 2, 32, false); break;
     default: return -7;
   }
 #undef PLN
@@ -1014,6 +1033,7 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kern
   constexpr int BUF_BYTES = SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
   extern __shared__ __align__(16) unsigned char pf_smem[];
   int* const sRow = (int*)(pf_smem + NBUF * BUF_BYTES);
+  float* const sSc = (float*)(sRow + BM);          // per-row output scale: A row scale (x router weight), once per block
 
   const int bx = blockIdx.x, by = blockIdx.y;
   if (by * BM >= ntpp[0]) return;
@@ -1033,7 +1053,9 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kern
 
   for (int r = tid; r < BM; r += NT) {
     const int fl = sorted_ids[by * BM + r];
-    sRow[r] = (fl < 0 || fl >= numel) ? -1 : fl;            // -1: padding row (computed, never stored)
+    const bool live = fl >= 0 && fl < numel;
+    sRow[r] = live ? fl : -1;                                // -1: padding row (computed, never stored)
+    sSc[r] = live ? As[fl / a_row_div] * (topk_w ? topk_w[fl] : 1.f) : 0.f;
   }
   __syncthreads();
 
@@ -1253,10 +1275,11 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kern
     for (int i = 0; i < TM; i++) {
 #pragma unroll
       for (int q = 0; q < 8; q++) {
-        const int fr = sRow[wm * TM * 16 + i * 16 + mhalf + q];
+        const int rr = wm * TM * 16 + i * 16 + mhalf + q;
+        const int fr = sRow[rr];
         if (fr < 0) continue;
-        float sc = wg * As[fr / a_row_div];
-        if (topk_w) sc *= topk_w[fr];
+        const float sc = wg * sSc[rr];                     // the per-element As / topk_w gathers were ~45% of the
+                                                           // K=160 down GEMM (1191 -> ~650 us at 4096 tokens)
         C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
       }
     }
@@ -1299,7 +1322,7 @@ extern "C" int r9k_moe_4bit_prefill_at(int fold, long a, long as, long wq, long 
   {                                                                                                        \
     constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
     constexpr size_t ssb = FOv ? 0 : (((size_t)BN * (BKv / GROUP) + 15) & ~(size_t)15);                    \
-    const size_t smem = (DBv ? 2 : 1) * ((size_t)BN * BKv + ssb) + (size_t)BM * 4;                         \
+    const size_t smem = (DBv ? 2 : 1) * ((size_t)BN * BKv + ssb) + (size_t)BM * 8;                         \
     dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
     hipLaunchKernelGGL((r9k_moe_4bit_prefill_at_kernel<TMv, TNv, WMv, WNv, BKv, DBv, FOv>), grid, block, smem, st, \
         (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \

@@ -39,10 +39,11 @@ def main():
     ap.add_argument("--warm", type=float, default=0.0, help="seconds of load before timing (steady-state clocks)")
     ap.add_argument("--rounds", type=int, default=1, help="interleaved timing rounds per cfg (min reported)")
     ap.add_argument("--fold", default="", help="cfgs (comma list, same names as --cfgs) also timed with folded exponents")
+    ap.add_argument("--tp", type=int, default=2, help="tensor-parallel size: per-rank N1 = 1280/tp, K2 = 640/tp (Flash-Next I=640)")
     a = ap.parse_args()
     E, topk = a.E, a.topk
     g = torch.Generator(device="cuda").manual_seed(0)
-    N1, K1, N2, K2 = 640, 2560, 2560, 320
+    N1, K1, N2, K2 = 1280 // a.tp, 2560, 2560, 640 // a.tp
     p1 = torch.randint(0, 256, (E, N1, K1 // 2), dtype=torch.uint8, device="cuda", generator=g)
     s1 = torch.randint(118, 128, (E, N1, K1 // 32), dtype=torch.uint8, device="cuda", generator=g)
     p2 = torch.randint(0, 256, (E, N2, K2 // 2), dtype=torch.uint8, device="cuda", generator=g)
@@ -74,27 +75,32 @@ def main():
                 MT = K.pick_mt(numel, E)
                 blk = 16 * MT
                 sid, eid, ntpp = align(topk_ids, blk, E)
-                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wa=Wa: K.moe_gemm(xq, xs, Wa, o1, sid, eid, ntpp, numel, topk, None, 2, 4, 2, num_experts=E, MT=MT)
-                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wb=Wb: K.moe_gemm(hq, hs, Wb, o2, sid, eid, ntpp, numel, 1, tw, 4, 2, 1, num_experts=E, MT=MT)
+                c1, c2 = K.legal_cfg((2, 4, 2), N1, K1), K.legal_cfg((4, 2, 1), N2, K2)   # experts.py defaults, as served
+                f1 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wa=Wa: K.moe_gemm(xq, xs, Wa, o1, sid, eid, ntpp, numel, topk, None, *c1, num_experts=E, MT=MT)
+                f2 = lambda sid=sid, eid=eid, ntpp=ntpp, MT=MT, Wb=Wb: K.moe_gemm(hq, hs, Wb, o2, sid, eid, ntpp, numel, 1, tw, *c2, num_experts=E, MT=MT)
             else:
                 cfg = int(c[1:])
                 blk = K.prefill_block(cfg)
                 sid, eid, ntpp = align(topk_ids, blk, E)
                 f1 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg, Wa=Wa: K.moe_gemm(xq, xs, Wa, o1, sid, eid, ntpp, numel, topk, None, num_experts=E, prefill=cfg)
                 f2 = lambda sid=sid, eid=eid, ntpp=ntpp, cfg=cfg, Wb=Wb: K.moe_gemm(hq, hs, Wb, o2, sid, eid, ntpp, numel, 1, tw, num_experts=E, prefill=cfg)
+                if K1 % K.prefill_bk(cfg):
+                    f1 = None                      # tile's K slab does not divide this GEMM's K (reported as n/a)
+                if K2 % K.prefill_bk(cfg):
+                    f2 = None
             fns.append((c + ("+fold" if fold else ""), blk, int(ntpp.item()) // blk, f1, f2))
         if a.warm > 0:
             import time
             t0 = time.time()
             while time.time() - t0 < a.warm:
                 for _ in range(10):
-                    fns[0][3]()
+                    (fns[0][3] or fns[0][4])()
                 torch.cuda.synchronize()
         best = {}
         for r in range(a.rounds):
             for c, blk, nblk, f1, f2 in fns:
-                u1 = T.graph_time(f1, reps=10, iters=a.iters)
-                u2 = T.graph_time(f2, reps=10, iters=a.iters)
+                u1 = T.graph_time(f1, reps=10, iters=a.iters) if f1 else float("nan")
+                u2 = T.graph_time(f2, reps=10, iters=a.iters) if f2 else float("nan")
                 b = best.setdefault(c, [1e9, 1e9])
                 b[0], b[1] = min(b[0], u1), min(b[1], u2)
         for c, blk, nblk, f1, f2 in fns:
