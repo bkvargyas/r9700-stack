@@ -34,6 +34,8 @@ from vllm.models.qwen4_exp.amd.mtp import Qwen4ExpMTP
 
 from . import lm_heads
 from ..attn import qsa as _qsa
+from ..ple import short_conv as _ple_conv
+from .. import hc as _hc
 
 logger = init_logger("vllm." + __name__)
 
@@ -148,6 +150,8 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _qsa.install(self)
+        _ple_conv.install(self)
+        _hc.install()
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -167,6 +171,8 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _qsa.install(self)
+        _ple_conv.install(self)
+        _hc.install()
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -183,6 +189,8 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
         with construction_scope():
             super().__init__(vllm_config=vllm_config, prefix=prefix)
         _qsa.install(self)
+        _ple_conv.install(self)
+        _hc.install()
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))
