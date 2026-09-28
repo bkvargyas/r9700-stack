@@ -599,6 +599,63 @@ extern "C" int r9k_moe_nvfp4a8(long a, long as, long wq, long ws, long wg, long 
 // epilogue applies 2^(Wref[n] - 127). Each thread's WSL weight slots are WSL consecutive lanes of one fragment, i.e.
 // WSL consecutive columns at one K step, so it needs WSL reference-exponent bytes (hoisted) and one WSL-byte scale
 // load per slab, prefetched with the weights.
+// Staged epilogue (both prefill kernels). The WMMA D layout leaves each lane with 8 rows of ONE column, so a direct
+// store is 2 bytes per lane: a wave's store instruction touches two 32 B row fragments, TM*TN*8 instructions per
+// lane, and the K=160 down GEMM spent ~30% of its time there. Instead each wave writes its TM*16 x (JS*16) bf16
+// sub-tile into LDS (the slab buffers are free after the K loop) and then stores whole 16 B row chunks: a store
+// instruction covers 32 lanes x 16 B = JS*32 B contiguous per row over 32/(JS*2) rows. JS = TN when the whole wave
+// tile fits PF_STAGE_MAX, else one 16-column strip at a time (cfg 17: 4 waves x 32 rows x 48 B = 6 KB inside its
+// 13.6 KB of slabs; cfg 12: 16 waves x 64 rows x 48 B = 48 KB inside 54 KB). pf_stage_bytes() is what the launch
+// provides; the row tables sit past max(slabs, stage). Measured on cfg 17 (TP=4, folded, 4096 tokens): down
+// 811 -> 690 us, gate_up 899 -> 883.
+#ifndef PF_STAGE_MAX
+#define PF_STAGE_MAX 16384     // largest whole-wave-tile stage (bytes); above it one 16-column strip at a time. cfg 17
+                               // (18 KB whole) measured better one strip at a time: down 745 -> 690 us, gate_up equal
+#endif
+typedef unsigned short pf_v8u16 __attribute__((ext_vector_type(8)));
+__host__ __device__ constexpr int pf_stage_js(int TM, int TN, int WM, int WN) {
+  return WM * WN * TM * 16 * (TN * 32 + 16) <= PF_STAGE_MAX ? TN : 1;
+}
+__host__ __device__ constexpr int pf_stage_bytes(int TM, int TN, int WM, int WN) {
+  return WM * WN * TM * 16 * (pf_stage_js(TM, TN, WM, WN) * 32 + 16);
+}
+#define PF_STAGED_EPILOGUE(WG_OF_N)                                                                          \
+  {                                                                                                          \
+    constexpr int JS = pf_stage_js(TM, TN, WM, WN), SPITCH = JS * 32 + 16, CPR = JS * 2;                    \
+    __syncthreads();                                              /* every wave is done with the slabs */    \
+    unsigned char* const stg = pf_smem + wave * (TM * 16 * SPITCH);                                          \
+    for (int j0 = 0; j0 < TN; j0 += JS) {                                                                    \
+      _Pragma("unroll") for (int jj = 0; jj < JS; jj++) {                                                    \
+        const int j = j0 + jj;                                                                               \
+        const int n = (nt0 + wn * TN + j) * 16 + nlane;                                                      \
+        const float wg = (n < N) ? (WG_OF_N) : 0.f;                                                          \
+        _Pragma("unroll") for (int i = 0; i < TM; i++) {                                                     \
+          _Pragma("unroll") for (int q = 0; q < 8; q++) {                                                    \
+            const int rr = wm * TM * 16 + i * 16 + mhalf + q;                                                \
+            const float v = acc[i][j][q] * (wg * sSc[rr]);                                                   \
+            *reinterpret_cast<unsigned short*>(stg + (i * 16 + mhalf + q) * SPITCH + (jj * 16 + nlane) * 2) = \
+                __bfloat16_as_ushort((__hip_bfloat16)v);                                                     \
+          }                                                                                                  \
+        }                                                                                                    \
+      }                                                                                                      \
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");                                                 \
+      __builtin_amdgcn_wave_barrier();                                                                       \
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");                                                 \
+      const int nbase = (nt0 + wn * TN + j0) * 16;                                                           \
+      _Pragma("unroll") for (int c = lane; c < TM * 16 * CPR; c += WAVE32) {                                 \
+        const int row = c / CPR, part = c - row * CPR;                                                       \
+        const int fr = sRow[wm * TM * 16 + row];                                                             \
+        const int n0 = nbase + part * 8;                                                                     \
+        if (fr >= 0 && n0 < N)                                                                               \
+          *reinterpret_cast<pf_v8u16*>(C + (size_t)fr * N + n0) =                                            \
+              *reinterpret_cast<const pf_v8u16*>(stg + row * SPITCH + part * 16);                            \
+      }                                                                                                      \
+      __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");                                                 \
+      __builtin_amdgcn_wave_barrier();                                                                       \
+      __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");                                                 \
+    }                                                                                                        \
+  }
+
 template <int TM, int TN, int WM, int WN, bool NV, int BK, bool DB, bool FOLD>
 __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
@@ -621,7 +678,9 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
   constexpr int SA_BYTES = BM * ASTR, SW_BYTES = BN * BK, SS_BYTES = FOLD ? 0 : ((BN * G + 15) & ~15);
   constexpr int BUF_BYTES = SA_BYTES + SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
   extern __shared__ __align__(16) unsigned char pf_smem[];
-  int* const sRow = (int*)(pf_smem + NBUF * BUF_BYTES);
+  constexpr int TAB_OFF = NBUF * BUF_BYTES > pf_stage_bytes(TM, TN, WM, WN) ? NBUF * BUF_BYTES
+                                                                          : pf_stage_bytes(TM, TN, WM, WN);
+  int* const sRow = (int*)(pf_smem + TAB_OFF);   // row tables sit past both the slabs and the epilogue stage
   float* const sSc = (float*)(sRow + BM);          // per-row output scale: A row scale (x router weight), once per block
 
   // Workgroups are dispatched x-fastest: all column tiles of routing block 0, then of block 1, ... so a block's A
@@ -878,24 +937,9 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_kernel(
     if (t == 12345.f) C[threadIdx.x] = 0;
     return;
   }
-#pragma unroll
-  for (int j = 0; j < TN; j++) {
-    const int n = (nt0 + wn * TN + j) * 16 + nlane;
-    if (n >= N) continue;
-    const float wg = NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f);
-#pragma unroll
-    for (int i = 0; i < TM; i++) {
-#pragma unroll
-      for (int q = 0; q < 8; q++) {
-        const int rr = wm * TM * 16 + i * 16 + mhalf + q;
-        const int fr = sRow[rr];
-        if (fr < 0) continue;
-        const float sc = wg * sSc[rr];                     // the per-element As / topk_w gathers were ~45% of the
-                                                           // K=160 down GEMM (1191 -> ~650 us at 4096 tokens)
-        C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
-      }
-    }
-  }
+  // (the per-element As / topk_w gathers this once had were ~45% of the K=160 down GEMM: 1191 -> 811 us with sSc;
+  //  the 2-byte scattered stores another ~30%: staged below)
+  PF_STAGED_EPILOGUE(NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f))
 }
 
 // Tile table (cfg index -> TM, TN, WM, WN, BK, DB); BM = WM*TM*16 rows per routing block, BN = WN*TN*16 columns.
@@ -953,7 +997,8 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
     constexpr int G = BKv / (NVv ? 16 : GROUP);                                                            \
     constexpr size_t ssb = FOv ? 0 : (((size_t)BN * G + 15) & ~(size_t)15);                                \
     constexpr size_t buf = (size_t)BM * (BKv + 8) + (size_t)BN * BKv + ssb;                                \
-    const size_t smem = (DBv ? 2 : 1) * buf + (size_t)BM * 8;                                              \
+    const size_t slabs = (DBv ? 2 : 1) * buf, stage = (size_t)pf_stage_bytes(TMv, TNv, WMv, WNv);             \
+    const size_t smem = (slabs > stage ? slabs : stage) + (size_t)BM * 8;                                    \
     if (smem > 64 * 1024) return -4;                                                                       \
     dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
     hipLaunchKernelGGL((r9k_moe_4bit_prefill_kernel<TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv>), grid, block, smem, st, \
@@ -1032,7 +1077,9 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kern
   constexpr int SW_BYTES = BN * BK, SS_BYTES = FOLD ? 0 : ((BN * G + 15) & ~15);
   constexpr int BUF_BYTES = SW_BYTES + SS_BYTES, NBUF = DB ? 2 : 1;
   extern __shared__ __align__(16) unsigned char pf_smem[];
-  int* const sRow = (int*)(pf_smem + NBUF * BUF_BYTES);
+  constexpr int TAB_OFF = NBUF * BUF_BYTES > pf_stage_bytes(TM, TN, WM, WN) ? NBUF * BUF_BYTES
+                                                                          : pf_stage_bytes(TM, TN, WM, WN);
+  int* const sRow = (int*)(pf_smem + TAB_OFF);   // row tables sit past both the slabs and the epilogue stage
   float* const sSc = (float*)(sRow + BM);          // per-row output scale: A row scale (x router weight), once per block
 
   const int bx = blockIdx.x, by = blockIdx.y;
@@ -1265,25 +1312,8 @@ __global__ void __launch_bounds__(WM * WN * WAVE32) r9k_moe_4bit_prefill_at_kern
 #undef AT_LOADW
 
   // Epilogue: lane holds rows mhalf..+8 of column nlane in every 16x16 tile; rows scatter through sRow.
-#pragma unroll
-  for (int j = 0; j < TN; j++) {
-    const int n = (nt0 + wn * TN + j) * 16 + nlane;
-    if (n >= N) continue;
-    const float wg = FOLD ? __uint_as_float((unsigned)Wref[n] << 23)
-                          : (R9K_AT_RESCALE ? __uint_as_float((unsigned)se[j] << 23) : 1.f);
-#pragma unroll
-    for (int i = 0; i < TM; i++) {
-#pragma unroll
-      for (int q = 0; q < 8; q++) {
-        const int rr = wm * TM * 16 + i * 16 + mhalf + q;
-        const int fr = sRow[rr];
-        if (fr < 0) continue;
-        const float sc = wg * sSc[rr];                     // the per-element As / topk_w gathers were ~45% of the
-                                                           // K=160 down GEMM (1191 -> ~650 us at 4096 tokens)
-        C[(size_t)fr * N + n] = (__hip_bfloat16)(acc[i][j][q] * sc);
-      }
-    }
-  }
+  PF_STAGED_EPILOGUE(FOLD ? __uint_as_float((unsigned)Wref[n] << 23)
+                          : (R9K_AT_RESCALE ? __uint_as_float((unsigned)se[j] << 23) : 1.f))
 }
 
 // Tile table of the A-tiled kernel (cfg index -> TM, TN, WM, WN, BK, DB); BM = WM*TM*16, BN = WN*TN*16.
@@ -1322,7 +1352,8 @@ extern "C" int r9k_moe_4bit_prefill_at(int fold, long a, long as, long wq, long 
   {                                                                                                        \
     constexpr int BM = WMv * TMv * 16, BN = WNv * TNv * 16, NT = WMv * WNv * WAVE32;                        \
     constexpr size_t ssb = FOv ? 0 : (((size_t)BN * (BKv / GROUP) + 15) & ~(size_t)15);                    \
-    const size_t smem = (DBv ? 2 : 1) * ((size_t)BN * BKv + ssb) + (size_t)BM * 8;                         \
+    const size_t slabs = (DBv ? 2 : 1) * ((size_t)BN * BKv + ssb), stage = (size_t)pf_stage_bytes(TMv, TNv, WMv, WNv); \
+    const size_t smem = (slabs > stage ? slabs : stage) + (size_t)BM * 8;                                    \
     dim3 grid((N / 16 + BN / 16 - 1) / (BN / 16), max_blocks), block(NT);                                  \
     hipLaunchKernelGGL((r9k_moe_4bit_prefill_at_kernel<TMv, TNv, WMv, WNv, BKv, DBv, FOv>), grid, block, smem, st, \
         (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws,       \
