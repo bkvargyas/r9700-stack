@@ -175,3 +175,85 @@ extern "C" int r9k_hc_gate_mix(long x, long s_x, long g, long s_g, long y, long 
                                                                   (uint16_t*)y, s_y, rows, HC, HD);
   return (int)hipGetLastError();
 }
+
+// ---------------------------------------------------------------- decode mix: up GEMM + sigmoid + gated mean
+// block_input[m, d] = bf16( (1/HC) * sum_s sigmoid(bf16(lora[m] . Wup[s*HD + d])) * xn[m, s*HD + d] ), HC == 4.
+// Stock runs the up GEMM as a bf16 skinny GEMM (12 us for the 6.5 MB weight at 4 rows), then hc_gate_mix; here the
+// weight rows of the four streams of one output dim meet in one wave: lane = khalf + 2 * (s + 4 * dl) covers four
+// dims x four streams x two K halves, the K halves reduce with one shuffle, the gate is rounded to bf16 as the GEMM
+// output was, and the streams add in stock's order 0..3 before the /HC. lora (M x LR bf16) is staged in LDS once
+// per block. M <= 8, LR % 16 == 0, LR <= 512, HD % 4 == 0.
+namespace {
+constexpr int MIX_MAXM = 8, MIX_MAXLR = 512, MIX_NT = 128, MIX_WAVES = 4;
+
+// LPR lanes per weight row (2 or 4): lane = kpart + LPR * (s + 4 * dl); LPR=4 reads 64 contiguous bytes per row
+// per instruction (better coalescing, twice the waves) at the cost of one more shuffle in the K reduction.
+template <int MT, int LPR>
+__global__ void __launch_bounds__(MIX_NT) r9k_hc_up_mix_kernel(
+    const uint16_t* __restrict__ lora, long s_l, const uint16_t* __restrict__ wup, long s_w,
+    const uint16_t* __restrict__ xn, long s_x, uint16_t* __restrict__ out, long s_o, int M, int LR, int HD) {
+  constexpr int DPW = 32 / LPR / 4;                                   // output dims per wave
+  __shared__ __attribute__((aligned(16))) uint16_t sl[MIX_MAXM][MIX_MAXLR];
+  const int t = threadIdx.x, lane = t & 31, wave = t >> 5;
+  const int nchl = LR / 8;
+  for (int c = t; c < M * nchl; c += MIX_NT) {
+    const int m = c / nchl, cc = c - m * nchl;
+    *reinterpret_cast<v8u16*>(&sl[m][cc * 8]) = *reinterpret_cast<const v8u16*>(lora + (long)m * s_l + cc * 8);
+  }
+  __syncthreads();
+  const int kpart = lane % LPR, s = (lane / LPR) & 3, dl = lane / (LPR * 4);
+  const int d0 = (blockIdx.x * MIX_WAVES + wave) * DPW;
+  const int d = min(d0 + dl, HD - 1);
+  const int n = s * HD + d;
+  const int LP = LR / LPR, nch = LP / 8;
+  const uint16_t* wp = wup + (long)n * s_w + kpart * LP;
+  float acc[MT];
+#pragma unroll
+  for (int m = 0; m < MT; m++) acc[m] = 0.f;
+  v8u16 wv[MIX_MAXLR / 16];
+#pragma unroll
+  for (int c = 0; c < MIX_MAXLR / 16; c++)
+    if (c < nch) wv[c] = *reinterpret_cast<const v8u16*>(wp + c * 8);
+#pragma unroll
+  for (int c = 0; c < MIX_MAXLR / 16; c++) {
+    if (c < nch) {
+#pragma unroll
+      for (int m = 0; m < MT; m++) {
+        const v8u16 xv = *reinterpret_cast<const v8u16*>(&sl[m < M ? m : 0][kpart * LP + c * 8]);
+#pragma unroll
+        for (int i = 0; i < 8; i++) acc[m] = fmaf(bf2f(xv[i]), bf2f(wv[c][i]), acc[m]);
+      }
+    }
+  }
+#pragma unroll
+  for (int m = 0; m < MT; m++) {
+    acc[m] += __shfl_xor(acc[m], 1, 32);                          // K parts
+    if constexpr (LPR == 4) acc[m] += __shfl_xor(acc[m], 2, 32);
+    const float g = bf2f(f2bf(acc[m]));                            // the GEMM's bf16 output
+    const float term = sigmoidf_(g) * bf2f(xn[(long)(m < M ? m : 0) * s_x + n]);
+    const float t1 = __shfl(term, lane + LPR, 32), t2 = __shfl(term, lane + 2 * LPR, 32),
+                t3 = __shfl(term, lane + 3 * LPR, 32);
+    const float sum = ((term + t1) + t2) + t3;                    // streams 0..3 in stock's order
+    if (kpart == 0 && s == 0 && d0 + dl < HD && m < M) out[(long)m * s_o + d] = f2bf(sum / 4.f);
+  }
+}
+}  // namespace
+
+extern "C" int r9k_hc_up_mix(long lora, long s_l, long wup, long s_w, long xn, long s_x, long out, long s_o, int M,
+                             int LR, int HC, int HD, int lpr, long stream) {
+  if (HC != 4 || M < 1 || M > MIX_MAXM || LR < 16 || LR > MIX_MAXLR || LR % 16 || HD < 2 || HD % 2) return -1;
+  if ((s_l | s_w | s_x | s_o) & 7) return -2;
+  if (lpr != 2 && lpr != 4) return -3;
+  if (LR % (8 * lpr)) return -4;
+  const int dpw = 32 / lpr / 4;
+  dim3 grid((HD / dpw + MIX_WAVES - 1) / MIX_WAVES), block(MIX_NT);
+  hipStream_t st = (hipStream_t)stream;
+#define MIXL(MTv, L)                                                                                              \
+  r9k_hc_up_mix_kernel<MTv, L><<<grid, block, 0, st>>>((const uint16_t*)lora, s_l, (const uint16_t*)wup, s_w,   \
+                                                       (const uint16_t*)xn, s_x, (uint16_t*)out, s_o, M, LR, HD)
+#define MIXM(L) do { if (M <= 1) MIXL(1, L); else if (M <= 2) MIXL(2, L); else if (M <= 4) MIXL(4, L); else MIXL(8, L); } while (0)
+  if (lpr == 2) MIXM(2); else MIXM(4);
+#undef MIXM
+#undef MIXL
+  return (int)hipGetLastError();
+}

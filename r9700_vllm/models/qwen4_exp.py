@@ -36,6 +36,7 @@ from . import lm_heads
 from ..attn import qsa as _qsa
 from ..ple import short_conv as _ple_conv
 from .. import hc as _hc
+from .. import router as _router
 
 logger = init_logger("vllm." + __name__)
 
@@ -152,6 +153,8 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
         _qsa.install(self)
         _ple_conv.install(self)
         _hc.install()
+        _router.install(self)
+        _hc.install_mix(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -173,6 +176,8 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
         _qsa.install(self)
         _ple_conv.install(self)
         _hc.install()
+        _router.install(self)
+        _hc.install_mix(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -191,6 +196,8 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
         _qsa.install(self)
         _ple_conv.install(self)
         _hc.install()
+        _router.install(self)
+        _hc.install_mix(self)
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))

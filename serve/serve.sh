@@ -91,9 +91,10 @@ if [ "$WRAP" = rocprof ]; then
   [ "${ROCPROF_WINDOW:-600:20}" != all ] && PRE+=(--collection-period "${ROCPROF_WINDOW:-600:20}:1" --collection-period-unit sec)
   PRE+=(-- vllm serve)
 fi
-# PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels)
+# PROF=1: torch profiler (POST /start_profile, /stop_profile) -> ~/stock-prof (use with EAGER=1 to see kernels;
+# PROFSTACK=true records Python stacks so every launch has a call site -- eager only, graphs carry no stacks)
 [ "${PROF:-0}" = 1 ] && { PD=${PROFDIR:-$HOME/stock-prof}; mkdir -p $PD; MNT+=(-v $PD:/prof)
-  ARGS+=(--profiler-config '{"profiler": "torch", "torch_profiler_dir": "/prof", "torch_profiler_with_stack": false, "torch_profiler_use_gzip": false}'); }
+  ARGS+=(--profiler-config "{\"profiler\": \"torch\", \"torch_profiler_dir\": \"/prof\", \"torch_profiler_with_stack\": ${PROFSTACK:-false}, \"torch_profiler_use_gzip\": false}"); }
 MTP=${MTP-3}
 # DRAFT=/models/<drafter> (e.g. a DFlash2 checkpoint) + SPEC=n: separate-drafter speculation instead of MTP
 if [ -n "$DRAFT" ]; then
