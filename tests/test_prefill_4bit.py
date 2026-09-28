@@ -126,6 +126,39 @@ for cfg in (0, 2, 3, 6, 11, 15):      # 11 / 15 = the tiles experts.py uses for 
     ref2 = routed_ref(hq.float() * hs[:, None], wd2, 1) * tw[:, None]
     check(f"mxfp4 routed down    E={E} M={M} top{topk} cfg={cfg} blk={blk}", out2, ref2)
 
+# ---- routed MoE at the TP=4 per-rank shapes: gate_up 320x2560, down 2560x160 (K=160 = five BK=32 slabs; the BK=64
+# tiles must refuse it). cfg 11 / 17 are the BK=32 block-64 tiles pick_moe_prefill can choose for the down GEMM.
+E, M, topk = 16, 1200, 4
+for cfg in (11, 17):
+    W1, wd1 = make_w("mxfp4", 320, 2560, E)
+    W2, wd2 = make_w("mxfp4", 2560, 160, E)
+    blk = K.prefill_block(cfg)
+    assert K.prefill_bk(cfg) == 32, cfg
+    scores = torch.randn(M, E, device="cuda", generator=g)
+    topk_w, topk_ids = torch.softmax(scores, -1).topk(topk, dim=-1)
+    sid, eid, ntpp = (v.cuda() for v in K.align_block_size_ref(topk_ids.cpu(), E, blk))
+    numel = M * topk
+    x = torch.randn(M, 2560, device="cuda", generator=g).to(torch.bfloat16)
+    xq, xs = K.quant_rows_fp8(x)
+    fl = topk_ids.flatten()
+    out1 = torch.full((numel, 320), float("nan"), dtype=torch.bfloat16, device="cuda")
+    K.moe_gemm(xq, xs, W1, out1, sid, eid, ntpp, numel, topk, None, num_experts=E, prefill=cfg)
+    check(f"mxfp4 routed TP4 gate_up 320x2560 cfg={cfg} blk={blk}", out1, routed_ref(xq.float() * xs[:, None], wd1, topk))
+    h = torch.randn(numel, 160, device="cuda", generator=g).to(torch.bfloat16)
+    hq, hs = K.quant_rows_fp8(h)
+    tw = topk_w.flatten().float().contiguous()
+    out2 = torch.full((numel, 2560), float("nan"), dtype=torch.bfloat16, device="cuda")
+    K.moe_gemm(hq, hs, W2, out2, sid, eid, ntpp, numel, 1, tw, num_experts=E, prefill=cfg)
+    check(f"mxfp4 routed TP4 down 2560x160 cfg={cfg} blk={blk}", out2, routed_ref(hq.float() * hs[:, None], wd2, 1) * tw[:, None])
+    try:
+        K.moe_gemm(hq, hs, W2, out2, sid, eid, ntpp, numel, 1, tw, num_experts=E, prefill=15)
+        print("FAIL: BK=64 tile accepted K=160"); ok = False
+    except RuntimeError:
+        pass
+assert K.pick_moe_prefill(4, 160) == K.MOE_PREFILL_CFG, K.pick_moe_prefill(4, 160)
+assert K.pick_moe_prefill(4, 160, gate_up=True) is None or K.prefill_bk(K.MOE_PREFILL_CFG_GATE_UP) == 32
+print("pick_moe_prefill(MT=4, K=160) ->", K.pick_moe_prefill(4, 160), "(down tile at TP=4)")
+
 # ---- ops-level dispatch (torch.ops.r9700.*_linear) picks the prefill path at large M and the old one at decode M
 try:
     from r9700_vllm import ops

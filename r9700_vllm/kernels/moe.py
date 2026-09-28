@@ -32,6 +32,8 @@ def lib() -> ctypes.CDLL:
         L.r9k_moe_4bit_prefill.argtypes = [ctypes.c_int] + [ctypes.c_long] * 12 + [ctypes.c_int] * 6 + [ctypes.c_long]
         L.r9k_moe_prefill_bm.restype = ctypes.c_int
         L.r9k_moe_prefill_bm.argtypes = [ctypes.c_int]
+        L.r9k_moe_prefill_bk.restype = ctypes.c_int
+        L.r9k_moe_prefill_bk.argtypes = [ctypes.c_int]
         L.r9k_quant_rows_fp8.restype = ctypes.c_int
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
@@ -297,7 +299,7 @@ def silu_mul_quant_fp8(gu: torch.Tensor):
 # kPfCfgs in r9k_moe_mxfp4a8.hip (the kernel is the source of truth: prefill_block() asks it).
 PREFILL_TILES = {0: (256, 64), 1: (256, 128), 2: (128, 128), 3: (128, 64), 4: (128, 64), 5: (256, 32),
                  6: (64, 64), 7: (256, 128), 8: (256, 128), 9: (256, 128), 10: (128, 128), 11: (64, 64),
-                 12: (256, 128), 13: (128, 128), 14: (64, 64), 15: (64, 128), 16: (256, 128)}
+                 12: (256, 128), 13: (128, 128), 14: (64, 64), 15: (64, 128), 16: (256, 128), 17: (64, 128)}
 PREFILL_MIN_M = int(os.environ.get("R9K_PREFILL_MIN_M", "128"))   # dense calls at M >= this use the prefill path
 # Untuned shapes: 256x128 BK=64 double-buffered (cfg 12) from M >= 512, 128x128 double-buffered (cfg 10) below (grid fill).
 PREFILL_DEFAULT = int(os.environ.get("R9K_PREFILL_CFG", "12"))
@@ -310,6 +312,14 @@ def prefill_block(cfg: int) -> int:
     if bm <= 0:
         raise ValueError(f"unknown prefill cfg {cfg}")
     return bm
+
+
+def prefill_bk(cfg: int) -> int:
+    """K slab of prefill tile `cfg`; the kernel needs K % BK == 0 (cfgs 8-11, 17 are BK=32; the rest BK=64)."""
+    bk = lib().r9k_moe_prefill_bk(cfg)
+    if bk <= 0:
+        raise ValueError(f"unknown prefill cfg {cfg}")
+    return bk
 
 
 def is_prefill_cfg(cfg) -> bool:
@@ -449,7 +459,7 @@ def pick_cfg(N: int, K: int, group: int = GROUP, M: int | None = None, kind: str
         t = lookup(kind, N, K, M)
         if t:
             return t
-        if M >= PREFILL_MIN_M and K % 64 == 0:
+        if M >= PREFILL_MIN_M and K % 64 == 0:      # the untuned defaults are BK=64 tiles
             return ("P", PREFILL_DEFAULT if M >= 512 else PREFILL_DEFAULT_SMALL)
     for WV, SK, NPW in ((2, 4, 2), (4, 2, 1), (2, 5, 2), (4, 1, 1)):
         if K % (SK * group) == 0 and (K >= 1024 or SK <= 2):
@@ -486,7 +496,7 @@ def pick_moe_prefill(MT: int, K_down: int, gate_up: bool = False) -> int | None:
         half the barriers per K), 1347 -> 1230 / 2282 -> 1907 us at 2048 / 4096 tokens (the 64x64 tiles were a
         wash to -10% against the MT kernel, which is why the first pass left gate_up on it)."""
     cfg = MOE_PREFILL_CFG_GATE_UP if gate_up else MOE_PREFILL_CFG
-    if cfg < 0 or K_down % 64 or 16 * MT != prefill_block(cfg):
+    if cfg < 0 or 16 * MT != prefill_block(cfg) or K_down % prefill_bk(cfg):
         return None
     return cfg
 

@@ -51,6 +51,7 @@ def _legal(cfg: tuple[int, int, int], W) -> tuple[int, int, int]:
 
 
 FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
+ZERO_DOWN = os.environ.get("R9K_MOE_ZERO_DOWN", "0") == "1"
 # Cold-pass strategy by step width (routed rows = tokens x top-k). Measured 2026-09-18, MTP-3, 270 slots:
 #  - few rows (e.g. 4 concurrent = 160 rows): bulk-staging the few cold experts beats latency-bound UVA reads
 #    (@4: 182.5 vs 121.0 tok/s);
@@ -189,8 +190,14 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
             self.activation(activation, act, gate_up)
             aq, as_ = K.quant_rows_fp8(act)
 
-        # zeroed: rows no pass writes (other EP ranks, or any routing edge case) must not feed moe_sum garbage
-        down = torch.zeros((numel, N2), dtype=torch.bfloat16, device=dev)
+        # Every routed row is written by exactly one pass when there is no expert map (the cache's hot and cold
+        # tables partition the experts; the plain path covers all of them), so the buffer needs no zeroing:
+        # at a 4096-token chunk the fill was 168 MB / 260 us per layer. Rows no pass writes -- other EP ranks --
+        # must not feed moe_sum garbage, so expert parallelism (or R9K_MOE_ZERO_DOWN=1) keeps the zeros.
+        if expert_map is not None or ZERO_DOWN:
+            down = torch.zeros((numel, N2), dtype=torch.bfloat16, device=dev)
+        else:
+            down = torch.empty((numel, N2), dtype=torch.bfloat16, device=dev)
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *_legal(CFG_DOWN, W2),

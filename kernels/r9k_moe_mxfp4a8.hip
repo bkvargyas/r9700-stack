@@ -903,6 +903,8 @@ static const PfCfg kPfCfgs[] = {
   {2, 2, 2, 2, 64, 1},   // 14: 64 x 64,   4 waves,  BK=64 double-buffered
   {2, 2, 2, 4, 64, 1},   // 15: 64 x 128,  8 waves,  BK=64 double-buffered (routed gate_up: N=640 = 5 tiles)
   {4, 4, 4, 2, 64, 1},   // 16: 256 x 128, 8 waves,  BK=64 double-buffered
+  {2, 4, 2, 2, 32, 1},   // 17: 64 x 128,  4 waves,  BK=32 double-buffered (routed down at TP=4: K=160 = 5 slabs;
+                         //     8 waves would split the 64x32 A slab into half-chunks per thread)
 };
 #define PF_NCFG ((int)(sizeof(kPfCfgs) / sizeof(kPfCfgs[0])))
 
@@ -910,17 +912,22 @@ extern "C" int r9k_moe_prefill_bm(int cfg) {     // rows per routing block of a 
   if (cfg < 0 || cfg >= PF_NCFG) return -1;
   return kPfCfgs[cfg].WM * kPfCfgs[cfg].TM * 16;
 }
+extern "C" int r9k_moe_prefill_bk(int cfg) {     // K slab of a prefill cfg: the kernel needs K % BK == 0 (-1: no such cfg)
+  if (cfg < 0 || cfg >= PF_NCFG) return -1;
+  return kPfCfgs[cfg].BK;
+}
 
 // Prefill entry: same operands / routing tables as r9k_moe_mxfp4a8 / r9k_moe_nvfp4a8 (nv selects the scale
 // format: 0 MXFP4, 1 NVFP4, 2 MXFP4 with the block exponents folded into the weights), routing block =
-// r9k_moe_prefill_bm(cfg) rows, tile = cfg. Shape rules: N % 16 == 0, K % 64 == 0.
+// r9k_moe_prefill_bm(cfg) rows, tile = cfg. Shape rules: N % 16 == 0, K % r9k_moe_prefill_bk(cfg) == 0 (the K loop
+// walks whole BK slabs; BK=32 tiles serve K=160, the TP=4 down GEMM).
 extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, long wref, long c,
                                     long sorted_ids, long expert_ids, long ntpp, long topk_w,
                                     long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div,
                                     int K, int N, int cfg, long stream) {
   if (N % 16) return -1;
-  if (K % 64) return -2;
   if (cfg < 0 || cfg >= PF_NCFG) return -7;
+  if (K % kPfCfgs[cfg].BK) return -2;
   if (nv < 0 || nv > 2) return -8;
   hipStream_t st = (hipStream_t)stream;
 #define PL(TMv, TNv, WMv, WNv, NVv, BKv, DBv, FOv)                                                         \
@@ -959,6 +966,7 @@ extern "C" int r9k_moe_4bit_prefill(int nv, long a, long as, long wq, long ws, l
     case 14: PLN(2, 2, 2, 2, 64, true); break;
     case 15: PLN(2, 2, 2, 4, 64, true); break;
     case 16: PLN(4, 4, 4, 2, 64, true); break;
+    case 17: PLN(2, 4, 2, 2, 32, true); break;
     default: return -7;
   }
 #undef PLN
