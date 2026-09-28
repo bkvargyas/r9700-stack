@@ -12,19 +12,137 @@ concatenates their weights along N -- MXFP4 (fragment-order tiles + per-row pack
 
 The merge is triggered from in_proj_ba's process_weights_after_loading (stock's loader visits in_proj_qkvz first).
 Layers whose formats differ (e.g. Flash-Next's block-fp8 qkvz) stay unmerged. R9K_GDN_MERGE=0 disables.
+
+MTP decode core (kernels/r9k_gdn.hip r9k_gdn_decode_mtp): stock's fused CUDA op for the speculative-decode step
+(fused_gdn_decode_post_conv_mtp) is not built on ROCm, so vLLM runs the Triton recurrence inside ~9 glue launches
+per layer (b/a contiguous, zeros, q/k/v cat, output copy, gated norm). Ours: the layer's forward becomes
+in_proj -> torch.ops.r9700.gdn_core (conv update + one fused gating/recurrence/norm launch when the batch is pure
+spec decode, stock's core + norm otherwise) -> out_proj. R9K_GDN_DECODE=stock keeps vLLM's forward.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 
 import torch
 
+from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import PluggableLayer
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import QwenGatedDeltaNetAttention
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
+from vllm.utils.torch_utils import (LayerNameType, _encode_layer_name, _resolve_layer_name,
+                                    direct_register_custom_op)
 
 logger = init_logger("vllm." + __name__)
+
+MAX_SPEC_TOKENS = 8            # per sequence (num_spec + 1); stock's MAX_FUSED_GDN_MTP_TOKENS
+_L = None
+_OPS_DONE = False
+
+
+def lib():
+    global _L
+    if _L is None:
+        from ..kernels import moe as KM
+        L = KM.lib()
+        L.r9k_gdn_decode_mtp.restype = ctypes.c_int
+        L.r9k_gdn_decode_mtp.argtypes = [ctypes.c_long] * 15 + [ctypes.c_int] + [ctypes.c_long] * 2 + [ctypes.c_int] + \
+            [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_float] * 2 + [ctypes.c_long]
+        _L = L
+    return _L
+
+
+def available() -> bool:
+    try:
+        return hasattr(lib(), "r9k_gdn_decode_mtp")
+    except Exception:
+        return False
+
+
+def decode_mtp(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor,
+               w: torch.Tensor, z: torch.Tensor, out: torch.Tensor, state: torch.Tensor, idx: torch.Tensor,
+               cu: torch.Tensor, acc: torch.Tensor, Hk: int, Hv: int, scale: float, eps: float) -> None:
+    """Fused gating + delta-rule recurrence + RMSNormGated for N spec-decode sequences.
+    mixed_qkv [rows, (2 Hk + Hv) 128] bf16 after the conv (any row stride); b, a [rows, Hv] bf16 views; A_log,
+    dt_bias [Hv] fp32; w [128] fp32; z [rows, Hv * 128] bf16 view; out [rows, Hv * 128] bf16 (rows past cu[N] get
+    zeros); state [blocks, Hv, 128, 128] fp32 or bf16, updated in place at idx[n, t]; idx [N, S] int32; cu [N + 1]
+    int32; acc [N] int32."""
+    N = idx.shape[0]
+    assert mixed_qkv.dtype == torch.bfloat16 and mixed_qkv.stride(1) == 1 and z.stride(1) == 1 and out.stride(1) == 1
+    assert state.dtype in (torch.float32, torch.bfloat16) and state.is_contiguous() or state.stride(-1) == 1
+    assert idx.dtype == torch.int32 and cu.dtype == torch.int32 and acc.dtype == torch.int32 and idx.stride(1) == 1
+    assert cu.is_contiguous() and acc.is_contiguous() and A_log.dtype == torch.float32 and w.dtype == torch.float32
+    rc = lib().r9k_gdn_decode_mtp(mixed_qkv.data_ptr(), mixed_qkv.stride(0), b.data_ptr(), b.stride(0), a.data_ptr(),
+                                  a.stride(0), A_log.data_ptr(), dt_bias.data_ptr(), w.data_ptr(), z.data_ptr(),
+                                  z.stride(0), out.data_ptr(), out.stride(0), state.data_ptr(), state.stride(0),
+                                  1 if state.dtype == torch.float32 else 0, idx.data_ptr(), idx.stride(0),
+                                  idx.shape[1], cu.data_ptr(), acc.data_ptr(), N, Hk, Hv, out.shape[0], float(scale),
+                                  float(eps), torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_gdn_decode_mtp failed ({rc}) N={N} S={idx.shape[1]} rows={out.shape[0]} "
+                           f"Hk={Hk} Hv={Hv}")
+
+
+def _fused_ok(self, md) -> bool:
+    idx = md.spec_state_indices_tensor
+    return (md.spec_sequence_masks is not None and md.num_prefills == 0 and md.num_decodes == 0
+            and md.num_spec_decodes > 0 and idx is not None and idx.size(1) <= MAX_SPEC_TOKENS
+            and md.spec_query_start_loc is not None and md.num_accepted_tokens is not None
+            and self.kv_cache[1].dtype in (torch.float32, torch.bfloat16))
+
+
+def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name: LayerNameType) -> None:
+    """out [T, Hv * 128] bf16 <- norm(core(conv(qkvz), ba), z): one fused launch after the conv update for a pure
+    spec-decode batch; stock's core + gated norm otherwise (prefill, mixed batches, warmup without metadata)."""
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import GDNAttentionMetadata
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
+    layer_name = _resolve_layer_name(layer_name)
+    fc = get_forward_context()
+    self = fc.no_compile_layers[layer_name]
+    md = fc.attn_metadata
+    md = md.get(self.prefix) if isinstance(md, dict) else None
+    T = qkvz.shape[0]
+    qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
+    Hv, D = self.num_v_heads // self.tp_size, self.head_v_dim
+    if md is not None and isinstance(md, GDNAttentionMetadata) and _fused_ok(self, md):
+        p = self.__dict__.get("_r9k_gdn_params")
+        if p is None:
+            p = (self.A_log.detach().float().contiguous(), self.dt_bias.detach().float().contiguous(),
+                 self.norm.weight.detach().float().contiguous())
+            self.__dict__["_r9k_gdn_params"] = p
+        N, n_act = md.num_spec_decodes, md.num_actual_tokens
+        idx, cu, acc = md.spec_state_indices_tensor, md.spec_query_start_loc, md.num_accepted_tokens
+        conv_state = self.kv_cache[0] if is_conv_state_dim_first() else self.kv_cache[0].transpose(-1, -2)
+        conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+        mixed = causal_conv1d_update(qkvz[:n_act, :qkv_size], conv_state, conv_weights, self.conv1d.bias,
+                                     self.activation, conv_state_indices=idx[:N, 0],
+                                     num_accepted_tokens=acc[:N], query_start_loc=cu[: N + 1],
+                                     max_query_len=idx.size(1), validate_data=False)
+        b, a = self.split_ba(ba)
+        decode_mtp(mixed, b, a, p[0], p[1], p[2], qkvz[:, qkv_size:], out, self.kv_cache[1], idx[:N], cu[: N + 1],
+                   acc[:N], self.num_k_heads // self.tp_size, Hv, self.head_k_dim ** -0.5, self.layer_norm_epsilon)
+        return
+    mixed_qkv, z = qkvz.split([qkv_size, self.value_dim // self.tp_size], dim=-1)
+    b, a = self.split_ba(ba)
+    core = torch.zeros((T, Hv, D), dtype=qkvz.dtype, device=qkvz.device)
+    self._forward_core(mixed_qkv=mixed_qkv, b=b.contiguous(), a=a.contiguous(), core_attn_out=core)
+    out.copy_(self.norm(core, z.reshape(T, Hv, D)).flatten(-2))
+
+
+def _gdn_core_fake(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name: LayerNameType) -> None:
+    return None
+
+
+def register_ops() -> None:
+    global _OPS_DONE
+    if _OPS_DONE:
+        return
+    from ..ops import _LIB
+    direct_register_custom_op("gdn_core", gdn_core, mutates_args=["qkvz", "out"], fake_impl=_gdn_core_fake,
+                              target_lib=_LIB)
+    _OPS_DONE = True
 
 
 def _format(lin):
@@ -108,6 +226,27 @@ class R9kQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if os.environ.get("R9K_GDN_MERGE", "1") == "1" and ba is not None and getattr(ba, "quant_method", None) \
                 is not None and getattr(self, "in_proj_qkvz", None) is not None:
             ba.quant_method = _MergeTrigger(ba.quant_method, self)
+        if os.environ.get("R9K_GDN_DECODE", "r9k") != "stock" and self._r9k_decode_fits() and available():
+            register_ops()
+            self._forward_method = self._r9k_forward
+            logger.info_once("r9700: GDN MTP decode core on r9k_gdn_decode_mtp (conv update + one fused "
+                             "gating/recurrence/norm launch per layer)")
+
+    def _r9k_decode_fits(self) -> bool:
+        return (self.qkvz_layout == "flat" and self.head_k_dim == 128 and self.head_v_dim == 128
+                and self.num_v_heads % self.num_k_heads == 0 and getattr(self.conv1d, "bias", None) is None
+                and self.activation in ("silu", "swish") and self.norm.group_size is None
+                and self.norm.norm_before_gate and self.norm.activation in ("silu", "swish")
+                and not self.disable_tp_for_ba_proj)
+
+    def _r9k_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        T = hidden_states.size(0)
+        qkvz, _ = self.in_proj_qkvz(hidden_states)
+        ba, _ = self.in_proj_ba(hidden_states)
+        out = torch.empty((T, self.value_dim // self.tp_size), dtype=hidden_states.dtype, device=hidden_states.device)
+        torch.ops.r9700.gdn_core(qkvz.view(T, -1), ba.view(T, -1), out, _encode_layer_name(self.prefix))
+        output, _ = self.out_proj(out)
+        return output
 
     def _r9k_merge(self) -> None:
         q, b = self.in_proj_qkvz, self.in_proj_ba
