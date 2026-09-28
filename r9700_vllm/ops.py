@@ -73,6 +73,23 @@ def _nvfp4_linear_fake(x, wq, ws, wg, N: int, K: int) -> torch.Tensor:
     return x.new_empty((x.shape[0], N))
 
 
+def mxfp4_gemm_q(q: torch.Tensor, s: torch.Tensor, W, out: torch.Tensor, M: int, cfg, topk_w=None) -> None:
+    """out [M, W.N] bf16 = dequant(q * s) @ W^T (* topk_w[row]) for a dense MXFP4 weight, on the kernel `cfg`
+    (pick_cfg) names: A-tiled (q from quant_rows_fp8(tiled=True)), LDS-tiled prefill, or the MT decode kernel."""
+    from .kernels import moe as KM
+    if KM.is_atiled_cfg(cfg):
+        # fragment-tiled activation straight into the WMMA registers (no LDS A staging); fold picks the W variant
+        t, _ = _identity_tables(q, M, KM.atiled_block(cfg[1]) // KM.MOE_BLOCK)
+        KM.moe_gemm(q, s, W, out, *t, M, 1, topk_w, num_experts=1, prefill=cfg[1], a_tiled=True)
+    elif KM.is_prefill_cfg(cfg):
+        t, _ = _identity_tables(q, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
+        KM.moe_gemm(q, s, W, out, *t, M, 1, topk_w, num_experts=1, prefill=cfg[1])
+    else:
+        t, MT = _identity_tables(q, M, cfg[3] if len(cfg) > 3 else None)
+        KM.moe_gemm(q, s, W, out, *t, M, 1, topk_w, *cfg[:3], num_experts=1, MT=MT,
+                    ldsa=bool(cfg[4]) if len(cfg) > 4 else False)
+
+
 def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, K: int, fold: bool = False
                   ) -> torch.Tensor:
     from .kernels import moe as KM
@@ -82,20 +99,8 @@ def _mxfp4_linear(x: torch.Tensor, wq: torch.Tensor, wsr: torch.Tensor, N: int, 
         return out
     cfg = KM.pick_cfg(N, K, M=M, kind="mxfp4", fold=fold)
     W = KM.Mxfp4Experts(wq, wsr, N, K, fold)
-    if KM.is_atiled_cfg(cfg):
-        # fragment-tiled activation straight into the WMMA registers (no LDS A staging); fold picks the W variant
-        q, s = KM.quant_rows_fp8(x, tiled=True)
-        t, _ = _identity_tables(x, M, KM.atiled_block(cfg[1]) // KM.MOE_BLOCK)
-        KM.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1], a_tiled=True)
-        return out
-    q, s = KM.quant_rows_fp8(x)
-    if KM.is_prefill_cfg(cfg):
-        t, _ = _identity_tables(x, M, KM.prefill_block(cfg[1]) // KM.MOE_BLOCK)
-        KM.moe_gemm(q, s, W, out, *t, M, 1, None, num_experts=1, prefill=cfg[1])
-        return out
-    t, MT = _identity_tables(x, M, cfg[3] if len(cfg) > 3 else None)
-    KM.moe_gemm(q, s, W, out, *t, M, 1, None, *cfg[:3], num_experts=1, MT=MT,
-                ldsa=bool(cfg[4]) if len(cfg) > 4 else False)
+    q, s = KM.quant_rows_fp8(x, tiled=KM.is_atiled_cfg(cfg))
+    mxfp4_gemm_q(q, s, W, out, M, cfg)
     return out
 
 

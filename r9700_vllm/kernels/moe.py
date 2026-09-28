@@ -38,6 +38,8 @@ def lib() -> ctypes.CDLL:
         L.r9k_quant_rows_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_silu_mul_quant_fp8.restype = ctypes.c_int
         L.r9k_silu_mul_quant_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 2 + [ctypes.c_long]
+        L.r9k_quant_rows_fp8_gate.restype = ctypes.c_int
+        L.r9k_quant_rows_fp8_gate.argtypes = [ctypes.c_long] * 5 + [ctypes.c_int] * 4 + [ctypes.c_long]
         assert L.r9k_moe_block() == MOE_BLOCK
         if hasattr(L, "r9k_fold_supported"):          # older libr9k.so builds have no folded kernels
             L.r9k_fold_supported.restype = ctypes.c_int
@@ -270,6 +272,23 @@ def quant_rows_fp8(x: torch.Tensor, tiled: bool = False):
     if rc:
         raise RuntimeError(f"r9k_quant_rows_fp8 failed ({rc})")
     return q, s
+
+
+def quant_rows_fp8_gate(x: torch.Tensor, wg: torch.Tensor, tiled: bool = False):
+    """quant_rows_fp8 plus the shared expert's gate in the same launch: (q, s, g) with g [M] fp32 =
+    bf16(sigmoid(bf16(x @ wg))) -- stock's F.sigmoid(expert_gate(x)) values -- for the down GEMM's row fold."""
+    assert x.dtype == torch.bfloat16 and x.dim() == 2 and x.stride(1) == 1
+    assert wg.dtype == torch.bfloat16 and wg.is_contiguous() and wg.numel() == x.shape[1]
+    M, K = x.shape
+    s = torch.empty((M,), dtype=torch.float32, device=x.device)
+    g = torch.empty((M,), dtype=torch.float32, device=x.device)
+    rows = (M + 15) // 16 * 16 if tiled else M
+    q = torch.empty((rows, K), dtype=torch.float8_e4m3fn, device=x.device)
+    rc = lib().r9k_quant_rows_fp8_gate(x.data_ptr(), q.data_ptr(), s.data_ptr(), wg.data_ptr(), g.data_ptr(), M, K,
+                                       x.stride(0), 1 if tiled else 0, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_quant_rows_fp8_gate failed ({rc}) M={M} K={K} tiled={tiled}")
+    return q, s, g
 
 
 def tile_fp8_ref(q: torch.Tensor) -> torch.Tensor:

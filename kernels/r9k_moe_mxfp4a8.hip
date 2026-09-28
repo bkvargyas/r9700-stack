@@ -1392,13 +1392,17 @@ __device__ __forceinline__ float bf16hi(unsigned int w) { return __uint_as_float
 // r = uint2 slot ((r/16) * K/16 + c/2) * 32 + r%16 + 16 * (c%2)); same 8-byte store per group, only its address
 // differs (K % 16 == 0). Rows the caller pads (M .. 16*ceil(M/16)) are never written: the GEMM computes on them
 // and drops them.
-template <bool TILED>
+// GATE: also g[row] = bf16(sigmoid(bf16(x[row] . wg))) as fp32 -- the shared expert's sigmoid(expert_gate(x))
+// at stock's rounding points (bf16 GEMM output, bf16 sigmoid), for the down GEMM's per-row epilogue fold.
+template <bool TILED, bool GATE>
 __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
-    const __hip_bfloat16* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ s, int K, int ld) {
+    const __hip_bfloat16* __restrict__ x, unsigned char* __restrict__ q, float* __restrict__ s, int K, int ld,
+    const __hip_bfloat16* __restrict__ wg, float* __restrict__ g) {
   const int row = blockIdx.x, tid = threadIdx.x, nvec = K / 8;
   const uint4* xr = (const uint4*)(x + (size_t)row * ld);
+  const uint4* wr = (const uint4*)wg;
   uint4 v[RQ_VEC];
-  float m = 0.f;
+  float m = 0.f, dot = 0.f;
 #pragma unroll
   for (int i = 0; i < RQ_VEC; i++) {
     const int c = tid + i * RQ_THREADS;
@@ -1406,15 +1410,34 @@ __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
     const unsigned int w[4] = {v[i].x, v[i].y, v[i].z, v[i].w};
 #pragma unroll
     for (int j = 0; j < 4; j++) m = fmaxf(m, fmaxf(fabsf(bf16lo(w[j])), fabsf(bf16hi(w[j]))));
+    if constexpr (GATE) {
+      if (c < nvec) {
+        const uint4 gw = wr[c];
+        const unsigned int u[4] = {gw.x, gw.y, gw.z, gw.w};
+#pragma unroll
+        for (int j = 0; j < 4; j++) dot += bf16lo(w[j]) * bf16lo(u[j]) + bf16hi(w[j]) * bf16hi(u[j]);
+      }
+    }
   }
   __shared__ float wmax[RQ_THREADS / 32];
+  __shared__ float wsum[RQ_THREADS / 32];
   for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor(m, o, 32));
-  if ((tid & 31) == 0) wmax[tid >> 5] = m;
+  if constexpr (GATE)
+    for (int o = 16; o > 0; o >>= 1) dot += __shfl_xor(dot, o, 32);
+  if ((tid & 31) == 0) { wmax[tid >> 5] = m; if constexpr (GATE) wsum[tid >> 5] = dot; }
   __syncthreads();
   if (tid < 32) {
     float t = tid < RQ_THREADS / 32 ? wmax[tid] : 0.f;
     for (int o = 16; o > 0; o >>= 1) t = fmaxf(t, __shfl_xor(t, o, 32));
     if (tid == 0) wmax[0] = t;
+    if constexpr (GATE) {
+      float d = tid < RQ_THREADS / 32 ? wsum[tid] : 0.f;
+      for (int o = 16; o > 0; o >>= 1) d += __shfl_xor(d, o, 32);
+      if (tid == 0) {
+        const float logit = (float)(__hip_bfloat16)d;              // hipBLASLt's bf16 output
+        g[row] = (float)(__hip_bfloat16)(1.f / (1.f + expf(-logit)));   // torch's bf16 sigmoid
+      }
+    }
   }
   __syncthreads();
   const float amax = fmaxf(wmax[0], 1e-12f);
@@ -1436,8 +1459,9 @@ __global__ void __launch_bounds__(RQ_THREADS) r9k_quant_rows_fp8_v2_kernel(
 extern "C" int r9k_quant_rows_fp8(long x, long q, long s, int M, int K, int ld, long stream) {
   if (M <= 0) return 0;
   if (K % 8 == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && K <= RQ_THREADS * RQ_VEC * 8)
-    hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel<false>, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
-                       (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
+    hipLaunchKernelGGL((r9k_quant_rows_fp8_v2_kernel<false, false>), dim3(M), dim3(RQ_THREADS), 0,
+                       (hipStream_t)stream, (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld,
+                       (const __hip_bfloat16*)0, (float*)0);
   else
     hipLaunchKernelGGL(r9k_quant_rows_fp8_kernel, dim3(M), dim3(256), 0, (hipStream_t)stream,
                        (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
@@ -1449,7 +1473,26 @@ extern "C" int r9k_quant_rows_fp8(long x, long q, long s, int M, int K, int ld, 
 extern "C" int r9k_quant_rows_fp8_tiled(long x, long q, long s, int M, int K, int ld, long stream) {
   if (M <= 0) return 0;
   if (!(K % 16 == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && K <= RQ_THREADS * RQ_VEC * 8)) return -3;
-  hipLaunchKernelGGL(r9k_quant_rows_fp8_v2_kernel<true>, dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
-                     (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld);
+  hipLaunchKernelGGL((r9k_quant_rows_fp8_v2_kernel<true, false>), dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
+                     (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld, (const __hip_bfloat16*)0,
+                     (float*)0);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Row quant + the shared expert's gate: g[row] = bf16(sigmoid(bf16(x[row] . wg))) (wg [K] bf16, 16-byte aligned).
+// tiled != 0 writes the fragment-tiled layout (K % 16 == 0). Same limits as the vectorised kernel; -3 otherwise.
+extern "C" int r9k_quant_rows_fp8_gate(long x, long q, long s, long wg, long g, int M, int K, int ld, int tiled,
+                                       long stream) {
+  if (M <= 0) return 0;
+  if (!(K % (tiled ? 16 : 8) == 0 && ld % 8 == 0 && (x & 15) == 0 && (q & 7) == 0 && (wg & 15) == 0 && wg && g
+        && K <= RQ_THREADS * RQ_VEC * 8)) return -3;
+  if (tiled)
+    hipLaunchKernelGGL((r9k_quant_rows_fp8_v2_kernel<true, true>), dim3(M), dim3(RQ_THREADS), 0, (hipStream_t)stream,
+                       (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld, (const __hip_bfloat16*)wg,
+                       (float*)g);
+  else
+    hipLaunchKernelGGL((r9k_quant_rows_fp8_v2_kernel<false, true>), dim3(M), dim3(RQ_THREADS), 0,
+                       (hipStream_t)stream, (const __hip_bfloat16*)x, (unsigned char*)q, (float*)s, K, ld,
+                       (const __hip_bfloat16*)wg, (float*)g);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }

@@ -618,7 +618,8 @@ nodes. Where our extra ~1,600 nodes per step come from (48 layers + 3 MTP passes
    stock's rope after our norm on 12 calls/step: `normalize_compressed_keys` gets its positions as `[:, 0]` of a
    `[T, 3]` buffer (1-D, element stride 3) and the fit check demanded unit stride. The kernel now takes a token
    stride for the positions (`ptok`; the MRoPE `[3, T]` transpose view with row stride 1 / token stride 3 is covered
-   the same way), and the test has stride-3 / stride-5 / MRoPE stride-2 cases (RESULT_STRIDE_FIX).
+   the same way), and the test has stride-3 / stride-5 / MRoPE stride-2 cases. Confirmed in serving: the round-3
+   eval server logs no "not fused" warning, so both indexer paths are on the one-launch glue.
 4. **Hyper-connection decode mix** (router kernel with an `hc_silu` epilogue on the merged down+inject GEMM, and
    `r9k_hc_up_mix` in `kernels/r9k_hc.hip`: up GEMM + sigmoid + gated mean over the four streams in one wave per
    four output dims, gate rounded to bf16 as the GEMM output was, streams summed in stock's order). Bound as
@@ -638,6 +639,42 @@ GDN spec-decode glue in `qwen_gdn_linear_attn.py` (cat / reshape / contiguous / 
 vLLM fuses only the non-speculative decode path), the shared expert's own quant + silu + expert-gate GEMM + sigmoid
 + mul (~5 per layer), `moe_align_block_size` + `count_and_sort` + `topk_softmax` + `moe_sum` + the top-k weight copy
 (5 per layer, stock), the block-fp8 input quant (2 per layer), 10 NCCL all-gathers.
+
+### 2026-09-28 round 4: GDN speculative-decode core in one launch
+
+The largest remaining block of decode glue was the Gated DeltaNet layers (36 of 48). Stock vLLM has a fused CUDA op
+for exactly the MTP decode step (`fused_gdn_decode_post_conv_mtp`: gating + recurrence + gated norm after the conv
+update), but it is not built in the ROCm image, so `forward_cuda` runs the Triton recurrence inside glue: `b` / `a`
+made contiguous, a zeroed core buffer, the q/k/v `cat`, the conv update, `fused_sigmoid_gating_delta_rule_update`,
+the output copy, `layer_norm_fwd`, and three reshape copies -- 11 HIP-graph nodes per layer, ~400 per step (the
+eager stack profile: `reshape` x108, `contiguous` x72, `cat` x36, `zeros` x36, copyBuffer x36 from
+`qwen_gdn_linear_attn.py`).
+
+`kernels/r9k_gdn.hip` `r9k_gdn_decode_mtp` (`r9700_vllm/models/gdn.py`): one workgroup per (sequence, value head)
+holds the 128x128 fp32 state in registers (64 per thread, K halves paired by shuffle), runs the sigmoid gating and
+the delta-rule recurrence over the sequence's spec tokens (state stored per token at its slot, sequences with a
+null initial slot skipped, padding rows zeroed), and applies RMSNormGated (RMS over V through LDS, silu gate) in the
+same launch. It reads the merged in_proj row and `ba` directly (any row strides), so nothing is copied. The layer's
+forward becomes in_proj -> `torch.ops.r9700.gdn_core` -> out_proj; inside the op a pure spec-decode batch takes the
+conv update + the kernel (2 launches), anything else (prefill, mixed batches, warmup) takes stock's core + norm.
+`R9K_GDN_DECODE=stock` restores vLLM's forward. `tests/test_gdn_decode_r9k.py` checks it against vLLM's Triton
+composition: output flips ~2e-4 of the elements (fp32 summation order), fp32 state within 1e-4, bf16 state by the
+same flip rule, padding and skipped sequences zero.
+
+**Shared expert in four launches** (`r9700_vllm/moe/shared.py`, `torch.ops.r9700.shared_expert`): the MoE block's
+shared expert (a gated `Qwen3NextMLP`, 48 + MTP calls per step) ran as our dense MXFP4 gate_up (row quant + GEMM),
+`SiluAndMul`, down (quant + GEMM), then the expert gate's bf16 `F.linear` (wvSplitK), `sigmoid` and `mul`: eight
+launches. Now the row quant also computes the gate dot and its sigmoid (`r9k_quant_rows_fp8_gate`, stock's rounding
+points: bf16 logit, bf16 sigmoid -- bit-equal to stock's gate on every tested row), the activation is the routed
+MoE's `silu_mul_quant_fp8`, and the sigmoid is folded into the down GEMM's per-row epilogue (the router-weight
+fold), so the output is rounded once. Large M takes the same prefill / A-tiled GEMM configs as the dense linear.
+`tests/test_shared_expert_r9k.py`: TP=4 and TP=2 shapes at M = 1..1024, ours at least as close to the fp64
+reference as stock (equal or better on 13 of 14 cases, within 0.7% on the other), 0.3-0.9% from stock in relative
+norm (the activation's fp8 codes). `R9K_SHARED_EXPERT=stock` restores vLLM's forward.
+
+RESULT_GDN_BENCH
+
+RESULT_GDN_SERVING
 
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
