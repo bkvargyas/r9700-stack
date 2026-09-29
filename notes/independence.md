@@ -185,3 +185,17 @@ licence, the default is all rights reserved and credit grants nothing. Fallback 
 box. Publishing the repo therefore does not redistribute libr4d. Without it the stack still runs -- the
 communicator falls through to RCCL and attention falls back to `unified_attention` -- at the cost in the table
 above. What publishing *would* carry is the derived GEMM source, which is section 3.
+
+## Runtime hooks beyond vLLM's extension points
+
+Everything else in the plugin goes through documented extension points (quantization config, model registry,
+platform plugin, attention backend, custom ops, `PluggableLayer` overrides). These few touch vLLM objects at
+runtime instead. Each is version-gated (it checks the attribute it needs and logs when it is absent), none
+modifies source or binaries, and all of them are here so nobody has to grep for them:
+
+| hook | where | why |
+|---|---|---|
+| `CompilationConfig._attention_ops` += `r9700::gdn_core` | `r9700_vllm/models/gdn.py` `register_splitting_op()` | our Gated DeltaNet op replaces `vllm::qwen_gdn_attention_core` in the traced forward and must be a piecewise-graph splitting op like it, or a prefill piece captures it with stale kernels |
+| `hyperconnection.hc_gate_mix` / `hc_combine_norm` rebound to our ops | `r9700_vllm/hc.py` `install()` | the model file imports those names as plain functions; there is no layer object to override |
+| forwards bound per module: `mlp.gate` (router GEMM), `GatedResidual.mix` / `combine_and_mix` (hc mix), gated `Qwen3NextMLP` (shared expert), `QSAIndexer` q/k glue | `router.py`, `hc.py`, `moe/shared.py`, `attn/qsa.py` | plain `nn.Module`s with no `CustomOp` dispatch to plug into; bound after construction, each with a `R9K_*=stock` knob |
+| MTP k>1 attention-type allowlist | `r9700_vllm/spec/mtp_rocm.py` | vLLM's ROCm allowlist for multi-token speculation did not include our attention backend |
