@@ -646,6 +646,17 @@ expert selection; the glue and hc mix differ from stock only in fp32 summation o
 must not stay the default until the culprit is found or reverted (the knobs: `R9K_ROUTER=stock`,
 `R9K_QSA_GLUE=stock`, `R9K_HC_MIX=stock`).
 
+**Bisect (2026-09-29, `~/evalcmp.py` over every saved run):** router off (`qt-r3a`) 97.38%, router alone (`qt-r3b`)
+97.38%, each 6 / 1 against qt-r2 (p = 0.125). But qt-r2's 98.00% is the outlier: the four earlier runs of the same
+default (qt-ref / qt-new / qt-def030 / qt-ar4) sit at 97.50-97.62% and qt-r2 beats them 4 / 0, 4 / 1, 3 / 0 -- it
+got four questions right that the default usually misses. Against those runs, r3a and r3b are 4 / 2 and 5 / 3, the
+same as the runs against each other (5 / 4, 4 / 4): noise. Only the full round 3 (qt-r3, 96.88%) still leans worse
+against the older runs (6 / 0, 7 / 1, 7 / 2), and one question (3195b2b45ffb) is wrong in all three round-3 legs and
+in none of the five earlier runs. The one round-3 change no leg switched off is the TP=4 `tuned.json` entries
+(1554e9a: block-fp8 dense shapes and the LM head take different split-K configs, so their fp32 sums round
+differently). Queued: a replicate of round 3 (`qt-r3c`) and the round-2 config again (`qt-r2b`, the noise floor).
+If qt-r3c repeats ~96.9% the tuned entries get their own leg; if it lands at 97.5% the round-3 verdict was noise.
+
 Remaining node budget (eager profile with Python stacks, `~/dec-stack.py`, ~2,770 kernels/step after the round):
 GDN spec-decode glue in `qwen_gdn_linear_attn.py` (cat / reshape / contiguous / zeros / copies, ~9 per layer x 36:
 vLLM fuses only the non-speculative decode path), the shared expert's own quant + silu + expert-gate GEMM + sigmoid
