@@ -37,6 +37,8 @@ from vllm.utils.torch_utils import (LayerNameType, _encode_layer_name, _resolve_
 logger = init_logger("vllm." + __name__)
 
 MAX_SPEC_TOKENS = 8            # per sequence (num_spec + 1); stock's MAX_FUSED_GDN_MTP_TOKENS
+DEBUG = os.environ.get("R9K_GDN_DEBUG", "0") == "1"   # per-stage syncs + host range checks (slow; diagnosis only)
+FUSED = os.environ.get("R9K_GDN_FUSED", "1") == "1"   # 0: always stock's core + norm inside the op (diagnosis)
 _L = None
 _OPS_DONE = False
 
@@ -107,7 +109,7 @@ def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name
     T = qkvz.shape[0]
     qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
     Hv, D = self.num_v_heads // self.tp_size, self.head_v_dim
-    if md is not None and isinstance(md, GDNAttentionMetadata) and _fused_ok(self, md):
+    if FUSED and md is not None and isinstance(md, GDNAttentionMetadata) and _fused_ok(self, md):
         p = self.__dict__.get("_r9k_gdn_params")
         if p is None:
             p = (self.A_log.detach().float().contiguous(), self.dt_bias.detach().float().contiguous(),
@@ -117,24 +119,93 @@ def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name
         idx, cu, acc = md.spec_state_indices_tensor, md.spec_query_start_loc, md.num_accepted_tokens
         conv_state = self.kv_cache[0] if is_conv_state_dim_first() else self.kv_cache[0].transpose(-1, -2)
         conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
-        mixed = causal_conv1d_update(qkvz[:n_act, :qkv_size], conv_state, conv_weights, self.conv1d.bias,
-                                     self.activation, conv_state_indices=idx[:N, 0],
-                                     num_accepted_tokens=acc[:N], query_start_loc=cu[: N + 1],
-                                     max_query_len=idx.size(1), validate_data=False)
+        x = qkvz[:n_act, :qkv_size]
+        dbg = DEBUG and not torch.cuda.is_current_stream_capturing()
+        if dbg:
+            _debug_check(self, qkvz, ba, out, x, idx, cu, acc, N, n_act, T)
+        mixed = causal_conv1d_update(x, conv_state, conv_weights, self.conv1d.bias, self.activation,
+                                     conv_state_indices=idx[:N, 0], num_accepted_tokens=acc[:N],
+                                     query_start_loc=cu[: N + 1], max_query_len=idx.size(1), validate_data=False,
+                                     out=torch.empty_like(x))          # qkvz itself is left untouched
+        if dbg:
+            torch.cuda.synchronize()
+            logger.info("r9700 gdn debug %s: conv ok, mixed %s %s", self.prefix, tuple(mixed.shape), mixed.stride())
         b, a = self.split_ba(ba)
         decode_mtp(mixed, b, a, p[0], p[1], p[2], qkvz[:, qkv_size:], out, self.kv_cache[1], idx[:N], cu[: N + 1],
                    acc[:N], self.num_k_heads // self.tp_size, Hv, self.head_k_dim ** -0.5, self.layer_norm_epsilon,
                    gate_sigmoid=self.norm.activation == "sigmoid")
+        if dbg:
+            torch.cuda.synchronize()
+            logger.info("r9700 gdn debug %s: kernel ok", self.prefix)
         return
+    dbg = DEBUG and not torch.cuda.is_current_stream_capturing()
+    if dbg:
+        torch.cuda.synchronize()
+        logger.info("r9700 gdn debug %s: fallback T=%d md=%s", self.prefix, T, None if md is None else
+                    f"prefills={md.num_prefills} decodes={md.num_decodes} spec={md.num_spec_decodes} act={md.num_actual_tokens}")
     mixed_qkv, z = qkvz.split([qkv_size, self.value_dim // self.tp_size], dim=-1)
     b, a = self.split_ba(ba)
     core = torch.zeros((T, Hv, D), dtype=qkvz.dtype, device=qkvz.device)
     self._forward_core(mixed_qkv=mixed_qkv, b=b.contiguous(), a=a.contiguous(), core_attn_out=core)
+    if dbg:
+        torch.cuda.synchronize()
+        logger.info("r9700 gdn debug %s: fallback core ok", self.prefix)
     out.copy_(self.norm(core, z.reshape(T, Hv, D)).flatten(-2))
+    if dbg:
+        torch.cuda.synchronize()
+        logger.info("r9700 gdn debug %s: fallback norm ok", self.prefix)
+
+
+def _debug_check(self, qkvz, ba, out, x, idx, cu, acc, N, n_act, T) -> None:
+    torch.cuda.synchronize()
+    st, cs = self.kv_cache[1], self.kv_cache[0]
+    i, c, k = idx[:N].cpu(), cu[: N + 1].cpu(), acc[:N].cpu()
+    logger.info("r9700 gdn debug %s: T=%d n_act=%d N=%d qkvz %s %s ba %s %s out %s x %s %s | state %s %s %s conv %s %s"
+                " | idx %s %s min %d max %d | cu %s | acc %s | b/a dtypes %s %s",
+                self.prefix, T, n_act, N, tuple(qkvz.shape), qkvz.stride(), tuple(ba.shape), ba.stride(),
+                tuple(out.shape), tuple(x.shape), x.stride(), tuple(st.shape), st.stride(), st.dtype, tuple(cs.shape),
+                cs.dtype, tuple(idx.shape), idx.stride(), int(i.min()), int(i.max()), c.tolist()[:20], k.tolist()[:20],
+                idx.dtype, acc.dtype)
+    bad = []
+    if int(i.max()) >= st.shape[0]:
+        bad.append(f"idx max {int(i.max())} >= state blocks {st.shape[0]}")
+    if int(c[-1]) > n_act or int(c[-1]) > T:
+        bad.append(f"cu[N] {int(c[-1])} > n_act {n_act} / T {T}")
+    if (c[1:] - c[:-1]).max() > idx.shape[1]:
+        bad.append(f"a sequence has more tokens than slots {idx.shape[1]}")
+    if int(k.min()) < 1 or int(k.max()) > idx.shape[1]:
+        bad.append(f"acc range {int(k.min())}..{int(k.max())}")
+    if bad:
+        logger.error("r9700 gdn debug %s: BAD %s", self.prefix, "; ".join(bad))
 
 
 def _gdn_core_fake(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name: LayerNameType) -> None:
     return None
+
+
+SPLIT_OP = "r9700::gdn_core"
+
+
+def register_splitting_op() -> bool:
+    """Put our op on vLLM's default piecewise-graph splitting list next to vllm::qwen_gdn_attention_core.
+
+    The GDN core must run eagerly at every step of a piecewise prefill graph (its Triton kernels take that step's
+    sequence layout); vLLM lists its own op in CompilationConfig._attention_ops for that. Ours replaces it in the
+    traced forward, so without this entry a prefill piece captures our op's kernels for the capture batch and
+    replays them for every later one -> GPU memory fault on the first real request (2026-09-29). Runs at plugin
+    registration, before any VllmConfig copies the class list. Version-gated on the attribute existing."""
+    from vllm.config.compilation import CompilationConfig
+    ops = getattr(CompilationConfig, "_attention_ops", None)
+    if not isinstance(ops, list):
+        logger.warning("r9700: CompilationConfig._attention_ops not a list (%s): GDN core stays on stock's forward",
+                       type(ops).__name__)
+        return False
+    if SPLIT_OP not in ops:
+        ops.append(SPLIT_OP)
+    return True
+
+
+_SPLIT_OK = os.environ.get("R9K_GDN_DECODE", "r9k") != "stock" and register_splitting_op()
 
 
 def register_ops() -> None:
@@ -142,7 +213,7 @@ def register_ops() -> None:
     if _OPS_DONE:
         return
     from ..ops import _LIB
-    direct_register_custom_op("gdn_core", gdn_core, mutates_args=["qkvz", "out"], fake_impl=_gdn_core_fake,
+    direct_register_custom_op("gdn_core", gdn_core, mutates_args=["out"], fake_impl=_gdn_core_fake,
                               target_lib=_LIB)
     _OPS_DONE = True
 
@@ -228,11 +299,17 @@ class R9kQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         if os.environ.get("R9K_GDN_MERGE", "1") == "1" and ba is not None and getattr(ba, "quant_method", None) \
                 is not None and getattr(self, "in_proj_qkvz", None) is not None:
             ba.quant_method = _MergeTrigger(ba.quant_method, self)
-        if os.environ.get("R9K_GDN_DECODE", "r9k") != "stock" and self._r9k_decode_fits() and available():
+        if _SPLIT_OK and self._r9k_decode_fits() and available():
             register_ops()
             self._forward_method = self._r9k_forward
+            try:
+                from vllm.config import get_current_vllm_config
+                split = get_current_vllm_config().compilation_config.splitting_ops
+                listed = split is not None and SPLIT_OP in split
+            except Exception:
+                listed = None
             logger.info_once("r9700: GDN MTP decode core on r9k_gdn_decode_mtp (conv update + one fused "
-                             "gating/recurrence/norm launch per layer)")
+                             "gating/recurrence/norm launch per layer); %s in splitting_ops: %s", SPLIT_OP, listed)
 
     def _r9k_decode_fits(self) -> bool:
         conds = {"flat layout": self.qkvz_layout == "flat",
