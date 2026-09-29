@@ -14,7 +14,14 @@ Qwen3.8-Flash-Next (MXFP4 / fp8 GPTQ), TP4, 4× R9700 at a 225 W cap, full Bette
 speculative decoding on both stacks. The reference column is the fastest known alternative stack, measured on
 the same box, checkpoint and cap.
 
-RESULT_RELEASE_TABLE
+| | v0.2.0 | reference | |
+|---|--:|--:|--:|
+| single-stream decode | **159.2 tok/s** | 134.1 | **+19%** |
+| decode step p50 | **16.8 ms** | 20.4 ms | **-18%** |
+| time to first token p50 | **94 ms** | 145 ms | **1.5× faster** |
+| prefill 2k / 8k / 16k / 32k | **6,408 / 7,365 / 7,451 / 7,182** | 5,279 / 5,711 / 5,977 / 6,106 | **+18-29%** |
+| concurrency 1 / 2 / 4 / 8 / 16 | **151 / 231 / 350 / 478 / 635** | 126 / 197 / 303 / 427 / 542 | **+12-20%** |
+| sanity set | 8 / 8 | | |
 
 Qwen3.8-27B-NVFP4 on 2× R9700 (TP2) is unchanged from v0.1.0: 94% of the reference stack on decode, 80-86% on
 prefill (the PCIe 3 all-reduce ceiling on this host).
@@ -25,11 +32,11 @@ prefill (the PCIe 3 all-reduce ceiling on this host).
   touches only the visible columns; per-row scales and staged 16 B stores in the MoE prefill epilogues; the
   compressed hierarchical 4-rank all-reduce; switch-local P2P on both PLX switches (2× peer bandwidth); prefill
   chunks up to 2k tokens captured as HIP graphs (TTFT 137 → 88 ms).
-- **Decode (+4% single-stream, +4-10% at concurrency):** on this ROCm each HIP-graph node costs ~1.5 µs of
+- **Decode (+19% single-stream, +12-20% at concurrency):** on this ROCm each HIP-graph node costs ~1.5 µs of
   dispatch, and a Flash-Next step had ~3,250 of them against the reference stack's ~1,640. Five fusions replaced
   the runs of tiny launches with one kernel each: router GEMM, indexer norm + rope, hyper-connection mix,
   the shared expert (8 → 4 launches), and the Gated DeltaNet speculative-decode core (11 graph nodes → 1 per
-  layer). RESULT_RELEASE_DECODE
+  layer). The last two alone took the step from 19.0 to 16.8 ms.
 
 ## What's in it (new since v0.1.0)
 

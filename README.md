@@ -4,9 +4,9 @@ Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Rade
 (gfx1201 / RDNA4).
 
 **Headline (September 2026): Qwen3.8-Flash-Next on four R9700s is now faster than the best known alternative
-stack on every metric we measure** -- 139 tok/s single-stream decode against 134, first token in 88 ms against
-145, prompt processing 20-31% ahead at every depth from 2k to 32k tokens, and 4-10% more aggregate throughput at
-every concurrency level. All of it on stock vLLM and stock ROCm, from a plugin -- and on a **PCIe 3** host, where
+stack on every metric we measure** -- 159 tok/s single-stream decode against 134 (+19%), first token in 94 ms
+against 145, prompt processing 18-29% ahead at every depth from 2k to 32k tokens, and 12-20% more aggregate
+throughput at every concurrency level. All of it on stock vLLM and stock ROCm, from a plugin -- and on a **PCIe 3** host, where
 the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would move the multi-card numbers up
 again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
 [PROGRESS.md](PROGRESS.md).
@@ -44,13 +44,13 @@ Flash-Next (the MoE + Gated DeltaNet model, MXFP4/fp8 GPTQ checkpoint), tensor-p
 225 W cap, full BetterBench (20 passes), MTP-3 speculative decoding on both stacks. The reference column is the
 fastest known alternative stack for this model on **the same box, the same checkpoint and the same power cap**.
 
-| | this stack | reference stack | |
+| | this stack (v0.2.0) | reference stack | |
 |---|--:|--:|--:|
-| single-stream decode | **139.1 tok/s** | 134.1 | **104%** |
-| decode step p50 | **19.0 ms** | 20.4 ms | |
-| time to first token p50 | **88 ms** | 145 ms | **1.6× faster** |
-| prefill 2k / 8k / 16k / 32k (tok/s) | **6,444 / 7,514 / 7,630 / 7,349** | 5,279 / 5,711 / 5,977 / 6,106 | **+22% / +32% / +28% / +20%** |
-| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **131 / 216 / 324 / 457 / 598** | 126 / 197 / 303 / 427 / 542 | **+4% / +10% / +7% / +7% / +10%** |
+| single-stream decode | **159.2 tok/s** | 134.1 | **+19%** |
+| decode step p50 | **16.8 ms** | 20.4 ms | **-18%** |
+| time to first token p50 | **94 ms** | 145 ms | **1.5× faster** |
+| prefill 2k / 8k / 16k / 32k (tok/s) | **6,408 / 7,365 / 7,451 / 7,182** | 5,279 / 5,711 / 5,977 / 6,106 | **+21% / +29% / +25% / +18%** |
+| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **151 / 231 / 350 / 478 / 635** | 126 / 197 / 303 / 427 / 542 | **+20% / +17% / +16% / +12% / +17%** |
 
 Where it came from, in one line each: prefill from an MXFP4×FP8 MoE GEMM with the per-row scales in LDS, a
 WMMA scorer for the sparse-attention indexer that only touches the visible columns, and a compressed 4-rank
@@ -58,9 +58,8 @@ all-reduce; decode from replacing hundreds of tiny per-step launches (norm + rop
 hyper-connection mix, the shared expert, the Gated DeltaNet speculative-decode core) with one kernel each --
 on this ROCm every HIP-graph node costs about 1.5 µs of dispatch, so the launches were the cost.
 
-**Next up:** the fused Gated DeltaNet decode core and the four-launch shared expert are committed and probing
-at **+15% single-stream decode** (166 → 191 tok/s in the quick probe, step 19.3 → 17.2 ms) with +9% at eight
-streams; the full benchmark and the paired quality eval are running and this table will be updated when they land.
+The last two fusions (the Gated DeltaNet speculative-decode core and the four-launch shared expert) alone took
+single-stream decode from 139 to 159 tok/s and the step from 19.0 to 16.8 ms, in one day.
 
 Quality: 800 chain-of-thought questions, paired against the previous default, checked before every change to
 the default ships (paired McNemar; see PROGRESS.md for each verdict).

@@ -724,7 +724,17 @@ decode 166.5 -> 170.3 tok/s (+2.3%, 3.09 -> 3.12 tok/step), c8 573 -> 561, c16 8
 7171 (the last three within the probe's run-to-run band). Smaller than the ~1.1 ms/step the unit timing
 suggested: in a captured decode graph the removed nodes were cheaper than in the eager profile.
 
-RESULT_SE_SERVING
+**Probe, both fusions (`se-r9k`):** decode 190.9 tok/s (3.2 tok/step), step 17.16 ms, c8 623, c16 891, prefill 8k
+7,233 -- vs `r4-stock` 166.5 / 19.3 / 573 / 852 / 7,407. The shared expert's four launches are worth more than the
+GDN core's one: 48 calls per step against 36, and the router-weight fold removes the expert-gate GEMM outright.
+
+**bb-final8 (round 4 = round 3 + GDN core + shared expert; TP=4, MTP-3, 20 passes):** decode **159.2 tok/s**, step
+p50 **16.79 ms**, TTFT p50 94 ms, prefill 6,408 / 7,365 / 7,451 / 7,182, concurrency 151 / 231 / 350 / 478 / 635,
+sanity 8/8. Against bb-final7: decode +14%, step -12%, concurrency +5..+15%, prefill -0.5..-2.4% (within the
+run-to-run band; the GDN op now runs eagerly in the prefill pieces exactly as stock's did). Against Rob's image:
+decode +19%, step -18%, TTFT 1.5x, prefill +18..+29%, concurrency +12..+20%.
+
+RESULT_R4_QUALITY
 
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
