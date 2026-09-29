@@ -749,6 +749,10 @@ spanned (97.5-97.6) but below the round-2 build's 97.9-98.0. It is a knob, not a
 R9K_QSA_GLUE=stock R9K_HC_MIX=stock` restores round-2 numerics at ~10% of decode. Shipped as-is for v0.2.0 with the
 trade stated; the cleaner fix is per-fusion evals against a bit-reproducible baseline, one at a time.
 
+*Superseded the same evening: on the full 1,319 questions no fusion, alone or together, costs anything (97.04% for
+the default against 96.82% for the round-2 numerics, 5 / 8). The half point was the first-800 slice. See "the decode
+fusions one at a time" below.*
+
 ### 2026-09-29: Flash-Next at TP2 with offloaded experts, on the 4-card box
 
 Brian asked for a two-card benchmark with the experts in host RAM (the v0.1.0 way to run Flash-Next). Three
@@ -907,13 +911,45 @@ outputs and would need the full paired eval before it could be offered even as a
 Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
 The launcher header says so; `GPUS=0,2` on this box.
 
+### 2026-09-29: the decode fusions one at a time, on the full test set (the round-3 question, answered)
+
+Item 1 of the list below, run the same day (`~/chain-qf.sh` / `chain-qf2.sh` on VM100, `~/qfcmp.py`): Flash-Next
+TP4, **all 1,319 GSM8K test questions**, chain-of-thought, concurrency 1. Reference = round-2 numerics on the
+current build (all five decode fusions at stock); one fusion on per leg; then the shipped default; then the
+reference again.
+
+| leg | accuracy | reference-only right | leg-only right | McNemar p (exact) | identical outputs |
+|---|---|---|---|---|---|
+| reference (`qf-base`) | 96.82% (1,277) | | | | |
+| reference again (`qf-base2`) | 96.82% | 0 | 0 | 1.00 | 99.9% |
+| router GEMM | 96.82% | 6 | 6 | 1.00 | 31.8% |
+| indexer norm + rope glue | 96.97% | 0 | 2 | 0.50 | 87.2% |
+| hyper-connection mix | 97.04% | 5 | 8 | 0.58 | 35.3% |
+| GDN speculative-decode core | 96.97% | 5 | 7 | 0.77 | 31.9% |
+| shared expert | 96.74% | 6 | 5 | 1.00 | 31.2% |
+| **all five (the v0.2.0 default)** | **97.04%** | 5 | 8 | 0.58 | 29.9% |
+
+1. **No fusion costs accuracy, alone or together.** The discordant pairs are balanced on every leg, and the shipped
+   default is three questions ABOVE the round-2 numerics, which means nothing either.
+2. **The reference is bit-reproducible** (1,318 of 1,319 outputs identical six hours apart, no discordant
+   pair), so the noise floor of this comparison is zero and every discordant pair above is the fusion's doing: a
+   fusion changes which marginal questions come out right, not how many.
+3. **The "~0.5 point" of yesterday was the subset.** On the first 800 questions -- yesterday's eval -- the same
+   eight runs read as they did then: reference 97.88% (1 / 0 against `qt-r2`), router 6 / 1, hc mix 6 / 2, GDN 5 / 2,
+   shared expert 5 / 0, all five 97.50% and 5 / 1, exactly `qt-r4c`. The round-2 numerics score 98.0% on those 800
+   and 95.0% on the other 519: they sit on the lucky side of the marginal questions of that slice, so anything that
+   reshuffles marginal questions looks like a loss there and like a gain on the rest. Paired tests do not protect
+   against that; a reference that scores unusually well on the slice is itself the outlier, which the bisect had
+   already half seen ("qt-r2 is the lucky outlier") before settling on the wrong reading.
+4. **Consequences.** The three `=stock` knobs buy nothing measurable and cost ~10% of decode; the quality
+   statement of v0.2.0 (changelog, release notes, README) is corrected in v0.2.1; the eval for a change of default
+   is from now on the full 1,319 questions (40 minutes at TP4), not the first 800.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
-1. **Per-fusion quality evals against a bit-reproducible baseline.** The three round-3 decode fusions (router GEMM,
-   indexer glue, hyper-connection mix) together cost ~0.5 point on the 800-question chain-of-thought eval; each
-   alone is at the edge of detection (6 / 1). One at a time, conc=1, against the round-2 numerics
-   (`R9K_ROUTER=stock R9K_QSA_GLUE=stock R9K_HC_MIX=stock`), to find which rounding point carries it.
+1. ~~Per-fusion quality evals against a bit-reproducible baseline~~ -- done 2026-09-29, section above: no fusion
+   costs accuracy on the full test set.
 2. **Decode node count**: the stock MoE align / top-k / sum glue (~250 graph nodes per step at ~1.5 us of dispatch
    each), then the remaining GDN and spec-decode glue.
 3. **Split-V GDN core** for high concurrency (at 16 sequences the fused kernel is state-bandwidth bound).
@@ -922,7 +958,7 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    device copies and the stock per-token quant of the block GEMM.
 
 ### Open questions for Brian
-- Round-3 fusions: shipped on by default in v0.2.0 with the ~0.5-point trade stated; the three `=stock` knobs
-  restore round-2 numerics at ~10% of decode. Item 1 above is the way to keep the speed without the trade.
+- `UTIL=0.96` for TP2 with offload: 28% more KV room and it ran clean, but it has not held a 32k context under
+  load. Worth a soak, or leave at 0.94?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
   serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.

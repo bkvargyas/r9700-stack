@@ -57,6 +57,11 @@ runs the three round-3 decode fusions together sit about half a point below the 
 is a knob, not a bug -- `R9K_ROUTER=stock R9K_QSA_GLUE=stock R9K_HC_MIX=stock` restores round-2 numerics for ~10%
 of decode. The full bisect is in PROGRESS.md.
 
+> **Correction, 2026-09-29 (v0.2.1).** The half point was an artifact of the 800-question slice. On the full
+> 1,319-question test set the v0.2.0 default scores 97.04% against 96.82% for the round-2 numerics (5 / 8
+> discordant, p = 0.58) and no fusion costs anything alone either; the round-2 numerics happen to score 98.0% on
+> the first 800 questions and 95.0% on the rest. Nothing needs switching off.
+
 ## Licence
 
 **Apache-2.0**, with one carve-out: `serve/templates/qwen-fixed-v22.3.jinja` is GGZ14's, used with permission

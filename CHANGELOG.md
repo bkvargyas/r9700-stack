@@ -31,6 +31,12 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
   below; a mixed batch gains up to ~10%, nothing else changes, outputs cannot.
 
 ### Fixed
+- **The quality statement of 0.2.0 was wrong in the project's disfavour.** It said the round-3 decode fusions
+  together sit about half a point below the round-2 numerics. On the full 1,319-question test set they do not: the
+  default scores 97.04% against 96.82% (5 / 8 discordant, p = 0.58), each of the five fusions alone is equally
+  indistinguishable (6 / 6, 0 / 2, 5 / 8, 5 / 7, 6 / 5), and the reference reproduces itself to 1,318 of 1,319
+  outputs. The half point came from evaluating on the first 800 questions, where the round-2 numerics score 98.0%
+  (95.0% on the other 519). Evals for a change of default now use the full set.
 - PROGRESS.md reported a concurrency regression for Flash-Next TP2 with offloaded experts (conc-8 132 vs 206 on
   2026-09-20). There is none: the two figures came from different harnesses. On the 2026-09-20 harness v0.2.0
   reads 104 tok/s single-stream (was 84.5), prefill 2,756 (was 2,165) and conc-8 211-227 (was 206, within the
