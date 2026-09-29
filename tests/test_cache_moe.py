@@ -3,7 +3,10 @@
 Run in the ROCm 10 image (needs vllm for moe_align_block_size):
     PYTHONPATH=/repo R9K_LIB=/repo/r9700_vllm/kernels/libr9k.so python3 /repo/tests/test_cache_moe.py
 """
+import os
 import sys
+
+os.environ["R9K_LRU_THRESH"] = "0.5"      # max_distinct = 24, as the steps below assume (the default is 0.99)
 
 import torch
 

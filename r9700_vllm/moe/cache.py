@@ -9,7 +9,10 @@ twice: over the arena with moe_align(expert_map=table) and over the host store w
 moe_align(expert_map=map_cold) -- the second is empty unless the step read through (too many distinct experts,
 or the insert cap was hit). All of it is device-side and pointer-stable, so it is cudagraph-safe.
 
-Config (per rank): R9K_EXPERT_CACHE_GB (0 = off), R9K_LRU_THRESH (0.5), R9K_LRU_MAX_INSERTS (64),
+Config (per rank): R9K_EXPERT_CACHE_GB (0 = off), R9K_LRU_THRESH (0.99: a step routing to more distinct experts
+than this share of the slots inserts nothing and reads every non-resident expert through from host. At 0.5 eight
+different requests sat over it on 72% of their steps -- 148 distinct experts a layer against 135 -- and the cache
+stopped following them: 22.7% misses, 207 ms a forward pass; at 0.99 15.8% and 144 ms), R9K_LRU_MAX_INSERTS (64),
 R9K_LRU_GATHER="chunks,lanes" (64,16: the copy is link-bound either way, 11-13.5 GB/s on PCIe 3, but at 8+
 inserts the wider grid is ~15% faster than 8,16 and equal below; tuning/lru_gather_bench.py). Warm start: the checkpoint's model-expertprofile.safetensors
 (expert_routing_counts [layers, experts]) if present, else experts 0..S-1.
@@ -209,7 +212,7 @@ class LayerCache:
         self.routed = torch.zeros((E,), dtype=torch.uint8, device=dev)
         self.step = torch.zeros((1,), dtype=torch.int64, device=dev)
         self.max_inserts = min(int(os.environ.get("R9K_LRU_MAX_INSERTS", "64")), S)
-        self.max_distinct = int(S * float(os.environ.get("R9K_LRU_THRESH", "0.5")))
+        self.max_distinct = int(S * float(os.environ.get("R9K_LRU_THRESH", "0.99")))
         self.miss = torch.full((max(1, self.max_inserts), 2), -1, **i32)
         # rows per step up to which the cold (host read-through) pass cannot have work: distinct <= rows
         self.no_cold_limit = min(self.max_distinct, self.max_inserts) if S > self.max_distinct else 0

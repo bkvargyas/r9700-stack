@@ -11,6 +11,7 @@ import sys
 
 os.environ["R9K_EXPERT_CACHE_STATS"] = "1"
 os.environ["R9K_EXPERT_CACHE_STATS_SEC"] = "0"      # no reader thread in the test
+os.environ["R9K_LRU_THRESH"] = "0.5"                # max_distinct = 24: the steps over all E must read through
 
 import torch
 
