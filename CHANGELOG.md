@@ -8,7 +8,7 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 Qwen3.8-Flash-Next on four R9700s (TP4) goes ahead of the fastest known alternative stack on every metric:
 single-stream decode, time to first token, prompt processing at every depth, and aggregate throughput at every
-concurrency level. RESULT_CHANGELOG_HEADLINE
+concurrency level -- measured on a PCIe 3 host; PCIe 5 would be faster still. RESULT_CHANGELOG_HEADLINE
 
 ### Added
 - **Four-card support.** `GPUS` / `TP` / `PORT` / `NAME` launcher knobs, TP=4 MoE and dense configs, and the

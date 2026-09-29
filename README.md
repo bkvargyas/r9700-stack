@@ -6,8 +6,10 @@ Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Rade
 **Headline (September 2026): Qwen3.8-Flash-Next on four R9700s is now faster than the best known alternative
 stack on every metric we measure** -- 139 tok/s single-stream decode against 134, first token in 88 ms against
 145, prompt processing 20-31% ahead at every depth from 2k to 32k tokens, and 4-10% more aggregate throughput at
-every concurrency level. All of it on stock vLLM and stock ROCm, from a plugin. The numbers are in
-[Benchmarks](#benchmarks); the story of how each one moved is in [PROGRESS.md](PROGRESS.md).
+every concurrency level. All of it on stock vLLM and stock ROCm, from a plugin -- and on a **PCIe 3** host, where
+the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would move the multi-card numbers up
+again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
+[PROGRESS.md](PROGRESS.md).
 
 **Built for stock upstream releases.** It targets **released vLLM** and **ROCm 10 or newer**, unmodified — no
 fork, no patched source, no vendored binaries. Everything loads as a plugin at runtime through vLLM's own

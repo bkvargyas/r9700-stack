@@ -5,7 +5,8 @@ AMD Radeon AI PRO R9700, using **stock vLLM (0.30 nightly) and stock ROCm 10** -
 nothing to re-port when either moves.
 
 **The headline: on four cards, Flash-Next is now ahead of the fastest known alternative stack on every metric
-we measure.** v0.1.0 trailed it by 5-20%.
+we measure.** v0.1.0 trailed it by 5-20%. This is on a **PCIe 3** host (cards behind two PLX switches on Gen3
+uplinks, ~13.7 GB/s between them); a PCIe 5 box would lift the multi-card numbers further with no code change.
 
 ## Performance
 
