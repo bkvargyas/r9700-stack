@@ -4,6 +4,15 @@ All notable changes to r9700-stack. The format follows [Keep a Changelog](https:
 the project uses [semantic versioning](https://semver.org/). Every number below was measured on 4× (or 2×)
 Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method behind each one.
 
+## [Unreleased]
+
+### Added
+- Full BetterBench for **Flash-Next at TP2 with experts in host RAM** (v0.2.0 code): single-stream decode
+  93.8 tok/s, step 25.7 ms, TTFT 555 ms, prefill 2,099 / 3,163 / 3,434 / 3,329 tok/s, concurrency 84 / 104 /
+  108 / 111 / 95 -- README and PROGRESS.
+- The card-placement rule, measured: tensor parallel wants both cards on one PLX switch, offloaded experts want
+  one card per switch (same-switch pair: 81 / 54 / 1,379 single / conc-8 / prefill-8k vs 114 / 132 / 2,464).
+
 ## [0.2.0] - 2026-09-29
 
 Qwen3.8-Flash-Next on four R9700s (TP4) goes ahead of the fastest known alternative stack on every metric:
@@ -76,5 +85,6 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.0...HEAD
 [0.2.0]: https://github.com/bkvargyas/r9700-stack/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bkvargyas/r9700-stack/releases/tag/v0.1.0

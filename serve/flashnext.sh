@@ -1,8 +1,14 @@
 #!/bin/bash
-# Qwen3.8-Flash-Next (tcclaviger GPTQ) on 2x R9700 (TP2), measured 2026-09-20:
-#   single decode 84.5 tok/s, conc-8 206, prefill ~2165 tok/s, MTP-3 acceptance 2.75, GSM8K-500 97.6-97.8%.
-# Experts stream from pinned host memory (needs the 256 GB VM); the plugin's LRU expert cache keeps 270 slots
-# per layer in VRAM. Attention is the model's own QSA (ATTN=CUSTOM is for standard-attention models only).
+# Qwen3.8-Flash-Next (tcclaviger GPTQ). Two ways to run it:
+#   TP2 with experts in host RAM (the defaults here; needs the 256 GB VM): the plugin's LRU expert cache keeps
+#     270 slots per layer in VRAM. Full BetterBench 2026-09-29 (v0.2.0): single decode 93.8 tok/s (probe 114),
+#     step 25.7 ms, TTFT 555 ms, prefill 2.1k / 3.2k / 3.4k / 3.3k tok/s at 2k..32k, conc 84 / 104 / 108 / 111 / 95.
+#     Prefill and concurrency are bound by the expert stream over PCIe. On a 4-card box use ONE CARD PER PLX
+#     SWITCH (GPUS=0,2): the stream comes down each switch's single Gen3 uplink, and the same-switch pair
+#     measured 81 / 54 / 1,379 (single / conc-8 / prefill 8k) against 114 / 132 / 2,464 on the split pair.
+#     CGSIZES= (vLLM's default graph sizes) at TP2: the 2048-token prefill graphs leave no KV room there.
+#   TP4 with everything in VRAM: GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 (the headline numbers in README.md).
+# Attention is the model's own QSA (ATTN=CUSTOM is for standard-attention models only).
 exec env \
   OVERLAYS=${OVERLAYS-emulated-switch} `# host overlay, not the product: VM100 on the .100 PLX box
                                         # needs the hostcall-free RCCL or every collective fails at

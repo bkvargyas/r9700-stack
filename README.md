@@ -65,6 +65,32 @@ Quality: 800 chain-of-thought questions at concurrency 1, paired against the pre
 to the default ships (paired McNemar). v0.2.0 scores 97.5%, no detectable difference from the previous default;
 the decode fusions can be switched off individually (`R9K_*=stock`) if you want the earlier numerics back.
 
+### Qwen3.8-Flash-Next, 2× R9700 (TP2) with experts in host RAM
+
+The two-card way to run Flash-Next: the routed experts stream from pinned host memory through the plugin's LRU
+expert cache (34 GB per rank offloaded, 270 expert slots per layer resident), so the model fits two cards with
+room for a 72k-token KV cache. Same v0.2.0 code, full BetterBench (20 passes), measured 2026-09-29 on one card
+per PLX switch:
+
+| | this stack |
+|---|--:|
+| single-stream decode | **93.8 tok/s** (quick probe: 114) |
+| decode step p50 | 25.7 ms |
+| time to first token p50 | 555 ms |
+| prefill 2k / 8k / 16k / 32k (tok/s) | 2,099 / 3,163 / 3,434 / 3,329 |
+| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | 84 / 104 / 108 / 111 / 95 |
+
+Read it as a memory-bound configuration: single-stream decode is strong because the cache keeps the hot experts
+resident, while prefill and concurrency are bound by streaming experts over the PCIe 3 uplink (that is the TTFT).
+Four cards with everything in VRAM are 1.7× faster single-stream and 4-6× at concurrency; a PCIe 5 host would
+narrow that gap without any code change.
+
+**Card placement matters, in opposite directions.** Tensor-parallel traffic wants both cards on the same PLX
+switch (switch-local P2P: the 4-card numbers above). Offloaded experts want one card per switch, because the
+expert stream comes down each switch's single Gen3 uplink from the host: on the same-switch pair this exact
+configuration measured 81 tok/s single-stream, 54 at eight streams and 1,379 tok/s prefill against 114 / 132 /
+2,464 on the split pair. On the 4-card box that is `GPUS=0,2`.
+
 ### Qwen3.8-27B-NVFP4, 2× R9700 (TP2)
 
 Measured with
@@ -134,8 +160,8 @@ You need the models on disk and a ROCm 10 container. Then:
 
 ```bash
 serve/27b.sh                      # Qwen3.8-27B-NVFP4 on 2 GPUs
-serve/flashnext.sh                # Qwen3.8-Flash-Next on 2 GPUs
-GPUS=0,1,2,3 TP=4 serve/flashnext.sh   # Flash-Next on 4 GPUs (the headline configuration)
+serve/flashnext.sh                # Qwen3.8-Flash-Next on 2 GPUs, experts in host RAM (GPUS=0,2 on a 4-card box)
+GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 serve/flashnext.sh   # Flash-Next on 4 GPUs, everything in VRAM (the headline)
 ```
 
 Both are thin wrappers over `serve/serve.sh` and every tuning knob in them is commented with what it was measured

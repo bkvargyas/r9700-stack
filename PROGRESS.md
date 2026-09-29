@@ -749,6 +749,34 @@ spanned (97.5-97.6) but below the round-2 build's 97.9-98.0. It is a knob, not a
 R9K_QSA_GLUE=stock R9K_HC_MIX=stock` restores round-2 numerics at ~10% of decode. Shipped as-is for v0.2.0 with the
 trade stated; the cleaner fix is per-fusion evals against a bit-reproducible baseline, one at a time.
 
+### 2026-09-29: Flash-Next at TP2 with offloaded experts, on the 4-card box
+
+Brian asked for a two-card benchmark with the experts in host RAM (the v0.1.0 way to run Flash-Next). Three
+launches to get a fair one:
+
+1. **GPUs 0,1 with the current defaults: no KV memory at all.** The 2048-token prefill graphs take 3.4 GiB per
+   card at TP2 (1.8 at TP4) on top of the 15.8 GB expert cache; `CGSIZES=` (vLLM's default sizes) restores it.
+2. **GPUs 0,1 with default graph sizes: 44k tokens of KV, and the quick probe collapsed at concurrency** (c8 54,
+   c16 49 tok/s below the 81 single-stream; prefill 8k 1,379). 240 expert slots gave 105k tokens of KV and the same
+   collapse, so KV was not it.
+3. **One card per PLX switch (GPUs 0,2) fixed it:** 106 / 94 / 99 / 2,241 (single / c8 / c16 / prefill 8k) at 240
+   slots, 114 / 132 / 120 / 2,464 at 270. The offloaded experts stream from pinned host memory down each switch's
+   single Gen3 x16 uplink; two cards on one switch halve each other's read bandwidth, which is invisible when
+   everything sits in VRAM (the TP4 numbers) and dominant when it does not. Also 154k tokens of KV on the split pair
+   against 105k on the same-switch one at equal settings (the pair's P2P scratch differs).
+
+**bb-qfn-tp2-offload (GPUs 0,2, OFFLOAD_GB=34/rank, 270 slots, CGSIZES default, otherwise v0.2.0 defaults; full
+BetterBench 20 passes):** decode 93.8 tok/s, step p50 25.68 ms, TTFT p50 555 ms, prefill 2,099 / 3,163 / 3,434 /
+3,329, concurrency 84 / 104 / 108 / 111 / 95, KV 71,859 tokens, sanity 8/8. Against the 2026-09-20 probe on the
+same configuration (84.5 / 206 / 2,165 single / c8 / prefill 8k) the probe now reads 114 / 132 / 2,464: single
++35%, prefill +14%, c8 -36%. The concurrency loss is not explained by the placement (0,2 is one card per switch,
+as the September box was) and has not been bisected; the suspects are the September-25 defaults (prefix caching
+off, block-fp8 projections) interacting with the host read-through, since single-stream, which the LRU serves
+from VRAM, improved as expected. Open item.
+
+Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
+The launcher header says so; `GPUS=0,2` on this box.
+
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
 remaining items are each ~1% of a chunk unless noted:
