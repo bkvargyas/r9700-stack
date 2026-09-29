@@ -3,13 +3,19 @@
 Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Radeon AI PRO R9700** cards
 (gfx1201 / RDNA4).
 
+**Headline (September 2026): Qwen3.8-Flash-Next on four R9700s is now faster than the best known alternative
+stack on every metric we measure** -- 139 tok/s single-stream decode against 134, first token in 88 ms against
+145, prompt processing 20-31% ahead at every depth from 2k to 32k tokens, and 4-10% more aggregate throughput at
+every concurrency level. All of it on stock vLLM and stock ROCm, from a plugin. The numbers are in
+[Benchmarks](#benchmarks); the story of how each one moved is in [PROGRESS.md](PROGRESS.md).
+
 **Built for stock upstream releases.** It targets **released vLLM** and **ROCm 10 or newer**, unmodified — no
 fork, no patched source, no vendored binaries. Everything loads as a plugin at runtime through vLLM's own
 extension points (quantization config, model registry, platform plugin, attention backend, custom ops), so you
 can update vLLM or ROCm without re-porting anything. That constraint was the point of the project: hand-tuned
 kernels normally mean a fork you then maintain forever.
 
-Requirements: 2× Radeon AI PRO R9700 (gfx1201), ROCm ≥ 10, a released vLLM build, and the model weights.
+Requirements: 2× or 4× Radeon AI PRO R9700 (gfx1201), ROCm ≥ 10, a released vLLM build, and the model weights.
 
 ### Checkpoint formats
 
@@ -30,7 +36,36 @@ handled by converting the fp8 parts.
 
 ## Benchmarks
 
-Qwen3.8-27B-NVFP4, TP2, 2× R9700 at a 225 W cap, measured with
+### Qwen3.8-Flash-Next, 4× R9700 (TP4)
+
+Flash-Next (the MoE + Gated DeltaNet model, MXFP4/fp8 GPTQ checkpoint), tensor-parallel over four cards at a
+225 W cap, full BetterBench (20 passes), MTP-3 speculative decoding on both stacks. The reference column is the
+fastest known alternative stack for this model on **the same box, the same checkpoint and the same power cap**.
+
+| | this stack | reference stack | |
+|---|--:|--:|--:|
+| single-stream decode | **139.1 tok/s** | 134.1 | **104%** |
+| decode step p50 | **19.0 ms** | 20.4 ms | |
+| time to first token p50 | **88 ms** | 145 ms | **1.6× faster** |
+| prefill 2k / 8k / 16k / 32k (tok/s) | **6,444 / 7,514 / 7,630 / 7,349** | 5,279 / 5,711 / 5,977 / 6,106 | **+22% / +32% / +28% / +20%** |
+| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **131 / 216 / 324 / 457 / 598** | 126 / 197 / 303 / 427 / 542 | **+4% / +10% / +7% / +7% / +10%** |
+
+Where it came from, in one line each: prefill from an MXFP4×FP8 MoE GEMM with the per-row scales in LDS, a
+WMMA scorer for the sparse-attention indexer that only touches the visible columns, and a compressed 4-rank
+all-reduce; decode from replacing hundreds of tiny per-step launches (norm + rope glue, router GEMM,
+hyper-connection mix, the shared expert, the Gated DeltaNet speculative-decode core) with one kernel each --
+on this ROCm every HIP-graph node costs about 1.5 µs of dispatch, so the launches were the cost.
+
+**Next up:** the fused Gated DeltaNet decode core and the four-launch shared expert are committed and probing
+at **+15% single-stream decode** (166 → 191 tok/s in the quick probe, step 19.3 → 17.2 ms) with +9% at eight
+streams; the full benchmark and the paired quality eval are running and this table will be updated when they land.
+
+Quality: 800 chain-of-thought questions, paired against the previous default, checked before every change to
+the default ships (paired McNemar; see PROGRESS.md for each verdict).
+
+### Qwen3.8-27B-NVFP4, 2× R9700 (TP2)
+
+Measured with
 BetterBench 0.6.0 (29 prompts across 8 categories, 20 passes each) on the shipped default
 configuration — our own attention and all-reduce kernels, nothing third-party loaded.
 
@@ -72,9 +107,6 @@ third-party one. Setting `R9K_AR_IMPL=r4d R9K_PAGED_ATTN=r4d` recovers it (~4,40
 library and would rather have the speed. Beyond that, large-message all-reduce on this host is bandwidth-bound
 on a PCIe 3 link at ~13.7 GB/s, which is the practical ceiling.
 
-Flash-Next (tcclaviger GPTQ, TP2) on the same build: ~85 tok/s single stream, ~206 at concurrency 8, ~2,150
-tok/s prefill.
-
 [PROGRESS.md](PROGRESS.md) has every number, how it was produced, and what was tried and rejected.
 
 ### About the 225 W power cap
@@ -99,8 +131,9 @@ numbers should be better than these, and they will not be comparable to them.
 You need the models on disk and a ROCm 10 container. Then:
 
 ```bash
-serve/27b.sh          # Qwen3.8-27B-NVFP4 on 2 GPUs
-serve/flashnext.sh    # Qwen3.8-Flash-Next on 2 GPUs
+serve/27b.sh                      # Qwen3.8-27B-NVFP4 on 2 GPUs
+serve/flashnext.sh                # Qwen3.8-Flash-Next on 2 GPUs
+GPUS=0,1,2,3 TP=4 serve/flashnext.sh   # Flash-Next on 4 GPUs (the headline configuration)
 ```
 
 Both are thin wrappers over `serve/serve.sh` and every tuning knob in them is commented with what it was measured
@@ -111,9 +144,12 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 ## What's in it
 
 - **`kernels/`** — HIP kernels for gfx1201: MXFP4×FP8 MoE GEMM (decode, prefill and fragment-tiled prefill
-  variants), paged attention, 2-rank peer-to-peer all-reduce, fp8 GEMM, int6 embedding gather.
+  variants), paged attention, sparse-attention (QSA) scoring and attention, 2-rank and compressed 4-rank
+  peer-to-peer all-reduce, fp8 GEMM, int6 embedding gather, and the decode fusions: Gated DeltaNet
+  speculative-decode core, router GEMM, indexer norm+rope, hyper-connection mix, shared expert.
 - **`r9700_vllm/`** — the plugin. Registers through vLLM's official extension points (quantization config,
-  model registry, platform plugin, attention backend, custom ops) — no monkey-patching of vLLM internals.
+  model registry, platform plugin, attention backend, custom ops, pluggable layers); the few runtime hooks
+  beyond those are version-gated and listed in [notes/independence.md](notes/independence.md).
 - **`serve/`** — launchers, with measured knobs.
 - **`tests/`** — correctness gates. Each kernel is checked against a reference implementation, and several are
   checked to be *bit-identical* to the path they replace.
