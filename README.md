@@ -61,8 +61,9 @@ on this ROCm every HIP-graph node costs about 1.5 µs of dispatch, so the launch
 The last two fusions (the Gated DeltaNet speculative-decode core and the four-launch shared expert) alone took
 single-stream decode from 139 to 159 tok/s and the step from 19.0 to 16.8 ms, in one day.
 
-Quality: 800 chain-of-thought questions, paired against the previous default, checked before every change to
-the default ships (paired McNemar; see PROGRESS.md for each verdict).
+Quality: 800 chain-of-thought questions at concurrency 1, paired against the previous default before any change
+to the default ships (paired McNemar). v0.2.0 scores 97.5%, no detectable difference from the previous default;
+the decode fusions can be switched off individually (`R9K_*=stock`) if you want the earlier numerics back.
 
 ### Qwen3.8-27B-NVFP4, 2× R9700 (TP2)
 

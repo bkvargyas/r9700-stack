@@ -51,7 +51,11 @@ prefill (the PCIe 3 all-reduce ceiling on this host).
 ## Quality
 
 Every change to a shipped default runs an 800-question chain-of-thought paired eval at concurrency 1 (paired
-McNemar) plus the 8-prompt sanity set before it ships. RESULT_RELEASE_QUALITY
+McNemar) plus the 8-prompt sanity set before it ships. v0.2.0's default scores **97.50%** on that eval, no
+detectable difference from the previous default on its own (5 / 1 discordant, p = 0.22), sanity 8 / 8. Across all
+runs the three round-3 decode fusions together sit about half a point below the round-2 build (97.9-98.0%); that
+is a knob, not a bug -- `R9K_ROUTER=stock R9K_QSA_GLUE=stock R9K_HC_MIX=stock` restores round-2 numerics for ~10%
+of decode. The full bisect is in PROGRESS.md.
 
 ## Licence
 

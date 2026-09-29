@@ -734,7 +734,20 @@ sanity 8/8. Against bb-final7: decode +14%, step -12%, concurrency +5..+15%, pre
 run-to-run band; the GDN op now runs eagerly in the prefill pieces exactly as stock's did). Against Rob's image:
 decode +19%, step -18%, TTFT 1.5x, prefill +18..+29%, concurrency +12..+20%.
 
-RESULT_R4_QUALITY
+**Quality, round 4 (`qt-r4c`, everything on, GDN core engaged):** 97.50% (780/800); paired against qt-r2 5 / 1,
+McNemar p = 0.219, no detectable difference. Sanity 8/8.
+
+**The round-3 question, closed (2026-09-29):** the round-2 configuration reruns at 97.88% one question apart
+from its first run (qt-r2b vs qt-r2: 1 / 0, 87% identical outputs), so that build is near-deterministic, and the
+round-3 family is consistently below it: 96.88 / 97.25 (round 3 twice), 97.38 / 97.38 (router off / router only),
+97.00 with the round-2 tuning table (`qt-r3t`, 8 / 0, p = 0.008 -- so the TP=4 tuned entries are not the cause;
+`test_tuned_cfgs` also passes on them), 97.50 with round 4 on top, 97.88 with the shared expert but the GDN core
+off. Per component the drop is at the edge of detection (6 / 1, p = 0.125 each); combined it is real (8-10 / 1).
+Read: the three round-3 decode fusions each perturb the numerics a little (fp32 order in the glue and mix, near-tie
+routing flips in the router) and together cost ~0.5 point on this eval, which is inside the band the older builds
+spanned (97.5-97.6) but below the round-2 build's 97.9-98.0. It is a knob, not a bug: `R9K_ROUTER=stock
+R9K_QSA_GLUE=stock R9K_HC_MIX=stock` restores round-2 numerics at ~10% of decode. Shipped as-is for v0.2.0 with the
+trade stated; the cleaner fix is per-fusion evals against a bit-reproducible baseline, one at a time.
 
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the

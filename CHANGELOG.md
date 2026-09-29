@@ -57,7 +57,10 @@ decode 159.2 tok/s vs 134.1 (+19%), step p50 16.8 vs 20.4 ms, TTFT 94 vs 145 ms,
 
 ### Quality
 - Every change to a shipped default is checked by an 800-question chain-of-thought paired eval at concurrency 1
-  (paired McNemar), plus the 8-prompt sanity set. RESULT_CHANGELOG_QUALITY
+  (paired McNemar), plus the 8-prompt sanity set. The v0.2.0 default scores 97.50% on that eval (no detectable
+  difference from the previous default alone, p = 0.22); across runs the round-3 decode fusions together sit
+  about half a point below the round-2 build's 97.9-98.0%. `R9K_ROUTER=stock R9K_QSA_GLUE=stock R9K_HC_MIX=stock`
+  restores round-2 numerics at ~10% of decode. Details in PROGRESS.md.
 
 ## [0.1.0] - 2026-09-22
 
