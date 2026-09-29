@@ -12,7 +12,8 @@
 //     q *= scale, h *= exp(g), v -= h.k, v *= beta, h += v (x) k, o = h.q rounded to bf16,
 //     h stored (state dtype) at state_indices[n, t] when > 0; the initial h comes from
 //     state_indices[n, num_accepted[n] - 1], and a sequence whose initial index is <= 0 is skipped (output 0).
-//   layer_norm_fwd (RMS, norm_before_gate, silu): y = (bf16 o as fp32) * rsqrt(mean(o^2) + eps) * w * z * sigmoid(z).
+//   layer_norm_fwd (RMS, norm_before_gate): y = (bf16 o as fp32) * rsqrt(mean(o^2) + eps) * w * gate(z), gate = silu
+//   (z * sigmoid(z)) or, gate_sigmoid != 0, sigmoid(z) (Flash-Next's output_gate_type).
 // Block = 256 threads: V row v = tid / 2, K half tid & 1 (64 fp32 of h per thread); K reductions pair via shfl,
 // the norm's V reduction goes through LDS. Row layout of mixed_qkv: [q: Hk x 128 | k: Hk x 128 | v: Hv x 128];
 // value head hv reads q/k head hv / (Hv / Hk). Rows past the last sequence (padding) get zero output. No printf/assert.
@@ -90,7 +91,7 @@ __global__ void __launch_bounds__(NT) r9k_gdn_decode_mtp_kernel(
     const uint16_t* __restrict__ ap, long sa, const float* __restrict__ A_log, const float* __restrict__ dt_bias,
     const float* __restrict__ w, const uint16_t* __restrict__ z, long sz, uint16_t* __restrict__ out, long sout,
     void* __restrict__ state, long sstate, const int* __restrict__ idx, long sidx, const int* __restrict__ cu,
-    const int* __restrict__ acc, int N, int Hk, int Hv, int rows_total, float scale, float eps) {
+    const int* __restrict__ acc, int N, int Hk, int Hv, int rows_total, float scale, float eps, int gate_sigmoid) {
   const int n = blockIdx.x / Hv, hv = blockIdx.x - n * Hv;
   const int tid = threadIdx.x, v = tid >> 1, kh = tid & 1, lane = tid & 31, wave = tid >> 5;
   __shared__ float lds_o[VD];
@@ -175,7 +176,8 @@ __global__ void __launch_bounds__(NT) r9k_gdn_decode_mtp_kernel(
     if (kh == 0) {
       const float zf = bf2f(z[row * sz + hv * VD + v]);
       float y = (lds_o[v] * rstd) * wv;
-      y = y * (zf * sigmoidf_(zf));
+      const float sg = sigmoidf_(zf);
+      y = y * (gate_sigmoid ? sg : zf * sg);
       out[row * sout + hv * VD + v] = f2bf(y);
     }
     __syncthreads();                                 // lds_o / lds_part reused by the next token
@@ -191,7 +193,7 @@ __global__ void __launch_bounds__(NT) r9k_gdn_decode_mtp_kernel(
 extern "C" int r9k_gdn_decode_mtp(long qkv, long sqkv, long b, long sb, long a, long sa, long A_log, long dt_bias,
                                   long w, long z, long sz, long out, long sout, long state, long sstate,
                                   int state_f32, long idx, long sidx, int S, long cu, long acc, int N, int Hk,
-                                  int Hv, int rows_total, float scale, float eps, long stream) {
+                                  int Hv, int rows_total, float scale, float eps, int gate_sigmoid, long stream) {
   if (Hk < 1 || Hv < Hk || Hv % Hk || S < 1 || S > 64 || N < 0 || rows_total < 0) return -1;
   if ((sqkv | sz | sout | sstate) & 7) return -2;
   if (!qkv || !b || !a || !A_log || !dt_bias || !w || !z || !out || !state || !idx || !cu || !acc) return -3;
@@ -202,11 +204,13 @@ extern "C" int r9k_gdn_decode_mtp(long qkv, long sqkv, long b, long sb, long a, 
     hipLaunchKernelGGL(r9k_gdn_decode_mtp_kernel<true>, grid, block, 0, st, (const uint16_t*)qkv, sqkv,
                        (const uint16_t*)b, sb, (const uint16_t*)a, sa, (const float*)A_log, (const float*)dt_bias,
                        (const float*)w, (const uint16_t*)z, sz, (uint16_t*)out, sout, (void*)state, sstate,
-                       (const int*)idx, sidx, (const int*)cu, (const int*)acc, N, Hk, Hv, rows_total, scale, eps);
+                       (const int*)idx, sidx, (const int*)cu, (const int*)acc, N, Hk, Hv, rows_total, scale, eps,
+                       gate_sigmoid);
   else
     hipLaunchKernelGGL(r9k_gdn_decode_mtp_kernel<false>, grid, block, 0, st, (const uint16_t*)qkv, sqkv,
                        (const uint16_t*)b, sb, (const uint16_t*)a, sa, (const float*)A_log, (const float*)dt_bias,
                        (const float*)w, (const uint16_t*)z, sz, (uint16_t*)out, sout, (void*)state, sstate,
-                       (const int*)idx, sidx, (const int*)cu, (const int*)acc, N, Hk, Hv, rows_total, scale, eps);
+                       (const int*)idx, sidx, (const int*)cu, (const int*)acc, N, Hk, Hv, rows_total, scale, eps,
+                       gate_sigmoid);
   return hipGetLastError() == hipSuccess ? 0 : -4;
 }

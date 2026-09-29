@@ -48,7 +48,7 @@ def lib():
         L = KM.lib()
         L.r9k_gdn_decode_mtp.restype = ctypes.c_int
         L.r9k_gdn_decode_mtp.argtypes = [ctypes.c_long] * 15 + [ctypes.c_int] + [ctypes.c_long] * 2 + [ctypes.c_int] + \
-            [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_float] * 2 + [ctypes.c_long]
+            [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_float] * 2 + [ctypes.c_int] + [ctypes.c_long]
         _L = L
     return _L
 
@@ -62,12 +62,13 @@ def available() -> bool:
 
 def decode_mtp(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor,
                w: torch.Tensor, z: torch.Tensor, out: torch.Tensor, state: torch.Tensor, idx: torch.Tensor,
-               cu: torch.Tensor, acc: torch.Tensor, Hk: int, Hv: int, scale: float, eps: float) -> None:
+               cu: torch.Tensor, acc: torch.Tensor, Hk: int, Hv: int, scale: float, eps: float,
+               gate_sigmoid: bool = False) -> None:
     """Fused gating + delta-rule recurrence + RMSNormGated for N spec-decode sequences.
     mixed_qkv [rows, (2 Hk + Hv) 128] bf16 after the conv (any row stride); b, a [rows, Hv] bf16 views; A_log,
     dt_bias [Hv] fp32; w [128] fp32; z [rows, Hv * 128] bf16 view; out [rows, Hv * 128] bf16 (rows past cu[N] get
     zeros); state [blocks, Hv, 128, 128] fp32 or bf16, updated in place at idx[n, t]; idx [N, S] int32; cu [N + 1]
-    int32; acc [N] int32."""
+    int32; acc [N] int32. gate_sigmoid: the norm's gate is sigmoid(z) instead of silu(z)."""
     N = idx.shape[0]
     assert mixed_qkv.dtype == torch.bfloat16 and mixed_qkv.stride(1) == 1 and z.stride(1) == 1 and out.stride(1) == 1
     assert state.dtype in (torch.float32, torch.bfloat16) and state.is_contiguous() or state.stride(-1) == 1
@@ -78,7 +79,7 @@ def decode_mtp(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, A_log:
                                   z.stride(0), out.data_ptr(), out.stride(0), state.data_ptr(), state.stride(0),
                                   1 if state.dtype == torch.float32 else 0, idx.data_ptr(), idx.stride(0),
                                   idx.shape[1], cu.data_ptr(), acc.data_ptr(), N, Hk, Hv, out.shape[0], float(scale),
-                                  float(eps), torch.cuda.current_stream().cuda_stream)
+                                  float(eps), 1 if gate_sigmoid else 0, torch.cuda.current_stream().cuda_stream)
     if rc:
         raise RuntimeError(f"r9k_gdn_decode_mtp failed ({rc}) N={N} S={idx.shape[1]} rows={out.shape[0]} "
                            f"Hk={Hk} Hv={Hv}")
@@ -122,7 +123,8 @@ def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name
                                      max_query_len=idx.size(1), validate_data=False)
         b, a = self.split_ba(ba)
         decode_mtp(mixed, b, a, p[0], p[1], p[2], qkvz[:, qkv_size:], out, self.kv_cache[1], idx[:N], cu[: N + 1],
-                   acc[:N], self.num_k_heads // self.tp_size, Hv, self.head_k_dim ** -0.5, self.layer_norm_epsilon)
+                   acc[:N], self.num_k_heads // self.tp_size, Hv, self.head_k_dim ** -0.5, self.layer_norm_epsilon,
+                   gate_sigmoid=self.norm.activation == "sigmoid")
         return
     mixed_qkv, z = qkvz.split([qkv_size, self.value_dim // self.tp_size], dim=-1)
     b, a = self.split_ba(ba)
@@ -233,11 +235,19 @@ class R9kQwenGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                              "gating/recurrence/norm launch per layer)")
 
     def _r9k_decode_fits(self) -> bool:
-        return (self.qkvz_layout == "flat" and self.head_k_dim == 128 and self.head_v_dim == 128
-                and self.num_v_heads % self.num_k_heads == 0 and getattr(self.conv1d, "bias", None) is None
-                and self.activation in ("silu", "swish") and self.norm.group_size is None
-                and self.norm.norm_before_gate and self.norm.activation in ("silu", "swish")
-                and not self.disable_tp_for_ba_proj)
+        conds = {"flat layout": self.qkvz_layout == "flat",
+                 "K=V=128": self.head_k_dim == 128 and self.head_v_dim == 128,
+                 "Hv % Hk": self.num_v_heads % self.num_k_heads == 0,
+                 "conv bias": getattr(self.conv1d, "bias", None) is None,
+                 "conv act": self.activation in ("silu", "swish"), "norm group": self.norm.group_size is None,
+                 "norm before gate": bool(self.norm.norm_before_gate),
+                 "gate act": self.norm.activation in ("silu", "swish", "sigmoid"),
+                 "ba tp": not self.disable_tp_for_ba_proj}
+        if all(conds.values()):
+            return True
+        logger.warning_once("r9700: GDN MTP decode core skipped for %s (failed: %s)", self.prefix,
+                            ", ".join(k for k, v in conds.items() if not v))
+        return False
 
     def _r9k_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         T = hidden_states.size(0)

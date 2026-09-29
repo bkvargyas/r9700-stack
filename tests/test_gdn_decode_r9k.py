@@ -4,7 +4,8 @@ a zeroed core buffer, then layer_norm_fwd (RMS, norm before a silu gate).
 
 Single GPU:  python3 tests/test_gdn_decode_r9k.py            (BENCH=0 skips the timing table)
 
-Flash-Next at TP=4: Hk=4, Hv=12, D=128, S=4 spec slots per sequence. Inputs are views of the merged in_proj row
+Flash-Next at TP=4: Hk=4, Hv=12, D=128, S=4 spec slots per sequence; silu and sigmoid output gates (Flash-Next
+uses sigmoid). Inputs are views of the merged in_proj row
 (mixed_qkv = row[:2560], z = row[2560:]) and of ba (b = ba[:, :Hv], a = ba[:, Hv:]) as in serving. The output must
 match stock except where our fp32 summation order flips a bf16 rounding (counted, <= 3e-3 of the elements, each
 within 2 bf16 ulps or 1% of the tensor's mean magnitude -- the norm re-rounds an already flipped o); the fp32 state
@@ -61,6 +62,9 @@ def make_case(lens, accs, nblocks=None, state_dtype=torch.float32, tail=0, skip=
                 ba=ba, A_log=A_log, dt_bias=dt_bias, w=w, state=state)
 
 
+ACT = "silu"
+
+
 def stock(c, state):
     """the stock spec-decode composition on views of the same buffers (state updated in place)."""
     rows, N = c["rows"], c["N"]
@@ -81,7 +85,7 @@ def stock(c, state):
     core[:n_act] = o.squeeze(0)[:n_act]
     out, _, _ = layer_norm_fwd(core.view(rows * HV, D), c["w"].to(torch.bfloat16), None, EPS,
                                z=z.reshape(rows * HV, D), group_size=D, norm_before_gate=True, is_rms_norm=True,
-                               activation="silu")
+                               activation=ACT)
     return out.view(rows, HV * D)
 
 
@@ -89,7 +93,7 @@ def ours(c, state):
     out = torch.empty((c["rows"], HV * D), dtype=torch.bfloat16, device=dev)
     b, a = c["ba"].chunk(2, dim=-1)
     G.decode_mtp(c["qkvz"][:, :QKV], b, a, c["A_log"], c["dt_bias"], c["w"], c["qkvz"][:, QKV:], out, state, c["idx"],
-                 c["cu"], c["acc"], HK, HV, D ** -0.5, EPS)
+                 c["cu"], c["acc"], HK, HV, D ** -0.5, EPS, gate_sigmoid=ACT == "sigmoid")
     return out
 
 
@@ -102,8 +106,9 @@ def flips_ok(o, s, name):
     return ok, f"{name} flips {nf}/{o.numel()}" + ("" if small.all() else " (large!)")
 
 
-def check(name, lens, accs, state_dtype=torch.float32, tail=0, skip=()):
-    global bad
+def check(name, lens, accs, state_dtype=torch.float32, tail=0, skip=(), act="silu"):
+    global bad, ACT
+    ACT = act
     c = make_case(lens, accs, state_dtype=state_dtype, tail=tail, skip=skip)
     s_state, o_state = c["state"].clone(), c["state"].clone()
     with torch.no_grad():
@@ -128,7 +133,7 @@ def check(name, lens, accs, state_dtype=torch.float32, tail=0, skip=()):
         zero_ok &= not o[c["n_act"]:].any().item()
     ok = ok_o and ok_s and touched and zero_ok
     bad += not ok
-    print(f"  {name:<44} {msg_o:<22} {msg_s:<18} {'ok' if ok else 'FAIL'}"
+    print(f"  {name:<44} {act:<7} {msg_o:<22} {msg_s:<18} {'ok' if ok else 'FAIL'}"
           + ("" if zero_ok else " (skipped/tail rows not zero)"))
 
 
@@ -174,6 +179,9 @@ def main():
     check("bf16 state, 4 seqs", [4, 4, 4, 4], [4, 3, 2, 1], state_dtype=torch.bfloat16)
     check("bf16 state, 1 seq 1 token", [1], [1], state_dtype=torch.bfloat16)
     check("64 seqs x 4", [4] * 64, [4] * 64)
+    check("sigmoid gate (Flash-Next), 4 seqs", [4, 4, 4, 4], [4, 3, 2, 1], act="sigmoid")
+    check("sigmoid gate, 16 seqs, bf16 state", [4] * 16, [1, 2, 3, 4] * 4, state_dtype=torch.bfloat16, act="sigmoid")
+    check("sigmoid gate, 1 seq 1 token", [1], [1], act="sigmoid")
     print(f"correctness: {'PASS' if bad == 0 else 'FAIL'}")
     if os.environ.get("BENCH", "1") != "0":
         for N in (1, 4, 16):
