@@ -767,31 +767,76 @@ launches to get a fair one:
 
 **bb-qfn-tp2-offload (GPUs 0,2, OFFLOAD_GB=34/rank, 270 slots, CGSIZES default, otherwise v0.2.0 defaults; full
 BetterBench 20 passes):** decode 93.8 tok/s, step p50 25.68 ms, TTFT p50 555 ms, prefill 2,099 / 3,163 / 3,434 /
-3,329, concurrency 84 / 104 / 108 / 111 / 95, KV 71,859 tokens, sanity 8/8. Against the 2026-09-20 probe on the
-same configuration (84.5 / 206 / 2,165 single / c8 / prefill 8k) the probe now reads 114 / 132 / 2,464: single
-+35%, prefill +14%, c8 -36%. The concurrency loss is not explained by the placement (0,2 is one card per switch,
-as the September box was) and has not been bisected; the suspects are the September-25 defaults (prefix caching
-off, block-fp8 projections) interacting with the host read-through, since single-stream, which the LRU serves
-from VRAM, improved as expected. Open item.
+3,329, concurrency 84 / 104 / 108 / 111 / 95, KV 71,859 tokens, sanity 8/8.
+
+**The "concurrency loss" against 2026-09-20 was the harness, not the build.** The first write-up of this section
+compared today's quick probe (c8 132) with the September-20 figure (conc-8 206) and called the difference an open
+regression. The two were never the same measurement: 206 came from `bench/harness.py` (eight copies of ONE prompt,
+a nonce apart, on the launcher's `NSEQ=4`), 132 from `~/probe.py` (two each of four different prompt types, code /
+prose / json / math, at `NSEQ=16`). Four launches on GPUs 0,2, both harnesses against each server (`~/chain-hx.sh`,
+`~/tp4tune/hx-*`):
+
+| leg | step ms | probe single | probe c8 (mixed) | harness single | harness agg8 (one prompt) | harness prefill 2000w | KV tokens |
+|---|---|---|---|---|---|---|---|
+| v0.2.0 defaults, NSEQ=16 | 26.31 | 114.1 | 117.5 | 104.4 | 226.5 | 2,756 | 71,859 |
+| v0.2.0 defaults, NSEQ=4 | 26.04 | 111.1 | 110.4 | 105.5 | 210.9 | 2,755 | 117,274 |
+| September-20 knobs, NSEQ=4 | 32.61 | 92.2 | 93.6 | 86.1 | 207.2 | 2,164 | 124,625 |
+| September-20 knobs, NSEQ=16 | 32.72 | 93.2 | 110.7 | 83.7 | 201.8 | 2,257 | 57,478 |
+| 2026-09-20, as recorded | | | | 84.5 | 206 | 2,165 | |
+
+("September-20 knobs" = prefix caching on, stock block-fp8, fp8 LM heads, stock QSA / scorer / qk-rope, and the
+five decode fusions at stock, on today's build and image.) The old knobs reproduce the old numbers to within 2%,
+so neither the move to four cards nor vLLM 0.30 changed this configuration. On the same harness v0.2.0 is +24%
+single-stream, +27% prefill and -20% step time. The mixed probe reads c8 94-118 on every leg, old knobs included;
+this morning's 132 was the top of that band.
+
+**Why the mixed batch is slow: prompt diversity, not any one prompt** (`bench/mix.py`, conc 8, 256 tokens, median of
+3, wall ms per step includes the prefill):
+
+| 8 concurrent requests | v0.2.0: tok/s | tok/step | ms/step | Sept-20 knobs: tok/s | tok/step | ms/step |
+|---|---|---|---|---|---|---|
+| code x8 | 275 | 3.48 | 94 | 249 | 3.42 | 109 |
+| prose x8 | 218 | 2.26 | 83 | 253 | 2.23 | 70 |
+| json x8 | 338 | 3.86 | 92 | 439 | 3.83 | 69 |
+| math x8 | 263 | 3.58 | 108 | 279 | 3.40 | 97 |
+| harness prompt x8 | 223 | 2.60 | 95 | 244 | 2.64 | 84 |
+| mixed (2 each of code / prose / json / math) | 119 | 3.14 | 213 | 112 | 3.03 | 219 |
+
+Every prompt type runs at 218-439 tok/s on its own; two each of four types run at 112-119, at ordinary acceptance,
+because the step itself takes 2.3x longer. With the experts in host RAM a step costs what it has to fetch, and a
+mixed batch routes to more distinct experts than the 270 slots per layer hold. That is the reading the numbers
+support; it has NOT been measured directly (the expert cache exports no miss counters yet). It is also why the
+BetterBench concurrency curve for this configuration is flat from 2 requests up (104 / 108 / 111 / 95): its corpus
+is mixed.
+
+Two cautions from the same table. Homogeneous conc-8 does not separate the two builds: the harness prompt read
+226.5 vs 201.8 in one pair of launches and 223 vs 244 in the next, so +-10% is launch-to-launch. And json x8 is
+lower on v0.2.0 (338 vs 439, tight ranges within each launch, same acceptance, 92 vs 69 ms per step) -- one launch
+each, so not a finding yet, but it is the first thing to repeat when this configuration gets its own pass.
+
+**Next for TP2 with offload** (it is the only way to run Flash-Next on two cards): miss and fetch-time counters in
+the expert cache, to turn the reading above into a measurement; then the mixed-batch step (213 ms) against the
+levers that exist -- insert cap per step (`R9K_LRU_MAX_INSERTS`, 64), slot count against KV room, staging.
 
 Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
 The launcher header says so; `GPUS=0,2` on this box.
 
 ### Next
-Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
-remaining items are each ~1% of a chunk unless noted:
-1. **Decode** (the one metric behind Rob: 125.4 vs 134.1 single-stream, his MTP-4 at 3.35 tok/step vs our MTP-3 at
-   3.13; step p50 21.06 vs 20.44 ms): per-step overhead (MTP drafts, sampling), or MTP-4 acceptance.
-2. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill; the
-   all-reduce is 147 ms = 27% of a 4k chunk's GPU time, pack_push 58 ms x202 the largest single kernel).
-3. `hc_gate_mix` 327 us x100 vs Rob's 269 (+6 ms per chunk); block-fp8 projections: stock Triton 34.1 ms x196 vs
-   his fp8hip 28.7 (+5 ms) -- a WMMA fp8-block GEMM for prefill widths would replace it.
-4. The 244 `copyBuffer` device copies (5 ms) and the stock per-token quant of the block GEMM (4.2 ms).
+State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
+1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
+1. **Per-fusion quality evals against a bit-reproducible baseline.** The three round-3 decode fusions (router GEMM,
+   indexer glue, hyper-connection mix) together cost ~0.5 point on the 800-question chain-of-thought eval; each
+   alone is at the edge of detection (6 / 1). One at a time, conc=1, against the round-2 numerics
+   (`R9K_ROUTER=stock R9K_QSA_GLUE=stock R9K_HC_MIX=stock`), to find which rounding point carries it.
+2. **Decode node count**: the stock MoE align / top-k / sum glue (~250 graph nodes per step at ~1.5 us of dispatch
+   each), then the remaining GDN and spec-decode glue.
+3. **Split-V GDN core** for high concurrency (at 16 sequences the fused kernel is state-bandwidth bound).
+4. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill).
+5. Prefill tail, each ~1% of a chunk: `hc_gate_mix`, a WMMA fp8-block GEMM for prefill widths, the `copyBuffer`
+   device copies and the stock per-token quant of the block GEMM.
 
 ### Open questions for Brian
-- **Round 3 quality regression (2026-09-29):** paired eval p = 0.012 against round 2; bisect running. Until it lands,
-  the shipped default (master) is round 3 -- consider `R9K_ROUTER=stock` in the serve scripts meanwhile.
-- MTP default: MTP-3 recommended (MTP-4 is +4.4% single-stream, -14% at 16 concurrent; `MTP=4` stays a knob).
-- Prefix caching off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse).
-- Push: commits ecdf7b8..fd950d4 are local only.
-- mxfp4 for the TARGET LM head (Rob's w4a16 does the same): ~0.5 ms/step, changes logits; two null paired evals.
+- Round-3 fusions: shipped on by default in v0.2.0 with the ~0.5-point trade stated; the three `=stock` knobs
+  restore round-2 numerics at ~10% of decode. Item 1 above is the way to keep the speed without the trade.
+- Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
+  serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.
