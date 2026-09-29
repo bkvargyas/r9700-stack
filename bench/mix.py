@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """conc-8 aggregate by workload mix on one server: 8 copies of one prompt type vs the mixed probe set.
+usage: mix.py [URL] [-v] [--only=code,mixed4]
 Separates prompt diversity (distinct experts streamed per step with offloaded experts) from prompt type."""
 import json, sys, time, threading, urllib.request, random, statistics as st
-B = sys.argv[1] if len(sys.argv) > 1 else "http://localhost:8080"
+B = next((a for a in sys.argv[1:] if a.startswith("http")), "http://localhost:8080")
 P = {
  "code": "Write a Python class implementing an LRU cache with type hints, docstrings and unit tests.",
  "prose": "Write a long, vivid short story about a lighthouse keeper during a storm.",
@@ -31,11 +32,17 @@ req("hi", 16)
 W = {k: [nonce() + v + f" (#{i})" for i in range(8)] for k, v in P.items()}
 W["mixed4"] = [nonce() + list(P.values())[i % 4] + f" (#{i})" for i in range(8)]
 W["single-code"] = [nonce() + P["code"]]; W["single-prose"] = [nonce() + P["prose"]]
+only = next((a.split("=", 1)[1].split(",") for a in sys.argv[1:] if a.startswith("--only=")), None)
+if only:                        # e.g. --only=code,mixed4 for a fast A/B
+    W = {k: v for k, v in W.items() if k in only}
 order = list(W) * 3
 for k in order[:len(W)]: agg(W[k][:1])          # warm each type once
 R = {}
 for k in order:
+    t0 = time.strftime("%H:%M:%S")
     R.setdefault(k, []).append(agg([nonce() + p.split("] ", 1)[1] for p in W[k]]))
+    if "-v" in sys.argv:        # wall-clock window of each run, to line up with the server's expert cache stats
+        print(f"  run {k:13s} {t0} .. {time.strftime('%H:%M:%S')}  {R[k][-1][0]:6.1f} tok/s", flush=True)
 for k in W:
     xs = R[k]; t = [x[0] for x in xs]
     print(f"{k:13s} n={len(W[k])}  agg {st.median(t):6.1f} tok/s [{min(t):.1f}..{max(t):.1f}]  tok/step {st.median([x[1] for x in xs]):.2f}  ms/step {st.median([x[2] for x in xs]):.1f}")

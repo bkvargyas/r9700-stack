@@ -123,6 +123,58 @@ def staging_enabled() -> bool:
     return os.environ.get("R9K_STAGE_COLD", "0") == "1"   # opt-in: no measured prefill gain (PCIe-bound), decode A/B confounded
 
 
+def stats_enabled() -> bool:
+    return os.environ.get("R9K_EXPERT_CACHE_STATS", "0") == "1"   # opt-in diagnostic: ~8 small launches per layer-step
+
+
+STAT_FIELDS = ("steps", "distinct", "inserts", "read_through", "wide")
+_STATS: list = []          # LayerCache objects with counters, this process (= one TP rank)
+_STATS_THREAD = None
+
+
+def stats_snapshot() -> torch.Tensor:
+    """[layers, 5] int64 on the host: per cached layer, totals since load of STAT_FIELDS."""
+    if not _STATS:
+        return torch.zeros((0, len(STAT_FIELDS)), dtype=torch.int64)
+    return torch.stack([c.stats for c in _STATS]).cpu()
+
+
+def stats_line(delta: torch.Tensor, mib_per_expert: float) -> str:
+    """One line for a [layers, 5] difference of two snapshots; per layer-step means over the layers that stepped."""
+    t = delta.sum(0).tolist()
+    n = max(t[0], 1)
+    return (f"{t[0]} layer-steps: routed {t[1] / n:.1f} distinct experts, {t[2] / n:.1f} inserted, "
+            f"{t[3] / n:.1f} read through from host ({t[3] / n * mib_per_expert:.0f} MiB), "
+            f"{100.0 * t[4] / n:.0f}% of steps over the insert threshold")
+
+
+def _stats_loop(period: float):
+    import time
+    last = None
+    while True:
+        time.sleep(period)
+        try:
+            cur = stats_snapshot()
+            if last is not None and cur.shape == last.shape and int((cur - last)[:, 0].sum()) > 0:
+                c = _STATS[0]
+                logger.info("r9700: expert cache, last %.0f s (S=%d, threshold %d, insert cap %d): %s", period, c.S,
+                            c.max_distinct, c.max_inserts, stats_line(cur - last, sum(c.bytes) / 2**20))
+            last = cur
+        except Exception as e:      # a diagnostic must never take the worker down
+            logger.warning("r9700: expert cache stats reader stopped: %s", e)
+            return
+
+
+def _stats_register(cache) -> None:
+    global _STATS_THREAD
+    _STATS.append(cache)
+    period = float(os.environ.get("R9K_EXPERT_CACHE_STATS_SEC", "10") or 0)
+    if _STATS_THREAD is None and period > 0:
+        import threading
+        _STATS_THREAD = threading.Thread(target=_stats_loop, args=(period,), name="r9k-cache-stats", daemon=True)
+        _STATS_THREAD.start()
+
+
 class LayerCache:
     def __init__(self, layer_idx: int, w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor,
                  N1: int, K1: int, N2: int, K2: int, slots: int):
@@ -166,6 +218,11 @@ class LayerCache:
         g = os.environ.get("R9K_LRU_GATHER", "8,16").split(",")
         self.chunks, self.lanes = int(g[0]), int(g[1])
         self._warm_start()
+        # R9K_EXPERT_CACHE_STATS=1: device-side totals of STAT_FIELDS (no host sync; a captured graph replays them)
+        self.stats = None
+        if stats_enabled():
+            self.stats = torch.zeros((len(STAT_FIELDS),), dtype=torch.int64, device=dev)
+            _stats_register(self)
         # wide steps (prefill / big batches): stage the routed-but-not-resident experts into VRAM with one bulk
         # gather instead of streaming them over PCIe inside the cold GEMM (once per 16*MT-row block, ~2x traffic)
         self.stage = None
@@ -233,6 +290,17 @@ class LayerCache:
         if rc:
             raise RuntimeError(f"r4d_lru_manage failed ({rc})")
         self._gather()
+        if self.stats is not None:
+            self._record()
+
+    def _record(self):
+        """After manage + gather: `routed` marks this step's experts, `table` already has the inserted ones, so
+        routed-and-not-resident is what the cold pass reads through from host memory."""
+        r = self.routed.to(torch.int64)
+        d = r.sum()
+        cold = (r * (self.table < 0)).sum()
+        self.stats.add_(torch.stack([torch.ones_like(d), d, self.n_miss[0].to(torch.int64), cold,
+                                     (d > self.max_distinct).to(torch.int64)]))
 
     def _align_bufs(self, mk: int, bs: int):
         """Persistent align outputs for (mk, bs), sized exactly as vLLM's moe_align_block_size would."""
@@ -267,6 +335,8 @@ class LayerCache:
         if rc:
             raise RuntimeError(f"r4d_lru_fused failed ({rc})")
         self._gather()
+        if self.stats is not None:
+            self._record()
         return (sh, eh, nh), (sc, ec, nc)
 
     def stage_cold(self, topk_ids: torch.Tensor):

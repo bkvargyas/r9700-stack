@@ -803,9 +803,9 @@ this morning's 132 was the top of that band.
 | mixed (2 each of code / prose / json / math) | 119 | 3.14 | 213 | 112 | 3.03 | 219 |
 
 Every prompt type runs at 218-439 tok/s on its own; two each of four types run at 112-119, at ordinary acceptance,
-because the step itself takes 2.3x longer. With the experts in host RAM a step costs what it has to fetch, and a
-mixed batch routes to more distinct experts than the 270 slots per layer hold. That is the reading the numbers
-support; it has NOT been measured directly (the expert cache exports no miss counters yet). It is also why the
+because the step itself takes 2.3x longer. With the experts in host RAM a step costs what it has to fetch. (First
+reading, written before the counters existed: "a mixed batch routes to more distinct experts than the 270 slots
+hold". Measured below: it does not -- it routes to 85 -- but it misses three times as many of them.) It is also why the
 BetterBench concurrency curve for this configuration is flat from 2 requests up (104 / 108 / 111 / 95): its corpus
 is mixed.
 
@@ -814,9 +814,59 @@ Two cautions from the same table. Homogeneous conc-8 does not separate the two b
 lower on v0.2.0 (338 vs 439, tight ranges within each launch, same acceptance, 92 vs 69 ms per step) -- one launch
 each, so not a finding yet, but it is the first thing to repeat when this configuration gets its own pass.
 
-**Next for TP2 with offload** (it is the only way to run Flash-Next on two cards): miss and fetch-time counters in
-the expert cache, to turn the reading above into a measurement; then the mixed-batch step (213 ms) against the
-levers that exist -- insert cap per step (`R9K_LRU_MAX_INSERTS`, 64), slot count against KV room, staging.
+**What bounds a mixed batch, measured (2026-09-29, same day).** The reading above was half right. Opt-in counters in
+the expert cache (`R9K_EXPERT_CACHE_STATS=1`: device-side totals per cached layer of steps, distinct routed experts,
+inserts, experts read through from host, steps over the insert threshold; a reader thread logs them every
+`R9K_EXPERT_CACHE_STATS_SEC`; `tests/test_cache_stats.py` checks them against a host recount) on three launches,
+rank 0, decode windows of `bench/mix.py -v`:
+
+| 8 submitted (4 run, see below) | forward passes /s | ms per forward | distinct experts per layer | inserted | read through | miss | steps over threshold | host -> VRAM per forward |
+|---|---|---|---|---|---|---|---|---|
+| code x8 | 20.8-21.6 | 46-48 | 66-71 | 2.1-2.2 | 0.8-1.1 | 4.4-4.6% | 1.7-2.4% | 175-193 MiB |
+| mixed (code / prose / json / math) | 10.9-11.6 | 86-92 | 85-87 | 10.3-11.1 | 1.4-1.7 | 14.0-14.5% | 2.3-2.6% | 714-751 MiB |
+| one request (code) | 28-33 | 30-36 | 26-31 | 1.9-2.1 | 0-0.5 | 7.4-8.6% | 0-1% | 114-154 MiB |
+
+1. **It is not the insert threshold.** The LRU manager inserts nothing on a step that routes to more than
+   `R9K_LRU_THRESH` x slots = 135 distinct experts; that was the suspect, and a mixed decode step is over it 2-3% of
+   the time. Nor does a batch route to more experts than there are slots (85 of 270).
+2. **It is the miss rate times the link.** A mixed batch misses 14% of its routed experts at every step, a
+   single-type batch 4.5%. Each miss is 1.245 MiB per rank, and the copy kernel already runs at the link rate:
+   `tuning/lru_gather_bench.py`, host -> VRAM, 11.4-13.5 GB/s from 4 inserts up on every launch grid (PCIe 3 x16).
+   714-751 MiB per forward pass is 66-69 ms of the 86-92; a single stream still pays ~13 ms of its 36.
+3. **The miss rate is the checkpoint's routing, not the policy.** Flash-Next routes diffusely: the busiest expert of
+   a layer carries 1-2% of the routing, and 90% of it needs 216-365 of the 512 experts. By the routing profile
+   shipped with the checkpoint the best static set of S experts per layer misses 24.0 / 17.4 / **13.3** / 9.9 / 7.1 /
+   4.8 / 2.5% of the mass at S = 200 / 240 / **270** / 300 / 330 / 360 / 400 -- a mixed batch behaves like the global
+   distribution, one prompt type like a much narrower one that the LRU follows. Re-splitting the same 12,960 slots
+   across layers by marginal mass (195-367 per layer) only moves 13.3% to 12.8%: not worth a knob.
+4. **A wider copy grid is worth ~8% on the mixed batch and nothing elsewhere:** `R9K_LRU_GATHER=64,16` against the
+   default 8,16 is 15% faster at 13 inserts (1,262 vs 1,492 us) and equal at 2; served, mixed 106.5 -> 115.2 and
+   113.9 tok/s (two launches), code x8 and single-stream unchanged. Candidate default, not yet flipped.
+
+**And a second, separate limit: only four requests run at once.** Engine iterations against per-request steps
+(`vllm:iteration_tokens_total_count` vs `vllm:spec_decode_num_drafts_total`, `--max-num-seqs 16`):
+
+| submitted | tok/s | ms per iteration | requests per iteration |
+|---|---|---|---|
+| 1 / 2 / 4 / 8 x code | 100 / 166-181 / 265-285 / 257-275 | 35 / 38-42 / 47-50 / 50 | 0.99 / 1.9 / 3.8 / 3.7-3.9 |
+| 1 / 2 / 3 / 4 mixed | 91 / 100 / 103 / 111 | 38 / 44 / 60 / 76 | 1.0 / 1.6 / 2.1 / 2.7 |
+| 8 / 16 mixed | 111-116 / 113-119 | 94-95 / 100-103 | 3.4-3.5 / 3.6-3.8 |
+
+With four short requests running the KV pool is 93.5% used (46.75% with two) and the others wait with reason
+`capacity`: every request takes 18 blocks of a 77-block pool whatever its length (the per-request recurrent state),
+and at TP2 with the experts cached the pool is what is left after 25.84 GiB of weights and 3.24 GiB of peak
+activation: 0.87 GiB on these launches, 1.38 GiB (71,859 tokens, so six requests) on the BetterBench one. Prefix
+caching on does not change it (same 4). So on this configuration concurrency above 4-6 buys nothing for any
+workload, and for a mixed one concurrency buys little at all (91 -> 111 tok/s from 1 to 4 requests) because every
+additional prompt type brings its own experts down the same link. That is the flat BetterBench curve (104 / 108 /
+111 / 95 from 2 to 16), and it is a property of two cards on a PCIe 3 host, not a defect to fix in a kernel.
+
+**What is left to try for TP2 with offload** (queued behind the quality evals, `~/chain-lru2.sh`): whether a launch
+that compiles afresh really gets the smaller KV pool (0.87 vs 1.38 GiB; suspected, not shown); `NSEQ=8` (graphs for
+16 sequences cost ~0.9 GiB that four to six running requests never use); `NBT=2048` (peak activation against prefill
+speed); 240 slots (more requests, 17.4% misses). Beyond knobs only three things move the mixed batch: more VRAM for
+slots, a faster link, or routing that prefers resident experts -- the last changes outputs and would need the full
+paired eval before it could be offered even as an option.
 
 Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
 The launcher header says so; `GPUS=0,2` on this box.

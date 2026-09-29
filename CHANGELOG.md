@@ -13,6 +13,15 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 - The card-placement rule, measured: tensor parallel wants both cards on one PLX switch, offloaded experts want
   one card per switch (same-switch pair: 81 / 54 / 1,379 single / conc-8 / prefill-8k vs 114 / 132 / 2,464).
 
+- `R9K_EXPERT_CACHE_STATS=1`: opt-in counters in the expert cache (distinct routed experts, inserts, experts read
+  through from host, steps over the insert threshold), logged every `R9K_EXPERT_CACHE_STATS_SEC` seconds per rank;
+  `tests/test_cache_stats.py`. `bench/mix.py` (conc-8 by workload mix) and `tuning/lru_gather_bench.py` (host -> VRAM
+  copy rate of the insert kernel).
+- Flash-Next TP2 with offloaded experts, what bounds it (PROGRESS.md 2026-09-29): a mixed batch misses 14% of its
+  routed experts per step against 4.5% for one prompt type, the insert copy already runs at the PCIe 3 link rate
+  (11.4-13.5 GB/s), and at most four to six requests run at once because each takes 18 KV blocks of a ~77-block
+  pool.
+
 ### Fixed
 - PROGRESS.md reported a concurrency regression for Flash-Next TP2 with offloaded experts (conc-8 132 vs 206 on
   2026-09-20). There is none: the two figures came from different harnesses. On the 2026-09-20 harness v0.2.0
