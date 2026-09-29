@@ -10,7 +10,8 @@ moe_align(expert_map=map_cold) -- the second is empty unless the step read throu
 or the insert cap was hit). All of it is device-side and pointer-stable, so it is cudagraph-safe.
 
 Config (per rank): R9K_EXPERT_CACHE_GB (0 = off), R9K_LRU_THRESH (0.5), R9K_LRU_MAX_INSERTS (64),
-R9K_LRU_GATHER="chunks,lanes" (8,16). Warm start: the checkpoint's model-expertprofile.safetensors
+R9K_LRU_GATHER="chunks,lanes" (64,16: the copy is link-bound either way, 11-13.5 GB/s on PCIe 3, but at 8+
+inserts the wider grid is ~15% faster than 8,16 and equal below; tuning/lru_gather_bench.py). Warm start: the checkpoint's model-expertprofile.safetensors
 (expert_routing_counts [layers, experts]) if present, else experts 0..S-1.
 """
 from __future__ import annotations
@@ -215,7 +216,7 @@ class LayerCache:
         self.n_miss = torch.zeros((1,), **i32)
         self.fused = os.environ.get("R9K_LRU_FUSED", "1") == "1" and E <= 1024
         self._align: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
-        g = os.environ.get("R9K_LRU_GATHER", "8,16").split(",")
+        g = os.environ.get("R9K_LRU_GATHER", "64,16").split(",")
         self.chunks, self.lanes = int(g[0]), int(g[1])
         self._warm_start()
         # R9K_EXPERT_CACHE_STATS=1: device-side totals of STAT_FIELDS (no host sync; a captured graph replays them)

@@ -7,6 +7,11 @@
 #     SWITCH (GPUS=0,2): the stream comes down each switch's single Gen3 uplink, and the same-switch pair
 #     measured 81 / 54 / 1,379 (single / conc-8 / prefill 8k) against 114 / 132 / 2,464 on the split pair.
 #     CGSIZES= (vLLM's default graph sizes) at TP2: the 2048-token prefill graphs leave no KV room there.
+#     RESTART ONCE after the first launch of a new configuration: the launch that compiles keeps ~0.45 GiB
+#     that the next one gives to the KV pool (45k vs 72k tokens at NSEQ=16, 94k vs 121k at NSEQ=8).
+#     What bounds it (PROGRESS.md 2026-09-29): one prompt type scales with requests (conc-8 401-535 tok/s),
+#     a mixed batch does not (~120-140 at any concurrency): it misses 14% of its routed experts per step
+#     and each miss is 1.245 MiB per rank over the PCIe link.
 #   TP4 with everything in VRAM: GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 (the headline numbers in README.md).
 # Attention is the model's own QSA (ATTN=CUSTOM is for standard-attention models only).
 exec env \
@@ -17,6 +22,10 @@ exec env \
   R9K_FOLD=1 `        # folded-exponent MXFP4 experts (bit-exact on this checkpoint): +5% prefill, +4% conc-8` \
   R9K_AR_QUANT=1 `    # wht6 all-reduce >= 128 KB (decode single-stream messages stay exact)` \
   MTP=3 `             # the checkpoint's own MTP head` \
+  NSEQ=${NSEQ-8} `    # requests running at once. Each holds 18 KV blocks whatever its length (vLLM: 4 state
+                      # groups x (1 + 3 MTP blocks) + 2 attention blocks), and the graphs for 16 sequences take
+                      # ~0.9 GiB from the KV pool: at TP2 with offloaded experts NSEQ=16 ran 4-6 requests at
+                      # once, NSEQ=8 runs 8 (conc-8, one prompt type: 283 -> 401 tok/s). NSEQ=16 for TP4.` \
   PREFIX_CACHE=${PREFIX_CACHE-0} `  # off: avoids the mamba-aligned prefill chunking (2k prefill 2.8k -> ~4.7k tok/s,
                                     # see serve.sh); =1 restores prefix reuse across requests` \
   CGSIZES=${CGSIZES-1,2,4,8,16,24,32,48,64,96,128,192,256,384,512,768,1024,1280,1536,1792,2048} `  # graphs for

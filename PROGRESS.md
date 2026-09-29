@@ -861,12 +861,48 @@ workload, and for a mixed one concurrency buys little at all (91 -> 111 tok/s fr
 additional prompt type brings its own experts down the same link. That is the flat BetterBench curve (104 / 108 /
 111 / 95 from 2 to 16), and it is a property of two cards on a PCIe 3 host, not a defect to fix in a kernel.
 
-**What is left to try for TP2 with offload** (queued behind the quality evals, `~/chain-lru2.sh`): whether a launch
-that compiles afresh really gets the smaller KV pool (0.87 vs 1.38 GiB; suspected, not shown); `NSEQ=8` (graphs for
-16 sequences cost ~0.9 GiB that four to six running requests never use); `NBT=2048` (peak activation against prefill
-speed); 240 slots (more requests, 17.4% misses). Beyond knobs only three things move the mixed batch: more VRAM for
-slots, a faster link, or routing that prefers resident experts -- the last changes outputs and would need the full
-paired eval before it could be offered even as an option.
+**The knobs, measured (2026-09-29 evening, `~/chain-knobs.sh`, `~/tp4tune/t2-*`).** Same harnesses on every leg;
+every configuration after the first was launched twice and measured on the second launch (see 1.):
+
+| leg | KV pool (tokens) | weights / peak act. / graphs (GiB) | single | code x8 | json x8 | mixed x8 | requests per iteration, code x8 | prefill 8k |
+|---|---|---|---|---|---|---|---|---|
+| defaults, NSEQ=16, first launch | 45,415 | 25.84 / 3.24 / 2.42 | 100.5 | 279 | 329 | 109 | 3.9 | 2,473 |
+| the same, second launch | 71,859 | 25.41 / 3.16 / 2.26 | 101.2 | 283 | 347 | 118 | 3.9 | 2,439 |
+| + copy grid 64,16 | 71,859 | 25.41 / 3.16 / 2.26 | 105.7 | 286 | 354 | 139 | 3.9 | 2,455 |
+| + **NSEQ=8** | 120,724 | 25.41 / 2.23 / 1.53 | 102.4 | **401** | **535** | 130 | **7.6** | 2,393 |
+| + NSEQ=8, NBT=2048 | 168,439 | 24.79 / 1.95 / 1.53 | 104.4 | 413 | 538 | 123 | 7.3 | 1,821 |
+| + NSEQ=8, 240 slots | 202,931 | 23.84 / 2.23 / 1.53 | 96.4 | 327 | 470 | 93 | 7.6 | 2,221 |
+| + NSEQ=8, UTIL=0.96 | 154,067 | 25.41 / 2.23 / 1.53 | 103.0 | 393 | 536 | 127 | 7.5 | 2,383 |
+
+1. **The first launch of a configuration gets a smaller KV pool than every later one**: 45,415 against 71,859
+   tokens (0.87 against 1.38 GiB), and the same on every other leg (94k -> 121k, 102k -> 168k, 155k -> 203k). The
+   launch that compiles keeps 0.43 GiB more in "weights + non-torch" and a larger activation peak; the pool is sized
+   from what is left. It is vLLM's accounting, not ours, and it is why the afternoon's fast legs (all first
+   launches) saw four requests where the morning's BetterBench launch would have run six. Operationally: restart
+   once after changing a knob. The launcher header says so.
+2. **NSEQ=8 is the concurrency fix for one prompt type: +42% to +54% at conc-8** (283 -> 401, 347 -> 535), single
+   stream unchanged. Graphs and activation for 16 sequences cost 1.66 GiB that went to requests which could not run;
+   at 8 the pool holds all eight (7.6 per iteration against 3.9). `serve/flashnext.sh` now defaults `NSEQ=8`
+   (`NSEQ=16` for TP4, as every TP4 number here was measured).
+3. **The mixed batch does not move with any of it**: 118-139 tok/s on every leg that kept 270 slots, whatever runs
+   at once. Its second-launch readings scatter more than the knobs differ (the same eight requests read 121-127 in
+   the iteration harness on all four of those legs), so the copy grid's +17% in one harness and 0% in the other is
+   one more reason to call it "up to +10%", which is what the kernel timing predicts. It costs nothing elsewhere and
+   cannot change outputs (a copy; data checked in the bench, sanity 8/8), so `R9K_LRU_GATHER` now defaults to 64,16.
+4. **240 slots: rejected.** 80k more tokens of KV, and -28% on the mixed batch, -18% / -12% on one prompt type, -6%
+   single stream, -7% prefill: the misses cost more than the room buys, as the routing profile said (17.4 against
+   13.3%).
+5. **NBT=2048: rejected as a default.** 48k more tokens of KV for -24% prefill (2,393 -> 1,821) and nothing else. It
+   is the knob for someone who needs the context more than the prompt speed.
+6. **UTIL=0.96: ran clean, not adopted.** 33k more tokens and the same throughput, 8/8 sanity; but these legs never
+   held a long context while eight requests ran, and the graph pool already sits outside the budget. It needs a
+   soak at 32k before it can be a default.
+
+**New TP2-offload default = the NSEQ=8 leg** (copy grid 64,16, 270 slots, NBT 4096, UTIL 0.94): single stream 102,
+conc-8 401-535 on one prompt type, ~120-140 mixed, prefill 8k 2.4k, KV 120,724 tokens. Full BetterBench of it
+queued behind the evals (`~/chain-bbtp2.sh` -> `~/tp4tune/bb-qfn-tp2-n8`). Beyond knobs only three things move the
+mixed batch: more VRAM for slots, a faster link, or routing that prefers resident experts -- the last changes
+outputs and would need the full paired eval before it could be offered even as an option.
 
 Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
 The launcher header says so; `GPUS=0,2` on this box.

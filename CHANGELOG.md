@@ -22,6 +22,14 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
   (11.4-13.5 GB/s), and at most four to six requests run at once because each takes 18 KV blocks of a ~77-block
   pool.
 
+### Changed
+- `serve/flashnext.sh` defaults `NSEQ=8` (was the launcher's 4; benchmarks passed 16). At TP2 with offloaded experts
+  the graphs and activations for 16 sequences took the KV room of the requests they were for: conc-8 on one prompt
+  type 283 -> 401 tok/s (code), 347 -> 535 (json), eight requests per iteration instead of four. Pass `NSEQ=16`
+  for TP4.
+- `R9K_LRU_GATHER` defaults to `64,16` (was `8,16`): the expert insert copy is ~15% faster at 8+ inserts and equal
+  below; a mixed batch gains up to ~10%, nothing else changes, outputs cannot.
+
 ### Fixed
 - PROGRESS.md reported a concurrency regression for Flash-Next TP2 with offloaded experts (conc-8 132 vs 206 on
   2026-09-20). There is none: the two figures came from different harnesses. On the 2026-09-20 harness v0.2.0
