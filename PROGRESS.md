@@ -708,7 +708,23 @@ At batch 1 that is ~1.1 ms/step over the 36 GDN layers and ~1.2 ms over the 48 s
 step. At 16 sequences the GDN kernel is state-bandwidth bound (4 x 64 KB of state stores per head per layer, as
 stock's); a split-V variant would help there if the concurrency numbers ask for it.
 
-RESULT_GDN_SERVING
+**Serving (first attempt: GPU memory fault on the first request).** Eager mode was fine and switching the fused
+kernel off did not help, so the kernel was not the cause: vLLM lists its own `vllm::qwen_gdn_attention_core` in
+`CompilationConfig._attention_ops`, the default piecewise-graph splitting list, so the GDN core runs eagerly at
+every step of a piecewise prefill graph (its Triton kernels take that step's sequence layout). Our op replaced it
+in the traced forward without that entry, so a prefill piece captured our op's kernels for the capture batch and
+replayed them for every later one. `register_splitting_op()` now appends `r9700::gdn_core` to that class list at
+plugin load (the install log reports whether the engine's `splitting_ops` has it). Rule for future plugin ops:
+anything that replaces a splitting op must be added to that list. (Also caught on the way: Flash-Next's output
+gate is `sigmoid`, and the first fit check only took silu, so the core silently sat out of one serving run; the
+check now logs its reason.)
+
+**Probe, GDN core only (`gdn-live`, shared expert stock) vs the round-3 default on the same build (`r4-stock`):**
+decode 166.5 -> 170.3 tok/s (+2.3%, 3.09 -> 3.12 tok/step), c8 573 -> 561, c16 852 -> 865, prefill 8k 7407 ->
+7171 (the last three within the probe's run-to-run band). Smaller than the ~1.1 ms/step the unit timing
+suggested: in a captured decode graph the removed nodes were cheaper than in the eager profile.
+
+RESULT_SE_SERVING
 
 ### Next
 Prefill is 19-30% ahead of Rob's image at every length and its per-family kernel gaps are single digits, so the
