@@ -52,6 +52,9 @@ fastest known alternative stack for this model on **the same box, the same check
 | prefill 2k / 8k / 16k / 32k (tok/s) | **6,408 / 7,365 / 7,451 / 7,182** | 5,279 / 5,711 / 5,977 / 6,106 | **+21% / +29% / +25% / +18%** |
 | concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **151 / 231 / 350 / 478 / 635** | 126 / 197 / 303 / 427 / 542 | **+20% / +17% / +16% / +12% / +17%** |
 
+v0.2.1 changes nothing on this path: with everything in VRAM the expert cache is not in use, and the numerics are
+those of v0.2.0.
+
 Where it came from, in one line each: prefill from an MXFP4×FP8 MoE GEMM with the per-row scales in LDS, a
 WMMA scorer for the sparse-attention indexer that only touches the visible columns, and a compressed 4-rank
 all-reduce; decode from replacing hundreds of tiny per-step launches (norm + rope glue, router GEMM,
@@ -71,21 +74,31 @@ individually (`R9K_*=stock`).
 
 The two-card way to run Flash-Next: the routed experts stream from pinned host memory through the plugin's LRU
 expert cache (34 GB per rank offloaded, 270 expert slots per layer resident), so the model fits two cards with
-room for a 72k-token KV cache. Same v0.2.0 code, full BetterBench (20 passes), measured 2026-09-29 on one card
-per PLX switch:
+room for a 120k-token KV cache. Full BetterBench (20 passes), v0.2.1 defaults, measured 2026-09-29 on one card per
+PLX switch:
 
-| | this stack |
-|---|--:|
-| single-stream decode | **93.8 tok/s** (quick probe: 114) |
-| decode step p50 | 25.7 ms |
-| time to first token p50 | 555 ms |
-| prefill 2k / 8k / 16k / 32k (tok/s) | 2,099 / 3,163 / 3,434 / 3,329 |
-| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | 84 / 104 / 108 / 111 / 95 |
+| | v0.2.1 | v0.2.0 |
+|---|--:|--:|
+| single-stream decode | **97.4 tok/s** | 93.8 |
+| decode step p50 | 25.6 ms | 25.7 ms |
+| time to first token p50 | **484 ms** | 555 ms |
+| prefill 2k / 8k / 16k / 32k (tok/s) | **2,208 / 3,558 / 3,839 / 3,793** | 2,099 / 3,163 / 3,434 / 3,329 |
+| concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **87 / 109 / 116 / 118 / 113** | 84 / 104 / 108 / 111 / 95 |
+| time to first token at 8 concurrent | **0.95 s** | 7.1 s |
 
-Read it as a memory-bound configuration: single-stream decode is strong because the cache keeps the hot experts
-resident, while prefill and concurrency are bound by streaming experts over the PCIe 3 uplink (that is the TTFT).
-Four cards with everything in VRAM are 1.7× faster single-stream and 4-6× at concurrency; a PCIe 5 host would
+Read it as a **link-bound** configuration for one to a few users. Every routed expert that is not resident is
+1.245 MiB per card over PCIe, and the copy already runs at the link rate, so total throughput levels off near
+115 tok/s from four requests up: more users share it, they do not add to it (per-request decode 96 / 64 / 34 /
+17 tok/s at 1 / 2 / 4 / 8). Eight requests now run at once instead of four to six, which is what took the
+time to first token at 8 concurrent from 7 s to under one. The cards say the same thing: always busy, and
+drawing 206 W with one request but 170 W with eight, because they are waiting for experts. The best case is a
+batch of near-identical requests, which share their experts: eight copies of one prompt run at 434-577 tok/s.
+Four cards with everything in VRAM are 1.6× faster single-stream and 3-6× at concurrency; a PCIe 5 host would
 narrow that gap without any code change.
+
+Two operational notes: **restart once after the first launch of a new configuration** (the launch that compiles
+leaves ~0.45 GiB less for the KV pool: 94k against 121k tokens), and pass `NSEQ=16` for four cards
+(`serve/flashnext.sh` defaults to 8, the right value for two).
 
 **Card placement matters, in opposite directions.** Tensor-parallel traffic wants both cards on the same PLX
 switch (switch-local P2P: the 4-card numbers above). Offloaded experts want one card per switch, because the

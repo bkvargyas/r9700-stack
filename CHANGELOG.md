@@ -6,29 +6,43 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [Unreleased]
 
-### Added
-- Full BetterBench for **Flash-Next at TP2 with experts in host RAM** (v0.2.0 code): single-stream decode
-  93.8 tok/s, step 25.7 ms, TTFT 555 ms, prefill 2,099 / 3,163 / 3,434 / 3,329 tok/s, concurrency 84 / 104 /
-  108 / 111 / 95 -- README and PROGRESS.
-- The card-placement rule, measured: tensor parallel wants both cards on one PLX switch, offloaded experts want
-  one card per switch (same-switch pair: 81 / 54 / 1,379 single / conc-8 / prefill-8k vs 114 / 132 / 2,464).
+## [0.2.1] - 2026-09-30
 
+Flash-Next on **two** cards with the experts in host RAM: new defaults, measured end to end, and the tools that
+found them. Full BetterBench against the 0.2.0 defaults: single-stream decode 97.4 tok/s (93.8), TTFT 484 ms (555),
+prefill 2,208 / 3,558 / 3,839 / 3,793 (2,099 / 3,163 / 3,434 / 3,329), concurrency 87 / 109 / 116 / 118 / 113
+(84 / 104 / 108 / 111 / 95), time to first token at 8 concurrent 0.95 s (7.1 s). Four-card numbers and all
+numerics are unchanged. And a correction: 0.2.0's decode fusions cost no accuracy.
+
+### Changed
+- `serve/flashnext.sh` defaults `NSEQ=8` (the launcher's default was 4; benchmarks passed 16). Each request holds
+  18 KV blocks whatever its length, and at TP2 with offloaded experts the graphs and activations for 16 sequences
+  took the room of the requests they were for: four to six ran, the rest queued. Pass `NSEQ=16` for TP4.
+- `R9K_LRU_THRESH` defaults to `0.99` (was `0.5`). Eight different requests route to ~150 distinct experts a
+  layer; over 0.5 x 270 slots the cache manager inserted nothing, on 72% of steps, and every step read 31 experts
+  a layer from host (2 GB, 207 ms per forward pass). BetterBench conc-8 with all eight running: 77 -> 118 tok/s.
+- `R9K_LRU_GATHER` defaults to `64,16` (was `8,16`): the expert insert copy is ~15% faster at 8+ inserts and equal
+  below. Outputs cannot change.
+- Quality evals for a change of default use the full 1,319-question test set, not the first 800.
+
+### Added
 - `R9K_EXPERT_CACHE_STATS=1`: opt-in counters in the expert cache (distinct routed experts, inserts, experts read
   through from host, steps over the insert threshold), logged every `R9K_EXPERT_CACHE_STATS_SEC` seconds per rank;
   `tests/test_cache_stats.py`. `bench/mix.py` (conc-8 by workload mix) and `tuning/lru_gather_bench.py` (host -> VRAM
   copy rate of the insert kernel).
-- Flash-Next TP2 with offloaded experts, what bounds it (PROGRESS.md 2026-09-29): a mixed batch misses 14% of its
-  routed experts per step against 4.5% for one prompt type, the insert copy already runs at the PCIe 3 link rate
-  (11.4-13.5 GB/s), and at most four to six requests run at once because each takes 18 KV blocks of a ~77-block
-  pool.
+- What bounds Flash-Next at TP2 with offloaded experts, measured (PROGRESS.md 2026-09-29): the PCIe link. A miss is
+  1.245 MiB per rank and the copy runs at the link rate (11.4-13.5 GB/s on PCIe 3); one prompt type misses 4.5%
+  of its routed experts per step, four types 14%, which is what the checkpoint's routing profile predicts for 270
+  slots (13.3%). The cards draw 206 W with one request and 170 W with eight.
+- The card-placement rule, measured: tensor parallel wants both cards on one PLX switch, offloaded experts want
+  one card per switch (same-switch pair: 81 / 54 / 1,379 single / conc-8 / prefill-8k vs 114 / 132 / 2,464).
+- Operational note in the launcher and README: the first launch of a configuration gets a smaller KV pool than
+  every later one (94k against 121k tokens at `NSEQ=8`); restart once.
 
-### Changed
-- `serve/flashnext.sh` defaults `NSEQ=8` (was the launcher's 4; benchmarks passed 16). At TP2 with offloaded experts
-  the graphs and activations for 16 sequences took the KV room of the requests they were for: conc-8 on one prompt
-  type 283 -> 401 tok/s (code), 347 -> 535 (json), eight requests per iteration instead of four. Pass `NSEQ=16`
-  for TP4.
-- `R9K_LRU_GATHER` defaults to `64,16` (was `8,16`): the expert insert copy is ~15% faster at 8+ inserts and equal
-  below; a mixed batch gains up to ~10%, nothing else changes, outputs cannot.
+### Rejected, with numbers (PROGRESS.md)
+- 240 expert slots (more KV; -28% on a mixed batch, -6% single stream), `NBT=2048` as a default (-24% prefill),
+  re-splitting the slots across layers by routing mass (13.3% -> 12.8% misses). `UTIL=0.96` ran clean with 28% more
+  KV but has not held a 32k context under load: not adopted.
 
 ### Fixed
 - **The quality statement of 0.2.0 was wrong in the project's disfavour.** It said the round-3 decode fusions
@@ -36,12 +50,10 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
   default scores 97.04% against 96.82% (5 / 8 discordant, p = 0.58), each of the five fusions alone is equally
   indistinguishable (6 / 6, 0 / 2, 5 / 8, 5 / 7, 6 / 5), and the reference reproduces itself to 1,318 of 1,319
   outputs. The half point came from evaluating on the first 800 questions, where the round-2 numerics score 98.0%
-  (95.0% on the other 519). Evals for a change of default now use the full set.
+  (95.0% on the other 519).
 - PROGRESS.md reported a concurrency regression for Flash-Next TP2 with offloaded experts (conc-8 132 vs 206 on
-  2026-09-20). There is none: the two figures came from different harnesses. On the 2026-09-20 harness v0.2.0
-  reads 104 tok/s single-stream (was 84.5), prefill 2,756 (was 2,165) and conc-8 211-227 (was 206, within the
-  launch-to-launch band). What is slow is a *mixed* batch: eight requests of one prompt type run at 218-439 tok/s,
-  two each of four types at 112-119, on the old and the new configuration alike.
+  2026-09-20). There is none: the two figures came from different harnesses (eight copies of one prompt against
+  four different prompts).
 
 ## [0.2.0] - 2026-09-29
 
@@ -115,6 +127,7 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bkvargyas/r9700-stack/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bkvargyas/r9700-stack/releases/tag/v0.1.0

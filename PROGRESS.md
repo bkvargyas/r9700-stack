@@ -830,7 +830,8 @@ rank 0, decode windows of `bench/mix.py -v`:
 | mixed (code / prose / json / math) | 10.9-11.6 | 86-92 | 85-87 | 10.3-11.1 | 1.4-1.7 | 14.0-14.5% | 2.3-2.6% | 714-751 MiB |
 | one request (code) | 28-33 | 30-36 | 26-31 | 1.9-2.1 | 0-0.5 | 7.4-8.6% | 0-1% | 114-154 MiB |
 
-1. **It is not the insert threshold.** The LRU manager inserts nothing on a step that routes to more than
+1. **It is not the insert threshold** (with four requests running; with eight it is -- see "The full BetterBench
+   of that candidate regressed" below). The LRU manager inserts nothing on a step that routes to more than
    `R9K_LRU_THRESH` x slots = 135 distinct experts; that was the suspect, and a mixed decode step is over it 2-3% of
    the time. Nor does a batch route to more experts than there are slots (85 of 270).
 2. **It is the miss rate times the link.** A mixed batch misses 14% of its routed experts at every step, a
@@ -902,11 +903,65 @@ every configuration after the first was launched twice and measured on the secon
    held a long context while eight requests ran, and the graph pool already sits outside the budget. It needs a
    soak at 32k before it can be a default.
 
-**New TP2-offload default = the NSEQ=8 leg** (copy grid 64,16, 270 slots, NBT 4096, UTIL 0.94): single stream 102,
-conc-8 401-535 on one prompt type, ~120-140 mixed, prefill 8k 2.4k, KV 120,724 tokens. Full BetterBench of it
-queued behind the evals (`~/chain-bbtp2.sh` -> `~/tp4tune/bb-qfn-tp2-n8`). Beyond knobs only three things move the
-mixed batch: more VRAM for slots, a faster link, or routing that prefers resident experts -- the last changes
-outputs and would need the full paired eval before it could be offered even as an option.
+**The full BetterBench of that candidate regressed, and the insert threshold was the cause after all.**
+`bb-qfn-tp2-n8` (NSEQ=8, copy grid 64,16): single stream, step, TTFT and prefill equal to the morning's run, and
+concurrency 84 / 104 / 115 / **77 / 76** against 84 / 104 / 108 / 111 / 95. Letting eight requests run removed the
+queue (TTFT at 8 concurrent 7.1 s -> 1.1 s) and lowered the total. Counters under BetterBench's own concurrency
+sweep (`~/lrubb.sh`, `~/statphase.py`, rank 0, bucketed by requests running):
+
+| requests running | threshold 0.5 (135): distinct / inserted / read through / miss / steps over / ms per forward | threshold 0.99 (267): the same |
+|---|---|---|
+| 3-4 | 93 / 8.8 / 2.1 / 11.6% / 2.5% / 84 | 95 / 10.1 / 1.0 / 11.7% / 0.8% / 84 |
+| 5-8 | **148** / 2.5 / **31.2** / 22.7% / **72%** / **207** | 152 / 20.8 / 3.3 / 15.8% / 3.0% / 144 |
+| conc-4 / conc-8 aggregate | 112.8 / **75.1** | 114.4 / **109.2** |
+
+Eight DIFFERENT requests route to ~150 distinct experts a layer. That is over 0.5 x 270 on 72% of steps, where the
+manager inserts nothing and refreshes nothing, so the cache stops following the traffic and every step reads 31
+experts a layer through from host: 2 GB and 207 ms per forward pass. Point 1 above ("it is not the insert
+threshold") was true of what it measured -- four requests running, 85 distinct experts, 2-3% of steps over -- and
+wrong as a general statement: the capacity limit had been hiding the threshold, and `bench/mix.py`'s mixed batch has
+four distinct prompts where BetterBench has 29. Point 3 of the knob legs ("the mixed batch does not move") is
+superseded for the same reason. `R9K_LRU_THRESH` now defaults to **0.99** (the cache tests pin 0.5, the value their
+step sizes were written for).
+
+**bb-qfn-tp2-rc2 = the v0.2.1 TP2-offload default** (NSEQ=8, copy grid 64,16, threshold 0.99; 270 slots, NBT 4096,
+UTIL 0.94; GPUs 0,2; second launch, KV 120,724 tokens; full BetterBench, 20 passes), against the morning's run of
+the v0.2.0 defaults:
+
+| | v0.2.0 defaults (`bb-qfn-tp2-offload`) | v0.2.1 defaults (`bb-qfn-tp2-rc2`) | |
+|---|---|---|---|
+| single-stream decode | 93.8 tok/s | 97.4 | +4% |
+| step p50 | 25.68 ms | 25.62 | = |
+| TTFT p50 | 555 ms | 484 | -13% |
+| prefill 2k / 8k / 16k / 32k | 2,099 / 3,163 / 3,434 / 3,329 | 2,208 / 3,558 / 3,839 / 3,793 | +5 / +12 / +12 / +14% |
+| aggregate at 1 / 2 / 4 / 8 / 16 | 84 / 104 / 108 / 111 / 95 | 87 / 109 / 116 / 118 / 113 | +4 / +5 / +7 / +6 / +19% |
+| per-request decode at 8 (median) | 20.6 tok/s | 17.1 | eight run instead of ~six |
+| TTFT p50 at 8 / 16 concurrent | 7.1 s / 37.9 s | **0.95 s** / 27.3 s | |
+| 8 requests, one prompt (code / json) | 283 / 347 | 434 / 577 | +53 / +66% |
+| 8 requests, four prompt types | 118 | 166 | +40% |
+| sanity | 8 / 8 | 8 / 8 | |
+
+The prefill gain arrived with the threshold (the NSEQ=8 run without it had the morning's prefill to the percent);
+which steps of a prefill it changes has not been isolated. Gates (`test_cache_moe`, `test_cache_stats`) pass on
+the new defaults.
+
+**What the cards are doing meanwhile** (amdgpu `gpu_busy_percent`, `mem_busy_percent`, hwmon power and clock at 1 Hz,
+joined with the server's request counters; both cards of the pair, 225 W cap):
+
+| phase | busy | memory busy | W per card | clock | W per card before the threshold fix |
+|---|---|---|---|---|---|
+| 1 request | 100% | 32% | 206 | 3,379 MHz | 203 |
+| 2 requests | 100% | 26% | 199 | 3,385 | 197 |
+| 3-4 requests | 100% | 21% | 179 | 3,399 | 175 |
+| 5-8 requests | 100% | 15-16% | 168-171 | 3,402 | 150-152 |
+| prefill, long prompts | 100% | 27% | 219 | 2,984 | 218 |
+| TP4, 1 request (for scale) | 99% | 28% | 192 | 3,397 | |
+
+A kernel is always running, and the more different requests run the LESS the cards compute: 206 W with one request,
+170 W with eight. The rest of the time goes to experts arriving over the link. Only prefill sits at the cap with the
+clock pulled down. Two cards with offloaded experts are link-bound with compute to spare; beyond these defaults
+only three things move a mixed load: more VRAM for slots, a faster link, or routing that prefers resident experts
+-- the last changes outputs and would need the full paired eval before it could be offered even as an option.
 
 Placement rule, now measured both ways: **same switch for tensor parallel, one card per switch for offload.**
 The launcher header says so; `GPUS=0,2` on this box.

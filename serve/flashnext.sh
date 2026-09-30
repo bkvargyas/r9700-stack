@@ -1,17 +1,17 @@
 #!/bin/bash
 # Qwen3.8-Flash-Next (tcclaviger GPTQ). Two ways to run it:
 #   TP2 with experts in host RAM (the defaults here; needs the 256 GB VM): the plugin's LRU expert cache keeps
-#     270 slots per layer in VRAM. Full BetterBench 2026-09-29 (v0.2.0): single decode 93.8 tok/s (probe 114),
-#     step 25.7 ms, TTFT 555 ms, prefill 2.1k / 3.2k / 3.4k / 3.3k tok/s at 2k..32k, conc 84 / 104 / 108 / 111 / 95.
+#     270 slots per layer in VRAM. Full BetterBench 2026-09-29 (v0.2.1): single decode 97.4 tok/s (probe 117),
+#     step 25.6 ms, TTFT 484 ms, prefill 2.2k / 3.6k / 3.8k / 3.8k tok/s at 2k..32k, conc 87 / 109 / 116 / 118 / 113.
 #     Prefill and concurrency are bound by the expert stream over PCIe. On a 4-card box use ONE CARD PER PLX
 #     SWITCH (GPUS=0,2): the stream comes down each switch's single Gen3 uplink, and the same-switch pair
 #     measured 81 / 54 / 1,379 (single / conc-8 / prefill 8k) against 114 / 132 / 2,464 on the split pair.
 #     CGSIZES= (vLLM's default graph sizes) at TP2: the 2048-token prefill graphs leave no KV room there.
 #     RESTART ONCE after the first launch of a new configuration: the launch that compiles keeps ~0.45 GiB
 #     that the next one gives to the KV pool (45k vs 72k tokens at NSEQ=16, 94k vs 121k at NSEQ=8).
-#     What bounds it (PROGRESS.md 2026-09-29): one prompt type scales with requests (conc-8 401-535 tok/s),
-#     a mixed batch does not (~120-140 at any concurrency): it misses 14% of its routed experts per step
-#     and each miss is 1.245 MiB per rank over the PCIe link.
+#     What bounds it (PROGRESS.md 2026-09-29): the link. Every routed expert that is not resident is 1.245 MiB
+#     per rank over PCIe at the link rate, so real traffic levels off near 115 tok/s from 4 requests up; eight
+#     copies of ONE prompt share their experts and run at 434-577. R9K_EXPERT_CACHE_STATS=1 logs the misses.
 #   TP4 with everything in VRAM: GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 (the headline numbers in README.md).
 # Attention is the model's own QSA (ATTN=CUSTOM is for standard-attention models only).
 exec env \
