@@ -179,6 +179,9 @@ def _stats_register(cache) -> None:
         _STATS_THREAD.start()
 
 
+ALIGN_KEEP_MAX = 512      # persistent align buffer sets per layer (one per captured graph shape); a backstop
+
+
 class LayerCache:
     def __init__(self, layer_idx: int, w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor,
                  N1: int, K1: int, N2: int, K2: int, slots: int):
@@ -307,7 +310,13 @@ class LayerCache:
                                      (d > self.max_distinct).to(torch.int64)]))
 
     def _align_bufs(self, mk: int, bs: int):
-        """Persistent align outputs for (mk, bs), sized exactly as vLLM's moe_align_block_size would."""
+        """Align outputs for (mk, bs), sized exactly as vLLM's moe_align_block_size would.
+
+        Kept for good only when a HIP graph is being captured (a replay writes through these pointers, and the
+        capture sizes bound how many there can be). An eager step gets temporaries: prefill chunks come in every
+        size -- a chunk shares its token budget with whatever is decoding -- and one persistent set per size per
+        layer is 28 MiB per rank at 4,096 tokens. That filled the card in 13 minutes of mixed-length prompts
+        (v0.2.1 and earlier: torch.OutOfMemoryError under a long-context soak)."""
         key = (mk, bs)
         b = self._align.get(key)
         if b is None:
@@ -318,7 +327,8 @@ class LayerCache:
             i32 = dict(dtype=torch.int32, device=dev)
             b = (L, NB, torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32),
                  torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32))
-            self._align[key] = b
+            if torch.cuda.is_current_stream_capturing() and len(self._align) < ALIGN_KEEP_MAX:
+                self._align[key] = b
         return b
 
     def update_fused(self, topk_ids: torch.Tensor, bs: int):
