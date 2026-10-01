@@ -1000,6 +1000,27 @@ reference again.
    statement of v0.2.0 (changelog, release notes, README) is corrected in v0.2.1; the eval for a change of default
    is from now on the full 1,319 questions (40 minutes at TP4), not the first 800.
 
+### 2026-10-01: after v0.2.1 -- what the two-card prefill number means, and the UTIL soak
+
+**Why prefill rose with the insert threshold: the benchmark's prompt, not prompts in general.** v0.2.1's BetterBench
+prefill is 5-14% above v0.2.0's and the release said it had not been isolated. `bench/prefill_kinds.py` (new) sends
+two kinds of prompt to the same server -- BetterBench's own filler, which is one paragraph's ~75 words shuffled, and
+slices of real text (this repository's notes) -- with the cache counters on (TP2 + offload, GPUs 0,2, rank 0):
+
+| prompt | threshold 0.5: tok/s | distinct / read through per layer | steps over | threshold 0.99: tok/s | distinct / read through | steps over |
+|---|---|---|---|---|---|---|
+| BetterBench filler, 8k | 3,342 | 312 / 125 | 100% | 3,672 (+10%) | 241 / 70 | 59% |
+| BetterBench filler, 24k | 3,218 | 268 / 112 | 86% | 3,645 (+13%) | 269 / 76 | 63% |
+| real text, 6.6k-8.4k | 2,467 | 247 / 99 | 55% | 2,288 (2,123-2,683) | 307 / 129 | 70% |
+| real text, 20k-26k | 2,568 | 339 / 145 | 76% | 2,526 | 367 / 160 | 83% |
+
+A 4,096-token chunk of the filler routes to 240-310 distinct experts a layer, which straddles 0.99 x 270 = 267: about
+40% of its steps now insert, the cache learns the filler's experts, and a third fewer are read through. A chunk of
+real text routes to 310-370 and stays over either threshold; its prefill does not move (the 8k pair differs by its
+own scatter). So: **on two cards with offloaded experts real documents prefill at about 2,300-2,600 tok/s, some 30%
+below the BetterBench figure, on v0.2.0 and v0.2.1 alike**, and the release's "+5..+14% prefill" is a statement about
+narrow prompts. The four-card numbers do not have this dependence (nothing is fetched). README corrected.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:

@@ -96,6 +96,11 @@ batch of near-identical requests, which share their experts: eight copies of one
 Four cards with everything in VRAM are 1.6× faster single-stream and 3-6× at concurrency; a PCIe 5 host would
 narrow that gap without any code change.
 
+**Prefill here depends on the prompt.** BetterBench's prefill filler is one paragraph's words shuffled, which routes
+to few enough experts for the cache to follow; real text does not. Measured on the same server, real documents
+prefill at about **2,300-2,600 tok/s** (8k-26k tokens) against 3,650 for the filler, and that figure is the same on
+v0.2.0 and v0.2.1: the prefill gain in the table is a gain on narrow prompts (`bench/prefill_kinds.py`).
+
 Two operational notes: **restart once after the first launch of a new configuration** (the launch that compiles
 leaves ~0.45 GiB less for the KV pool: 94k against 121k tokens), and pass `NSEQ=16` for four cards
 (`serve/flashnext.sh` defaults to 8, the right value for two).

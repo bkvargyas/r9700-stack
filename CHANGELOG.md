@@ -6,6 +6,14 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [Unreleased]
 
+### Added
+- `bench/prefill_kinds.py` (prefill by kind of prompt) and `bench/soak.py` (long-context soak).
+
+### Fixed
+- The 0.2.1 notes give Flash-Next TP2-offload prefill as 2,208-3,839 tok/s, 5-14% above 0.2.0. Both are BetterBench
+  figures on its shuffled-paragraph filler, and the gain exists only for such narrow prompts (the cache can now
+  follow their experts). Real text prefills at about 2,300-2,600 tok/s on both versions. README and PROGRESS say so.
+
 ## [0.2.1] - 2026-09-30
 
 Flash-Next on **two** cards with the experts in host RAM: new defaults, measured end to end, and the tools that
