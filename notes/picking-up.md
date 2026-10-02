@@ -37,6 +37,22 @@ TESTS="test_moe_mxfp4.py test_attn_r9k.py ..." ~/gates.sh     # on VM100; single
 Helper scripts on VM100 (`~/gates.sh`, `~/artest.sh`, `~/steptime.sh`, `~/pfprof.sh`, `~/batch.sh`) are outside
 the repo. They are small; recreate from the invocations in `PROGRESS.md` if the box is ever rebuilt.
 
+## Before a release — the checks that found what the benchmarks could not (2026-10-02)
+
+Two bugs shipped in three releases because every check ran in lockstep, at fixed prompt depths, at concurrency 1 or
+at exactly `max_num_seqs`. On EVERY configuration (Flash-Next TP2 + offload, Flash-Next TP4, 27B TP2), on the
+release candidate:
+
+```bash
+python3 bench/sanity_stress.py --pre "" --conc <NSEQ+1> --rounds 100     # and 1.5x, 2x NSEQ: must be 0 bad answers
+python3 bench/sanity_stress.py --text <real text> --rounds 40            # long prefills, then the 8-way check
+python3 bench/soak.py --text <real text> --conc 16 --seconds 1500 --lo 200 --hi 30000   # 0 errors, VRAM flat
+torchrun --nproc-per-node=2 tests/test_ar_race.py                        # and test_ar_r9k / test_ar_nrank / test_ar4
+```
+
+plus the single-GPU gates and a full BetterBench. Watch `mem_info_vram_used` during the soak (it must plateau).
+The plain `sanity.py` counts an answer right if the number appears anywhere in it; the stress script does not.
+
 ## Measuring anything — read this before you believe a number
 
 These cost real time to learn:

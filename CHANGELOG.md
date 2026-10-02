@@ -8,29 +8,44 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [0.2.2] - 2026-10-02
 
-A fix release. **If you run Flash-Next with offloaded experts (two cards), upgrade:** 0.2.1 and every earlier
-version leak VRAM under mixed-length prompts and run out of memory within minutes to hours of real traffic. Four
-cards with everything in VRAM were not affected. Speed and outputs are unchanged.
-
-### Added
-- `bench/prefill_kinds.py` (prefill by kind of prompt) and `bench/soak.py` (mixed-length long-context soak; a
-  release is now soaked on both configurations before it is tagged).
-
-### Rejected, with numbers
-- `UTIL=0.96` for TP2 with offload: runs at 69 MiB free and dies when the queue drains (PROGRESS.md 2026-10-01).
+A fix release for **two cards** (tensor parallel 2): Qwen3.8-Flash-Next with offloaded experts and Qwen3.8-27B.
+Two bugs, both present since 0.1.0, both invisible to fixed-depth benchmarks and to evals at concurrency 1:
+wrong output for some requests under concurrency, and a memory leak that ends in out-of-memory. **Upgrade if you
+run two cards.** Four cards with everything in VRAM produced no wrong answer in 15,000 and did not leak; they get
+the same all-reduce fix as a precaution. Speed and (correct) outputs are unchanged.
 
 ### Fixed
+- **Garbled answers on two cards when a request joins a batch in flight.** A race in our 2-rank P2P all-reduce
+  (`kernels/r9k_ar.hip`): the half of its double buffer was chosen by a per-block counter while the number of blocks
+  followed the message size, so after a small message the next larger one could overwrite the previous message's
+  last rows before the other rank had summed them. The last sequence of the batch then decoded garbage (the right
+  beginning, then one token repeated). With more requests than `max_num_seqs`: 34-41% of rounds had a bad answer on
+  Flash-Next TP2 (5-8% of answers), 8 of 900 answers on the 27B; after the fix 0 of 10,440. Every call now advances
+  every block counter (fixed launch grid), and the compressed path shares the exact path's counters. The 4-rank
+  kernels had the same construction and are fixed the same way. `tests/test_ar_race.py` reproduces it with the old
+  grid and passes with the new one. On 0.1.0-0.2.1, `R9K_R4D_AR=0` (RCCL all-reduce) avoids it.
 - **Memory leak in the expert cache: Flash-Next with offloaded experts ran out of VRAM under mixed-length prompts.**
   The fused LRU path kept one set of align buffers per batch shape per layer for good (28 MiB per rank at a
   4,096-token chunk), and under real traffic nearly every prefill step has a new shape. At the 0.2.1 defaults a
   15-minute soak of 18k-30k-token prompts from 8 clients took a card from 30.5 to 32.6 GiB and killed the engine
   (77 requests served, 369 failed); fixed, the same soak serves 111 with none failed and VRAM flat at 31.0 GiB,
-  and a 31-minute soak from 16 clients (270 to 28.5k tokens) serves 291 with none failed.
-  Present since the fused LRU path was introduced (0.1.0, 0.2.0, 0.2.1); four cards with everything in VRAM do not
-  use the cache and were not affected (soaked: 236 served, 0 failed). `tests/test_cache_shapes.py`.
+  and a 31-minute soak from 16 clients (270 to 28.5k tokens) serves 291 with none failed. Now one buffer set per
+  layer, reused by every step. `tests/test_cache_shapes.py`.
 - The 0.2.1 notes give Flash-Next TP2-offload prefill as 2,208-3,839 tok/s, 5-14% above 0.2.0. Both are BetterBench
   figures on its shuffled-paragraph filler, and the gain exists only for such narrow prompts (the cache can now
   follow their experts). Real text prefills at about 2,300-2,600 tok/s on both versions. README and PROGRESS say so.
+
+### Added
+- `bench/sanity_stress.py`: the 8-way sanity check, strict (the answer and nothing else), in rounds, at any
+  concurrency and optionally after long prefills. `bench/soak.py`: mixed-length long-context soak.
+  `bench/prefill_kinds.py`: prefill by kind of prompt.
+- Release checklist (notes/picking-up.md): stress at more requests than `max_num_seqs`, soak with mixed lengths,
+  on every configuration, before a tag.
+- A same-day baseline of the 27B against the reference stack on the same two cards (PROGRESS.md): decode 196.6 vs
+  197.5 tok/s, prefill 81-87%, TTFT 116 vs 65 ms, concurrency 94-97%.
+
+### Rejected, with numbers
+- `UTIL=0.96` for TP2 with offload: runs at 69 MiB free and dies when the queue drains (PROGRESS.md 2026-10-01).
 
 ## [0.2.1] - 2026-09-30
 

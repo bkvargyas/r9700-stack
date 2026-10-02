@@ -1036,10 +1036,14 @@ so that a captured graph would find them at the same address. But a prefill chun
 with whatever is decoding, so under real traffic nearly every eager step has a size nobody has seen, and each new
 size left 28 MiB per rank behind (two 73k-entry int32 tables x 48 layers at a 4,096-token chunk). Every benchmark
 here uses fixed prompt depths and a handful of shapes; none could show it. It has been there since the fused LRU
-path went in, so v0.1.0 and v0.2.0 have it too. Fix: the buffers are kept only while
-`torch.cuda.is_current_stream_capturing()` (bounded by the capture sizes, backstop 512 per layer); eager steps get
-temporaries. `tests/test_cache_shapes.py`: 900 eager shapes leave no buffer set and not one byte of allocated memory
-behind, and a captured graph replays 12 new routings equal to an eager twin. The plugin's other shape-keyed caches
+path went in, so v0.1.0 and v0.2.0 have it too. Fix: ONE buffer set per layer, sized by the largest step seen (in
+serving the first call is vLLM's profile run at max_num_batched_tokens) and handed out as views; the fused kernel
+rewrites every entry it hands back, so sharing is safe and the addresses a captured graph replays through never
+move. If a larger step ever arrives the old set is kept and one twice the size takes over. (A first version kept
+buffers only during graph capture and used temporaries otherwise; it soaked clean too, and was dropped for the
+simpler scheme.) `tests/test_cache_shapes.py`: 900 eager shapes smallest-first hold five sets and under 100 KiB at
+test scale; largest-first nothing grows and the address is one throughout; a captured graph replays 12 new routings
+equal to an eager twin, also with eager steps of another size in between. The plugin's other shape-keyed caches
 (`_MX_TABLES`, the QSA scratch, the staging area) are bounded by construction.
 
 A longer and rougher soak of the fix (16 clients for 31 minutes, prompts of 270 to 28.5k tokens, so the queue
@@ -1057,6 +1061,106 @@ which 0.94 has (983 MiB free at the peak) and 0.96 does not. The 28% of extra KV
 **Rule from here on:** a release is soaked with mixed-length prompts on both configurations before it is tagged.
 Fixed-depth benchmarks measure speed; they cannot see what accumulates.
 
+### 2026-10-02: garbled answers on two cards -- a race in our own all-reduce
+
+**Found by accident, by the sanity check.** After a prefill benchmark on the leak-fix build the 8-way sanity came
+back 7 / 8 with `'45 Engine En'` and `'5 Engine Eng'`: the right digits, then one token (7943, " Engine") instead of
+the end of the answer, for good. Every sanity before it had been a clean 8 / 8 -- and that check counts an answer
+right if the number appears anywhere in it. `bench/sanity_stress.py` (new) asks the same questions strictly, in
+rounds, optionally after long prefills, and prints every bad answer.
+
+**It was not the leak fix** (all three buffer schemes showed it: 2 / 800, 2 / 800, 1 / 800 answers, always in the
+first 8-way batch after a long prompt, always a late sequence) **and not the insert threshold** (3 of 60 rounds at
+0.5, always the eighth request). The eighth request was the clue: with `NSEQ=8` a long request that has not left
+yet makes the eighth of eight wait one step, and it then joins a batch of running decodes. Submitting more requests
+than `max_num_seqs` does that on every round, with no long prompt at all:
+
+| Flash-Next TP2 + offload, NSEQ=8, strict sanity | rounds with a bad answer | bad answers |
+|---|---|---|
+| 8 concurrent | 0 / 100 | 0 / 800 |
+| 9 concurrent | 34 / 100 | 74 / 900 |
+| 12 concurrent | 41 / 100 | 57 / 1,200 |
+| 16 concurrent | 34 / 100 | 64 / 1,600 |
+
+One knob per launch from there (9 concurrent x 100 rounds / 12 x 60; rounds with a bad answer):
+
+| leg | 9 conc | 12 conc | |
+|---|---|---|---|
+| defaults | 34 | 41 (of 100) | |
+| TP4, NSEQ=16 at 16 / 17 / 24 / 32 concurrent | 0 | 0 | 0 of 7,620 answers |
+| TP4, NSEQ=8 | 0 | 0 | not the sequence limit as such |
+| `EAGER=1` (no HIP graphs) | 0 | 0 | needs graph replay |
+| GDN decode stock / all five decode fusions stock | 1 / 0 | 34 / 35 | not our decode kernels |
+| `R9K_AR_QUANT=0` (exact all-reduce only) | 25 | 29 | not the compressed codec |
+| `R9K_LRU_FUSED=0` | 8 | 6 | not the fused LRU kernel |
+| a sparser capture-size list | **99** | **60 of 60** | deterministic: it is about how a mixed batch is padded and sized |
+| GPUs 0,1 (one PLX switch) | 26 | 27 | not the card pair |
+| no speculation (`MTP=` as an argument) | 0 | 0 | the draft passes supply the differently-sized messages |
+| **RCCL all-reduce (`R9K_R4D_AR=0`)** | **0** | **0** | |
+| **libr4d all-reduce (`R9K_AR_IMPL=r4d`)** | **0** | **0** | |
+| Qwen3.8-27B, TP2, `serve/27b.sh` | 8 | 0 | the 27B has it too |
+
+**The bug** (`kernels/r9k_ar.hip`, ours, the TP2 default since 2026-09-22). Each rank pushes its input into the
+peer's scratch and sums the pair; the scratch is double-buffered so that a rank already on the next call cannot
+overwrite what its peer is still reading. The half was chosen by `seq[b] & 1`, a counter PER BLOCK, and the launch
+grid was the number of data blocks, which follows the message size (`n16 // 1400`, 4..24). A block that sat out a
+small message kept its old parity, so on the next, larger message it wrote into the SAME half as the message
+before -- and its slice starts inside that message's tail whenever the new slices are shorter (`per' * nb_prev <
+n16_prev`: e.g. 28 rows = 6 blocks of 1,494 words, then 58 rows = 13 blocks of 1,428: block 6 starts at word 8,568
+of a message that ends at 8,960). A rank one call ahead then overwrote the last rows of the previous message before
+the other rank had summed them. From that step the two ranks disagreed on the hidden state of the LAST sequence in
+the batch, and it decoded garbage for the rest of its life. The compressed path made it worse in a second way: it
+shared the scratch with the exact path but kept its own counters, so the two paths could pick the same half for
+consecutive calls at any time. It takes two back-to-back all-reduces of different sizes with the ranks slightly out
+of step: the MTP draft passes next to a main forward whose size has just changed because a prompt joined, under graph
+replay, where launches are microseconds apart. In lockstep it never shows, which is why every test passed (the
+kernel's own test even exercised "a varying block count between calls" -- with a sync after each).
+
+**The fix.** Every call advances every counter: the launch grid is fixed per (scratch, counters) pair (24 blocks at
+TP2; 16 one-shot and 64 two-shot at TP4) and blocks beyond the data blocks do nothing but increment. All blocks
+then agree on the half, which is what double buffering assumed all along; the 2-rank compressed path now uses the
+exact path's counters. New entry points `r9k_ar_*_g(..., grid)`; the old ones remain for tests that keep one block
+count. The N-rank kernels had the same per-block scheme (TP4 never showed it; its one-shot path has a constant
+block count and its two-shot path varies only above ~40 tokens) and got the same fix.
+
+`tests/test_ar_race.py` (torchrun, 2 ranks): one captured graph of small-then-larger pairs, replayed 1,500 times
+with rank 1 held back. Old grid: 3 exact outputs wrong with every message exact, 6,008 wrong and 6,000 differing
+between the ranks with the compressed path on. Fixed grid: 0 and 0. `test_ar_r9k`, `test_ar_nrank`, `test_ar4`
+pass; the idle blocks cost nothing measurable (4-rank graph timings identical to the microsecond-level table).
+
+**Serving, after the fix** (strict sanity, requests over `max_num_seqs`): TP2 + offload with the sparse capture list
+0 of 1,620 (was 99 / 100 rounds); TP2 defaults 0 of 4,600 at 9 / 12 / 16 concurrent and 0 of 320 in the long-prompt
+pattern; 27B 0 of 3,900; TP4 0 of 6,020. Probes unchanged on all three.
+
+**What was affected.** Any two-card run on our all-reduce -- Flash-Next TP2 + offload and the 27B at TP2 -- from
+2026-09-22 (v0.1.0) on, whenever a request joined a batch already in flight: more requests than `max_num_seqs`, or
+requests arriving while others decode. One sequence of the batch, a few percent of the time. v0.2.1's `NSEQ=8`
+made it common by letting eight run. Every quality eval here ran at concurrency 1 and could not see it; BetterBench
+does not read answers. Four cards: no wrong answer in 15,000, but the same construction, now fixed.
+On v0.2.0 / v0.2.1, `R9K_R4D_AR=0` (RCCL all-reduce) avoids it.
+
+**Rules from this.** (1) The sanity check is strict now and part of every benchmark chain. (2) A release is
+stressed at more requests than `max_num_seqs` and soaked with mixed lengths, on every configuration. (3) "Passes in
+lockstep" is not evidence about a handshake; a protocol test must put the ranks out of step.
+
+### 2026-10-02: Qwen3.8-27B on two cards, a same-day baseline against the reference stack
+
+Same two cards (GPUs 0,1, one PLX switch), same checkpoint, full BetterBench each, both sanity 8 / 8. Ours:
+`serve/27b.sh` on vLLM 0.30. Reference: GGZ14 radiance 0.9.3 (vLLM 0.27.1), relaunched with `~/launch-ref27b.sh`.
+
+| | ours | reference | |
+|---|---|---|---|
+| decode | 196.6 tok/s | 197.5 | 99.5% |
+| step p50 | 23.43 ms | 23.15 | +1.2% |
+| TTFT p50 | 116 ms | 65 | 1.8x slower |
+| prefill 2k / 8k / 16k / 32k | 4,177 / 4,187 / 4,066 / 3,832 | 4,780 / 4,947 / 4,903 / 4,746 | 87 / 85 / 83 / 81% |
+| concurrency 1 / 2 / 4 / 8 | 174 / 287 / 401 / 526 | 180 / 303 / 428 / 558 | 97 / 95 / 94 / 94% |
+| KV cache | 210,782 tokens | 798,784 | 3.8x smaller |
+
+Decode is at parity. What is left: prefill (the reference chunks at 8,192 and runs libr4d's all-reduce), time to
+first token (prefill graphs up to 2,048 tokens took Flash-Next from 137 to 104 ms and have not been tried here),
+concurrency, and KV capacity (ours is a fixed `KVMEM=9`; theirs is profiled at 0.95 and, by its size, 8-bit).
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
@@ -1070,6 +1174,9 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    device copies and the stock per-token quant of the block GEMM.
 
 ### Open questions for Brian
-- v0.2.2 (the leak fix) is committed locally and soaked; pushing and publishing it is Brian's call.
+- v0.2.2 (the leak fix and the all-reduce race fix) is committed locally and validated; pushing and publishing it
+  is Brian's call.
+- The published v0.2.0 and v0.2.1 notes say nothing of either bug. Edit them on GitHub, or let v0.2.2's notes
+  carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
   serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.
