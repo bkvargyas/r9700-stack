@@ -1021,6 +1021,38 @@ own scatter). So: **on two cards with offloaded experts real documents prefill a
 below the BetterBench figure, on v0.2.0 and v0.2.1 alike**, and the release's "+5..+14% prefill" is a statement about
 narrow prompts. The four-card numbers do not have this dependence (nothing is fetched). README corrected.
 
+**The soak found a memory leak in the released two-card default, not a UTIL question** (`bench/soak.py`, new: 8
+clients for 15 minutes, each sending an 18k-30k-token slice of real text and asking for 256 tokens; VRAM from
+`mem_info_vram_used` at 1 Hz). Flash-Next TP2 + offload, v0.2.1 defaults (UTIL 0.94, NSEQ 8, KV 120,724 tokens):
+
+| | v0.2.1 as released | with the fix |
+|---|---|---|
+| requests served / failed | 77 / **369** | 111 / 0 |
+| VRAM used per card | 30.5 -> 32.6 GiB in 13 minutes (the whole card), then `torch.OutOfMemoryError`, engine dead | 30.98 GiB flat for 15 minutes, one step to 31.64 as the queue drained |
+| sanity afterwards | -- (server gone) | 8 / 8 |
+
+Cause: `LayerCache._align_bufs` kept the align outputs of the fused LRU kernel per (rows, block) per layer, for good,
+so that a captured graph would find them at the same address. But a prefill chunk shares the step's token budget
+with whatever is decoding, so under real traffic nearly every eager step has a size nobody has seen, and each new
+size left 28 MiB per rank behind (two 73k-entry int32 tables x 48 layers at a 4,096-token chunk). Every benchmark
+here uses fixed prompt depths and a handful of shapes; none could show it. It has been there since the fused LRU
+path went in, so v0.1.0 and v0.2.0 have it too. Fix: the buffers are kept only while
+`torch.cuda.is_current_stream_capturing()` (bounded by the capture sizes, backstop 512 per layer); eager steps get
+temporaries. `tests/test_cache_shapes.py`: 900 eager shapes leave no buffer set and not one byte of allocated memory
+behind, and a captured graph replays 12 new routings equal to an eager twin. The plugin's other shape-keyed caches
+(`_MX_TABLES`, the QSA scratch, the staging area) are bounded by construction.
+
+**The same soak on four cards** (TP4, everything in VRAM, the expert cache not in use): 236 served, 0 failed, 5
+rejected for length, sanity 8 / 8, VRAM flat at 31.96 GiB per card for the whole run. First long-context soak of
+the headline configuration; nothing found.
+
+**UTIL=0.96: rejected.** With the leak fixed it ran 15 minutes at 32,555 MiB of 32,624 and died on a 150 MiB
+allocation when the queue drained (82 served, 7 failed). The step the 0.94 run takes at the same moment is 640 MiB,
+which 0.94 has (983 MiB free at the peak) and 0.96 does not. The 28% of extra KV is not available on this card.
+
+**Rule from here on:** a release is soaked with mixed-length prompts on both configurations before it is tagged.
+Fixed-depth benchmarks measure speed; they cannot see what accumulates.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
@@ -1034,7 +1066,6 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    device copies and the stock per-token quant of the block GEMM.
 
 ### Open questions for Brian
-- `UTIL=0.96` for TP2 with offload: 28% more KV room and it ran clean, but it has not held a 32k context under
-  load. Worth a soak, or leave at 0.94?
+- v0.2.2 (the leak fix) is committed locally and soaked; pushing and publishing it is Brian's call.
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
   serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.

@@ -7,9 +7,20 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 ## [Unreleased]
 
 ### Added
-- `bench/prefill_kinds.py` (prefill by kind of prompt) and `bench/soak.py` (long-context soak).
+- `bench/prefill_kinds.py` (prefill by kind of prompt) and `bench/soak.py` (mixed-length long-context soak; a
+  release is now soaked on both configurations before it is tagged).
+
+### Rejected, with numbers
+- `UTIL=0.96` for TP2 with offload: runs at 69 MiB free and dies when the queue drains (PROGRESS.md 2026-10-01).
 
 ### Fixed
+- **Memory leak in the expert cache: Flash-Next with offloaded experts ran out of VRAM under mixed-length prompts.**
+  The fused LRU path kept one set of align buffers per batch shape per layer for good (28 MiB per rank at a
+  4,096-token chunk), and under real traffic nearly every prefill step has a new shape. At the 0.2.1 defaults a
+  15-minute soak of 18k-30k-token prompts from 8 clients took a card from 30.5 to 32.6 GiB and killed the engine
+  (77 requests served, 369 failed); fixed, the same soak serves 111 with none failed and VRAM flat at 31.0 GiB.
+  Present since the fused LRU path was introduced (0.1.0, 0.2.0, 0.2.1); four cards with everything in VRAM do not
+  use the cache and were not affected (soaked: 236 served, 0 failed). `tests/test_cache_shapes.py`.
 - The 0.2.1 notes give Flash-Next TP2-offload prefill as 2,208-3,839 tok/s, 5-14% above 0.2.0. Both are BetterBench
   figures on its shuffled-paragraph filler, and the gain exists only for such narrow prompts (the cache can now
   follow their experts). Real text prefills at about 2,300-2,600 tok/s on both versions. README and PROGRESS say so.
