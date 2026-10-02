@@ -8,11 +8,11 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [0.2.2] - 2026-10-02
 
-A fix release for **two cards** (tensor parallel 2): Qwen3.8-Flash-Next with offloaded experts and Qwen3.8-27B.
-Two bugs, both present since 0.1.0, both invisible to fixed-depth benchmarks and to evals at concurrency 1:
-wrong output for some requests under concurrency, and a memory leak that ends in out-of-memory. **Upgrade if you
-run two cards.** Four cards with everything in VRAM produced no wrong answer in 15,000 and did not leak; they get
-the same all-reduce fix as a precaution. Speed and (correct) outputs are unchanged.
+A fix release. Three bugs, all present since 0.1.0, all invisible to fixed-depth benchmarks and to evals at
+concurrency 1; each was found by loading the server the way real traffic does. **Upgrade.**
+On two cards (Flash-Next with offloaded experts, and the 27B): wrong output for some requests under concurrency, and
+(Flash-Next) a memory leak that ends in out-of-memory. On any Flash-Next configuration, four cards first: out of
+memory when one step holds prompts of very different lengths. Speed and (correct) outputs are unchanged.
 
 ### Fixed
 - **Garbled answers on two cards when a request joins a batch in flight.** A race in our 2-rank P2P all-reduce
@@ -24,6 +24,11 @@ the same all-reduce fix as a precaution. Speed and (correct) outputs are unchang
   every block counter (fixed launch grid), and the compressed path shares the exact path's counters. The 4-rank
   kernels had the same construction and are fixed the same way. `tests/test_ar_race.py` reproduces it with the old
   grid and passes with the new one. On 0.1.0-0.2.1, `R9K_R4D_AR=0` (RCCL all-reduce) avoids it.
+- **Out of memory in the prefill of Flash-Next's short convolution when a step holds prompts of very different
+  lengths.** The stock method (and our drop-in for it) packs all of a step's prefills into `[prefills, longest,
+  4*hidden]` and holds about six such tensors: 3,000 + 15 x 70 tokens peak at 4.8 GiB. On four cards a mixed-length
+  soak at 16 running sequences went from 29.4 to 32.2 GiB in 40 seconds and died. Now packed by length (groups of
+  at most 1.25x the step's tokens), the same bits, 0.4-0.5 GiB. `tests/test_ple_conv.py`.
 - **Memory leak in the expert cache: Flash-Next with offloaded experts ran out of VRAM under mixed-length prompts.**
   The fused LRU path kept one set of align buffers per batch shape per layer for good (28 MiB per rank at a
   4,096-token chunk), and under real traffic nearly every prefill step has a new shape. At the 0.2.1 defaults a

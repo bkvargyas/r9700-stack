@@ -1143,6 +1143,39 @@ On v0.2.0 / v0.2.1, `R9K_R4D_AR=0` (RCCL all-reduce) avoids it.
 stressed at more requests than `max_num_seqs` and soaked with mixed lengths, on every configuration. (3) "Passes in
 lockstep" is not evidence about a handshake; a protocol test must put the ranks out of step.
 
+### 2026-10-02: out of memory on four cards under mixed-length concurrency -- the PLE short-conv prefill
+
+**Found by the release soak.** The first validation pass of v0.2.2 ran BetterBench, the strict stress and a
+mixed-length soak on every configuration. Four cards passed the first two (159.2 tok/s, 0 bad answers of 4,900) and
+died in the third: 24 clients, prompts of 200 to 30k tokens, `NSEQ=16` -- 31 requests served, VRAM from 29.4 to
+32.2 GiB in 40 seconds, `torch.OutOfMemoryError` on a 156 MiB allocation. The earlier four-card soak (8 clients,
+all long prompts) had sat at 31.96 GiB and passed.
+
+The allocation is in `ple/short_conv.py`, our drop-in for vLLM's `_short_conv_dilated_prefill_batched`, and the
+cause is in the algorithm we mirror: it packs ALL prefills of a step into `[prefills, longest, 4*hidden]` and keeps
+about six tensors of that size alive (zeros, transposed, history, conv output, activation, transposed back). One
+long chunk next to many short prompts is therefore many times the step's real tokens. vLLM's memory profile runs
+one sequence and sees 84 MiB per tensor; nothing budgets for the product.
+
+| one step holds | stock: peak in this function | packed by length |
+|---|---|---|
+| 3,800 + 7 x 40 tokens | 3,055 MiB | 526 MiB |
+| 3,000 + 15 x 70 tokens | 4,779 MiB | 432 MiB |
+| 2,900 + 800 + 300 + 17 + 5 tokens (+ decode rows) | 1,498 MiB | 419 MiB |
+| 3,000 + 900 + 60 tokens, one NULL state block | 958 MiB | 430 MiB |
+
+**Fix:** group the step's prefills by length, longest first, each group at most 1.25x the step's own token count
+(`R9K_PLE_CONV_SLACK`; a single sequence is always a group, so one prefill or prefills of similar length run exactly
+as before, without the host sync the grouping needs). Each sequence's convolution reads only its own tokens and its
+own state, so the output and the written-back conv state are the same bits: `tests/test_ple_conv.py` compares both
+with stock on five skewed cases and bounds the peak.
+
+It also explains two loose ends on two cards: the one-time +640 MiB step in the soaks of the leak fix (the first
+step with several prefills of different lengths), and why `UTIL=0.96` died "when the queue drained" (the same step,
+with 69 MiB free). Every release has had it -- through vLLM's own method in v0.1.0, through our override since
+v0.2.0 -- on any configuration; four cards at 16 running sequences reach it first because they admit the most
+prefills per step.
+
 ### 2026-10-02: Qwen3.8-27B on two cards, a same-day baseline against the reference stack
 
 Same two cards (GPUs 0,1, one PLX switch), same checkpoint, full BetterBench each, both sanity 8 / 8. Ours:
@@ -1174,8 +1207,8 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    device copies and the stock per-token quant of the block GEMM.
 
 ### Open questions for Brian
-- v0.2.2 (the leak fix and the all-reduce race fix) is committed locally and validated; pushing and publishing it
-  is Brian's call.
+- v0.2.2 (the all-reduce race, the expert-cache leak, the short-conv packing) is committed locally; pushing and
+  publishing it is Brian's call.
 - The published v0.2.0 and v0.2.1 notes say nothing of either bug. Edit them on GitHub, or let v0.2.2's notes
   carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
