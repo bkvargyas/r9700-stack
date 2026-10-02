@@ -45,7 +45,7 @@ def t_transpose():
     ok("transpose strided view", torch.equal(S.transpose12(v), v.transpose(1, 2).contiguous()))
 
 
-def run_case(name, q_lens, num_decode_tokens, state_slots, has_init, null_slots=()):
+def run_case(name, q_lens, num_decode_tokens, state_slots, has_init, null_slots=(), max_peak=None):
     """Same inputs to both implementations; compare output and conv state."""
     fake = types.SimpleNamespace(conv_state_len=(KSZ - 1) * DIL, short_conv_dilation=DIL)
     P = len(q_lens)
@@ -64,14 +64,20 @@ def run_case(name, q_lens, num_decode_tokens, state_slots, has_init, null_slots=
     for j in null_slots:
         idx[j] = NULL_BLOCK_ID
     idx = idx.to(dev)
-    outs = []
+    outs, peaks = [], []
     for fn in (Qwen4ExpPLELayer._short_conv_dilated_prefill_batched, S.prefill_batched):
         cs = st0.clone()
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        base = torch.cuda.memory_allocated()
         o = fn(fake, x, md, cs, w, idx, P, num_decode_tokens, ntok)
         torch.cuda.synchronize()
+        peaks.append((torch.cuda.max_memory_allocated() - base) / 2**20)
         outs.append((o, cs))
     ok(f"{name}: output", torch.equal(outs[0][0], outs[1][0]))
     ok(f"{name}: conv state", torch.equal(outs[0][1], outs[1][1]))
+    if max_peak is not None:
+        ok(f"{name}: peak {peaks[1]:.0f} MiB (stock {peaks[0]:.0f}), limit {max_peak}", peaks[1] <= max_peak)
     return x, w, md, st0, idx, fake, P, ntok
 
 
@@ -86,6 +92,17 @@ def main():
     run_case("tiny lengths 1..5", [1, 2, 3, 4, 5], 0, 8, [True] * 5)
     run_case("NULL block slot", [700, 300], 0, 8, [True, True], null_slots=(1,))
     run_case("empty state cache", [512, 64], 0, 0, [False, False])
+    # prefills of very different lengths in one step: stock packs [prefills, longest, 4*hidden] for all of them
+    # (the four-card OOM of 2026-10-02); ours packs by length, same bits, a fraction of the memory
+    assert S.length_groups([3800, 40, 40, 40, 40, 40, 40, 40], 5100) == [[0], [1, 2, 3, 4, 5, 6, 7]]
+    assert S.length_groups([500] * 8, 5000) == [list(range(8))]
+    assert S.length_groups([96, 2000, 500, 1500], 5120) == [[1, 3], [2, 0]]
+    run_case("skewed 3800 + 7 x 40", [3800, 40, 40, 40, 40, 40, 40, 40], 0, 16, [True] * 8, max_peak=1100)
+    run_case("skewed, unsorted, decode prefix", [17, 2900, 300, 5, 800], 6, 16, [True, False, True, True, False],
+             max_peak=1000)
+    run_case("skewed with a NULL block", [60, 3000, 900], 0, 8, [True, True, True], null_slots=(0,), max_peak=1000)
+    run_case("16 prefills, one long", [3000] + [70] * 15, 0, 32, [True] * 16, max_peak=1000)
+    run_case("equal lengths 8 x 500 (one group)", [500] * 8, 0, 16, [True] * 8)
     print("correctness:", "PASS" if bad == 0 else f"FAIL ({bad})")
     if os.environ.get("BENCH", "1") == "1":
         x, w, md, st0, idx, fake, P, ntok = run_case("bench shape", [4096], 0, 8, [True])
