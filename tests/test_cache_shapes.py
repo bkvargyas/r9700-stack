@@ -45,19 +45,17 @@ def main():
     cache.update_fused(route(4, g), K.MOE_BLOCK)
     torch.cuda.synchronize()
     base = torch.cuda.memory_allocated()
-    peak_keep = 0
     for M in range(1, 301):
         for mt in (1, 2, 4):
             hot, cold = cache.update_fused(route(M, g), K.MOE_BLOCK * mt)
             del hot, cold
-        peak_keep = max(peak_keep, len(cache._align))
     torch.cuda.synchronize()
     grown = torch.cuda.memory_allocated() - base
     held = sum(sum(x.numel() * 4 for x in o[2:]) for o in [cache._one] + cache._one_old if o is not None)
-    eager_ok = peak_keep == 0 and grown <= 2 * held and held < (1 << 20) and len(cache._one_old) <= 12
+    eager_ok = grown <= 2 * held and held < (1 << 20) and len(cache._one_old) <= 12
     ok &= eager_ok
-    print(f"  eager, 900 shapes: per-shape buffer sets {peak_keep}, allocated memory grew {grown / 2**10:.0f} KiB, "
-          f"align buffers held {held / 2**10:.0f} KiB in {1 + len(cache._one_old)} set(s)  ok={eager_ok}")
+    print(f"  eager, 900 shapes: allocated memory grew {grown / 2**10:.0f} KiB, align buffers held "
+          f"{held / 2**10:.0f} KiB in {1 + len(cache._one_old)} set(s)  ok={eager_ok}")
     # the same shapes again, largest first: nothing may grow at all once the largest step has been seen
     c2 = make_cache(g)
     c2.update_fused(route(300, g), K.MOE_BLOCK * 4)
@@ -85,7 +83,6 @@ def main():
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         (sh, eh, nh), (sc, ec, nc) = a.update_fused(ids, K.MOE_BLOCK)
-    kept = len(a._align)
     b.update_fused(ids, K.MOE_BLOCK)                 # the capture pass ran the step once: keep the twin in step
     same = True
     for trial in range(12):
@@ -95,9 +92,8 @@ def main():
         torch.cuda.synchronize()
         same &= all(torch.equal(x, y) for x, y in ((sh, rh), (eh, reh), (nh, rnh), (sc, rc), (ec, rec), (nc, rnc)))
         same &= torch.equal(a.table, b.table) and torch.equal(a.slot_expert, b.slot_expert)
-    graph_ok = kept == 0 and same
-    ok &= graph_ok
-    print(f"  captured graph: 12 replays equal to the eager twin: {same}  ok={graph_ok}")
+    ok &= same
+    print(f"  captured graph: 12 replays equal to the eager twin: {same}")
     # an eager step of another size between replays must not disturb the graph (they share the buffers)
     mixed = True
     for trial in range(6):

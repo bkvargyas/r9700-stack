@@ -179,10 +179,6 @@ def _stats_register(cache) -> None:
         _STATS_THREAD.start()
 
 
-ALIGN_KEEP_MAX = 512      # R9K_ALIGN_BUFS=capture: persistent align buffer sets per layer; a backstop
-ALIGN_MODE = os.environ.get("R9K_ALIGN_BUFS", "one")
-
-
 class LayerCache:
     def __init__(self, layer_idx: int, w13: torch.Tensor, w2: torch.Tensor, s13: torch.Tensor, s2: torch.Tensor,
                  N1: int, K1: int, N2: int, K2: int, slots: int):
@@ -222,7 +218,6 @@ class LayerCache:
         self.no_cold_limit = min(self.max_distinct, self.max_inserts) if S > self.max_distinct else 0
         self.n_miss = torch.zeros((1,), **i32)
         self.fused = os.environ.get("R9K_LRU_FUSED", "1") == "1" and E <= 1024
-        self._align: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
         self._one = None             # (cap L, cap NB, sorted/eids/npad hot, sorted/eids/npad cold): see _align_bufs
         self._one_old: list = []
         g = os.environ.get("R9K_LRU_GATHER", "64,16").split(",")
@@ -316,37 +311,27 @@ class LayerCache:
         """Align outputs for (mk, bs), sized exactly as vLLM's moe_align_block_size would.
 
         ONE buffer set per layer, sized by the largest step seen (in serving the first call is vLLM's profile run at
-        max_num_batched_tokens) and handed out as views: every step rewrites what it reads, so sharing is safe, the
-        addresses never move (a captured graph replays through them), and nothing is allocated per step or per shape.
-        v0.2.1 and earlier kept one set PER SHAPE for good: a prefill chunk shares its token budget with whatever is
-        decoding, so real traffic has a new size at nearly every step, 28 MiB per rank each at 4,096 tokens -- the
-        card was full after 13 minutes of mixed-length prompts. If a larger step ever arrives the old set is kept
-        alive (a graph may hold its address) and one at least twice the size takes over, so the total stays under
-        twice the largest.
-        R9K_ALIGN_BUFS=capture|keep select the two earlier schemes, for bisecting only."""
+        max_num_batched_tokens) and handed out as views: the fused kernel rewrites every entry it hands back, so
+        sharing is safe, the addresses never move (a captured graph replays through them), and nothing is allocated
+        per step or per shape. v0.2.1 and earlier kept one set PER SHAPE for good: a prefill chunk shares its token
+        budget with whatever is decoding, so real traffic has a new size at nearly every step, 28 MiB per rank each
+        at 4,096 tokens -- the card was full after 13 minutes of mixed-length prompts. If a larger step ever arrives
+        the old set is kept alive (a graph may hold its address) and one at least twice the size takes over, so the
+        total stays under twice the largest."""
         E = self.E
         L = min(mk * bs, mk + E * (bs - 1)) if mk < E else mk + E * (bs - 1)
         NB = (L + bs - 1) // bs
-        i32 = dict(dtype=torch.int32, device=self.table.device)
-        if ALIGN_MODE == "one":
-            o = self._one
-            if o is None or o[0] < L:
-                if o is not None:
-                    self._one_old.append(o)          # never freed: a captured graph may replay through it
-                cl = max(L, 2 * o[0]) if o is not None else L     # geometric: a handful of sets at most
-                cn = cl // K.MOE_BLOCK + 1                         # enough blocks for any block size
-                o = (cl, cn, torch.empty((cl,), **i32), torch.empty((cn,), **i32), torch.empty((1,), **i32),
-                     torch.empty((cl,), **i32), torch.empty((cn,), **i32), torch.empty((1,), **i32))
-                self._one = o
-            return (L, NB, o[2][:L], o[3][:NB], o[4], o[5][:L], o[6][:NB], o[7])
-        key = (mk, bs)
-        b = self._align.get(key)
-        if b is None:
-            b = (L, NB, torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32),
-                 torch.empty((L,), **i32), torch.empty((NB,), **i32), torch.empty((1,), **i32))
-            if ALIGN_MODE == "keep" or (torch.cuda.is_current_stream_capturing() and len(self._align) < ALIGN_KEEP_MAX):
-                self._align[key] = b
-        return b
+        o = self._one
+        if o is None or o[0] < L:
+            if o is not None:
+                self._one_old.append(o)          # never freed: a captured graph may replay through it
+            cl = max(L, 2 * o[0]) if o is not None else L     # geometric: a handful of sets at most
+            cn = cl // K.MOE_BLOCK + 1                         # enough blocks for any block size
+            i32 = dict(dtype=torch.int32, device=self.table.device)
+            o = (cl, cn, torch.empty((cl,), **i32), torch.empty((cn,), **i32), torch.empty((1,), **i32),
+                 torch.empty((cl,), **i32), torch.empty((cn,), **i32), torch.empty((1,), **i32))
+            self._one = o
+        return (L, NB, o[2][:L], o[3][:NB], o[4], o[5][:L], o[6][:NB], o[7])
 
     def update_fused(self, topk_ids: torch.Tensor, bs: int):
         """LRU manage + both moe_align outputs (hot over slots, cold over host) in one launch, then gather.
