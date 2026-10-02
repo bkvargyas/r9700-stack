@@ -36,6 +36,10 @@ def _lib():
     L.r9k_ar_ipc_open.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_long)]
     L.r9k_ar_oneshot_2rank.restype = ctypes.c_int
     L.r9k_ar_oneshot_2rank.argtypes = [ctypes.c_long] * 9 + [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 4
+    if not hasattr(L, "r9k_ar_oneshot_2rank_g"):
+        raise RuntimeError("libr9k.so predates the fixed-grid all-reduce (r9k_ar_oneshot_2rank_g): rebuild kernels/")
+    L.r9k_ar_oneshot_2rank_g.restype = ctypes.c_int
+    L.r9k_ar_oneshot_2rank_g.argtypes = [ctypes.c_long] * 9 + [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 5
     if hasattr(L, "r9k_wht_pack"):
         for n in ("r9k_wht_group", "r9k_wht_group_bytes"):
             getattr(L, n).restype = ctypes.c_int
@@ -48,6 +52,8 @@ def _lib():
         L.r9k_ar_push_2rank.restype = ctypes.c_int
         # (peer_scratch, peer_flags, flags, seq, slot16, src, nbytes, stream) + (nb, nt, drain, acq) + slot_out
         L.r9k_ar_push_2rank.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 4 + [ctypes.c_long]
+        L.r9k_ar_push_2rank_g.restype = ctypes.c_int
+        L.r9k_ar_push_2rank_g.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 4 + [ctypes.c_long, ctypes.c_int]
     return L
 
 
@@ -98,6 +104,11 @@ class R9kAllReduce:
         self._peer_scratch, self._peer_flags = ps.value, pf.value
         self._histon = os.environ.get("R9K_AR_HIST") == "1"
         self._seq = torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
+        # Every call launches max_nb blocks and advances all max_nb counters, whatever its size (blocks beyond the
+        # data blocks do nothing else): the double buffering is only valid if all blocks agree on the buffer half.
+        # With the grid following the message size, a prompt joining a batch of running decodes garbled the last
+        # sequence of the batch (kernels/r9k_ar.hip, protocol note). R9K_AR_FIXED_GRID=0 restores that for bisecting.
+        self._grid = self.max_nb if os.environ.get("R9K_AR_FIXED_GRID", "1") == "1" else 0
         # 4/2 = release store on the flag, acquire load on the poll: expresses exactly the ordering the
         # handshake needs at system scope, instead of draining everything with __threadfence_system(). Measured
         # ~54 us/call cheaper at 2 MB. R9K_AR_FENCE=drain,acq overrides for experiments (see tuning/ar_profile.py;
@@ -132,10 +143,11 @@ class R9kAllReduce:
             self._locpk = torch.empty(self._qcap, dtype=torch.uint8, device=self.device)
             self._slot = torch.zeros(1, dtype=torch.int32, device=self.device)
             # The compressed path needs EVERY block at the same double-buffer parity, because one slot index
-            # (recorded by block 0) addresses the whole payload for the separate reduce kernel. seq is per block,
-            # so a varying block count would desynchronise parities -- blocks that sat out a call lag behind.
-            # Hence: its own counter, never shared with the exact path, and a fixed block count on every call.
-            self._qseq = torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
+            # (recorded by block 0) addresses the whole payload for the separate reduce kernel. It shares the exact
+            # path's scratch, so it must share its counters too: with separate counters the two paths could pick the
+            # same half for consecutive calls. Both paths advance all max_nb counters on every call (self._grid).
+            # (R9K_AR_FIXED_GRID=0: the old separate counter, as before 2026-10-02.)
+            self._qseq = self._seq if self._grid else torch.zeros(self.max_nb, dtype=torch.int32, device=self.device)
             self._wht = True
             logger.info("r9700: r9k compressed all-reduce for messages >= %d KB (%d-bit codes, %.2f bits/elem)",
                         self._qmin >> 10, self._qbits, self._qbytes * 8.0 / self._qgroup)
@@ -177,10 +189,10 @@ class R9kAllReduce:
         n16 = x.numel() * x.element_size() // 16
         nb = max(self.min_nb, min(self.max_nb, n16 // self.words_per_block))
         nb = max(1, min(nb, n16))
-        rc = self.L.r9k_ar_oneshot_2rank(
+        rc = self.L.r9k_ar_oneshot_2rank_g(
             self._peer_scratch, self._scratch, self._peer_flags, self._flags, self._seq.data_ptr(),
             self.slot16, x.data_ptr(), out.data_ptr(), x.numel(), _DTYPE[x.dtype],
-            torch.cuda.current_stream().cuda_stream, nb, 0, self.drain, self.acq)
+            torch.cuda.current_stream().cuda_stream, nb, 0, self.drain, self.acq, self._grid)
         if rc:
             raise RuntimeError(f"r9k_ar_oneshot_2rank failed ({rc})")
         return out
@@ -199,9 +211,10 @@ class R9kAllReduce:
             raise RuntimeError(f"r9k_wht_pack failed ({rc})")
         # fixed block count (see _qseq above); the smallest compressed payload is >= 50 KB = 3200 16-byte words,
         # so max_nb blocks are always all non-empty and the kernel never clamps the count underneath us
-        rc = self.L.r9k_ar_push_2rank(
+        rc = self.L.r9k_ar_push_2rank_g(
             self._peer_scratch, self._peer_flags, self._flags, self._qseq.data_ptr(), self.slot16,
-            self._locpk.data_ptr(), pk_bytes, st, self.max_nb, 0, self.drain, self.acq, self._slot.data_ptr())
+            self._locpk.data_ptr(), pk_bytes, st, self.max_nb, 0, self.drain, self.acq, self._slot.data_ptr(),
+            self._grid)
         if rc:
             raise RuntimeError(f"r9k_ar_push_2rank failed ({rc})")
         rc = self.L.r9k_wht_reduce_at(
@@ -246,6 +259,13 @@ class R9kAllReduceN:
             if hasattr(L, fn):
                 getattr(L, fn).restype = ctypes.c_int
                 getattr(L, fn).argtypes = at
+        for fn in ("r9k_ar_oneshot_nrank_g", "r9k_ar_twoshot_nrank_g"):
+            if not hasattr(L, fn):
+                logger.warning("r9700: libr9k.so predates the fixed-grid all-reduce (%s); TP=%d stays on RCCL", fn,
+                               self.world_size)
+                return
+            getattr(L, fn).restype = ctypes.c_int
+            getattr(L, fn).argtypes = at + [ctypes.c_int]
         self.L = L
         self.device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
         torch.cuda.set_device(self.device)
@@ -271,6 +291,8 @@ class R9kAllReduceN:
         self._sp2, self._fp2 = two or (None, None)
         self._seq = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
         self._seq2 = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
+        # fixed launch grids, one per (scratch, seq) pair: see R9kAllReduce._grid and kernels/r9k_ar.hip
+        self._fixed = os.environ.get("R9K_AR_FIXED_GRID", "1") == "1"
         self.drain, self.acq = 4, 2
         if os.environ.get("R9K_AR_FENCE"):
             self.drain, self.acq = (int(v) for v in os.environ["R9K_AR_FENCE"].split(",")[:2])
@@ -348,12 +370,14 @@ class R9kAllReduceN:
         out = torch.empty_like(x)
         two = (nbytes > self.max1) if mode is None else mode == 2
         if two:
-            fn, sp, fp, seq, slot = self.L.r9k_ar_twoshot_nrank, self._sp2, self._fp2, self._seq2, self.slot2
+            fn, sp, fp, seq, slot = self.L.r9k_ar_twoshot_nrank_g, self._sp2, self._fp2, self._seq2, self.slot2
+            grid = self.max_nb2
         else:
-            fn, sp, fp, seq, slot = self.L.r9k_ar_oneshot_nrank, self._sp, self._fp, self._seq, self.slot1
+            fn, sp, fp, seq, slot = self.L.r9k_ar_oneshot_nrank_g, self._sp, self._fp, self._seq, self.slot1
+            grid = self.max_nb
         rc = fn(sp, fp, self.world_size, self.rank, seq.data_ptr(), slot, x.data_ptr(), out.data_ptr(),
                 x.numel(), _DTYPE[x.dtype], torch.cuda.current_stream().cuda_stream,
-                nb or self.nblocks(nbytes, two), nt, self.drain, self.acq)
+                nb or self.nblocks(nbytes, two), nt, self.drain, self.acq, grid if self._fixed else 0)
         if rc:
             raise RuntimeError(f"r9k_ar_{'two' if two else 'one'}shot_nrank failed ({rc})")
         return out
