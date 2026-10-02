@@ -1042,6 +1042,10 @@ temporaries. `tests/test_cache_shapes.py`: 900 eager shapes leave no buffer set 
 behind, and a captured graph replays 12 new routings equal to an eager twin. The plugin's other shape-keyed caches
 (`_MX_TABLES`, the QSA scratch, the staging area) are bounded by construction.
 
+A longer and rougher soak of the fix (16 clients for 31 minutes, prompts of 270 to 28.5k tokens, so the queue
+fills and drains continually): 291 served, 0 failed, sanity 8 / 8, VRAM at the same 31.64 GiB plateau from the
+third minute to the end.
+
 **The same soak on four cards** (TP4, everything in VRAM, the expert cache not in use): 236 served, 0 failed, 5
 rejected for length, sanity 8 / 8, VRAM flat at 31.96 GiB per card for the whole run. First long-context soak of
 the headline configuration; nothing found.

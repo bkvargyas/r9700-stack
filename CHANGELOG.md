@@ -6,6 +6,12 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-02
+
+A fix release. **If you run Flash-Next with offloaded experts (two cards), upgrade:** 0.2.1 and every earlier
+version leak VRAM under mixed-length prompts and run out of memory within minutes to hours of real traffic. Four
+cards with everything in VRAM were not affected. Speed and outputs are unchanged.
+
 ### Added
 - `bench/prefill_kinds.py` (prefill by kind of prompt) and `bench/soak.py` (mixed-length long-context soak; a
   release is now soaked on both configurations before it is tagged).
@@ -18,7 +24,8 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
   The fused LRU path kept one set of align buffers per batch shape per layer for good (28 MiB per rank at a
   4,096-token chunk), and under real traffic nearly every prefill step has a new shape. At the 0.2.1 defaults a
   15-minute soak of 18k-30k-token prompts from 8 clients took a card from 30.5 to 32.6 GiB and killed the engine
-  (77 requests served, 369 failed); fixed, the same soak serves 111 with none failed and VRAM flat at 31.0 GiB.
+  (77 requests served, 369 failed); fixed, the same soak serves 111 with none failed and VRAM flat at 31.0 GiB,
+  and a 31-minute soak from 16 clients (270 to 28.5k tokens) serves 291 with none failed.
   Present since the fused LRU path was introduced (0.1.0, 0.2.0, 0.2.1); four cards with everything in VRAM do not
   use the cache and were not affected (soaked: 236 served, 0 failed). `tests/test_cache_shapes.py`.
 - The 0.2.1 notes give Flash-Next TP2-offload prefill as 2,208-3,839 tok/s, 5-14% above 0.2.0. Both are BetterBench
@@ -146,7 +153,8 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bkvargyas/r9700-stack/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/bkvargyas/r9700-stack/releases/tag/v0.1.0
