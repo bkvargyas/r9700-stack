@@ -212,6 +212,8 @@ GPU busy against ~78 ms wall, ~1,950 launches at ~24 us of gap each. `cudagraph_
 FULL_AND_PIECEWISE so those launches survive capture; `FULL` is 55 ms *worse*. Ruled out by measurement:
 speculative decoding (helps by 37 ms), chat-template rendering, HSA_ENABLE_MWAITX, GPU_MAX_HW_QUEUES, the API
 server. Closed as upstream behaviour -- full detail and the one remaining lever in notes/picking-up.md.
+(**Reopened and root-caused 2026-10-02**, below: the eager launches were stock's chunked GDN prefill core, 48 times
+a step. Not upstream behaviour we had to accept.)
 
 Added `CGMODE=` and `MWAITX=` knobs to serve/serve.sh while investigating.
 
@@ -1219,6 +1221,75 @@ Decode is at parity. What is left: prefill (the reference chunks at 8,192 and ru
 first token (prefill graphs up to 2,048 tokens took Flash-Next from 137 to 104 ms and have not been tried here),
 concurrency, and KV capacity (ours is a fixed `KVMEM=9`; theirs is profiled at 0.95 and, by its size, 8-bit).
 
+### 2026-10-02: time to first token -- the GDN prefill core (after v0.2.2, on master)
+
+The 27B answered a short prompt in ~97 ms against the reference's 46, and on 2026-09-21 this log closed that as
+upstream behaviour. It was not. Reopened with three measurements, each narrower than the last:
+
+1. **TTFT against prompt length** (`~/pfsweep2.py`): ours 96 / 96 / 144 / 144 / 175 ms at 44 / 82 / 158 / 319 / 655
+   tokens, the reference 46 / 67 / 94 / 130 / 163. Flat in the prompt length: a fixed cost, not compute. Prefill
+   graphs up to 2,048 tokens (`CGSIZES`) moved only the 158-319 range (to 96 / 121) and cost 0.8 GiB; prefix caching
+   off changed nothing. Neither is the cause.
+2. **The server's own counters** (`bench/ttft_breakdown.py`): queue 0.0 ms, one engine iteration per request, and
+   that one step ~90 ms where a decode step is 23-28. The reference: one step, 40 ms.
+3. **A torch profile of that step with Python stacks**: 48 calls of `r9700::gdn_core`, each falling through to
+   stock's prefill core -- `fused_post_conv_prep`, the chunked delta rule (`chunk_gated_delta_rule`: cumsum, KK^T,
+   triangular solve, W/U, the state scan, the output: six Triton kernels), state gather and scatter, the gated norm.
+   ~30 launches and 1.15 ms of wall per layer in a unit bench, the same at 16 tokens and at 2,048. 48 layers: ~55
+   ms of a 97 ms step. The op runs eagerly between the pieces of the piecewise graph, so no capture size helps.
+
+**The fix** (`kernels/r9k_gdn.hip`, `r9700_vllm/models/gdn.py`): for a step with few prefill tokens, the recurrence
+token by token in one launch per layer -- `r9k_gdn_seq`, the decode kernel's loop with the state in registers,
+any number of tokens, the final state stored once -- after the causal conv in one launch, `r9k_gdn_conv`. Both read
+and write the batch's own rows through a row map, so a step that mixes prefills with running spec-decode sequences
+needs no gather either (their half goes through the same kernel in its decode form; only stock's conv update still
+gathers its input).
+
+What the unit test holds (`tests/test_gdn_prefill_r9k.py`):
+- against an fp64 token-by-token reference the output differs only in bf16 rounding flips (19-318 of 10^5-10^6
+  elements), relative error 1-6e-5; **stock's chunked form sits at 5e-3 from the same reference** (state 3e-3). The
+  chunked form does its solves on bf16 q/k; token by token in fp32 is simply closer to the definition.
+- spec-decode sequences through the new kernel are bit-identical to `r9k_gdn_decode_mtp`; row-mapped runs are
+  bit-identical to compact ones.
+- the conv is bit-identical to stock's, output and state. That took finding out what stock computes: the Triton
+  kernel multiplies bf16 by bf16, and on this backend the fp32 -> bf16 conversion inside that multiply
+  **truncates** (the final store rounds to nearest). Half the outputs differed by an ulp until the products were
+  truncated; found by enumerating the rounding choices against stock's output. Kept, because the decode-side conv
+  is the same Triton arithmetic and the two should agree.
+
+**It is not free on the GPU.** Unit bench, one sequence, Hv 24: stock 1.12 ms per layer at any length; ours 0.04 /
+0.09 / 0.24 / 0.48 / 0.95 / 1.77 ms at 16 / 45 / 128 / 256 / 512 / 1,024 tokens (~1.8 us per token; the conv 0.03-0.15
+against 0.42). In serving the crossover comes earlier than those numbers say, because stock's Python overlaps with
+GPU work already queued: the step is max(launch time, GPU time), and once it is GPU-bound our extra 0.065-0.086 ms
+per token (36 / 48 layers) is pure loss.
+
+| first token, ms (client median) | 45 | 83 | 159 | 197 | 236 | 278 | 320 | 404 | 509 | 656 tokens |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 27B TP2, stock core | 99 | 98 | 148 | | | 148 | 148 | 148 | 150 | 172 |
+| 27B TP2, ours at every length <= 512 | 49 | 61 | 81 | 85 | 92 | 122 | 128 | 142 | **161** | 172 |
+| reference stack | 46 | 68 | 93 | | | | 125 | | | 158 |
+| Flash-Next TP4, stock core | 87 | 87 | 88 | 87 | 88 | 91 | 92 | 107 | 112 | 131 |
+| Flash-Next TP4, ours <= 256 | 44 | 58 | 73 | 82 | 87 | 90 | 91 | 107 | 112 | 132 |
+| Flash-Next TP4, ours <= 512 (first try) | 46 | 60 | 74 | | | | **107** | | | 132 |
+
+So the threshold (`R9K_GDN_PREFILL_MAX`, prefill tokens per step) is 256 by default -- Flash-Next on four cards
+breaks even there -- and `serve/27b.sh` sets 400 (the 27B breaks even near 440). Flash-Next on two cards (offload,
+no prefill graphs): 52 ms at 44 tokens; above its graph limit it runs eagerly as before (177 ms at 82 tokens).
+
+Checked, in place of the release checklist (Brian's call: publish without the full suite): seven unit gates;
+strict sanity with more requests than `max_num_seqs`, 100 rounds after short prefills and 10 after long ones, on
+all three configurations, 0 bad answers of 3,850 (run at threshold 512, the wider coverage); three concurrency
+probes per launch on Flash-Next TP4 with and without (c16 884-887 against 866-880: no change -- one early probe
+that read 774 was a first-probe-after-launch number). **Not run:** GSM8K, a full BetterBench, the mixed-length soak.
+The smoke test earned its keep once: with speculative decoding the conv state is wider than the conv's three
+columns (the conv update's rolling window lives in the same tensor), the wrapper asserted exactly three, and the
+server died at warm-up. The unit test now has that case.
+
+What is left in a short first step (profile with stacks, 27B, 45 tokens, so every number is inflated ~1.7x):
+GDN metadata built once per KV-cache group, 11 times, 14 ms (stock; the reference patches vLLM to share it); the
+GDN layers still 0.6 ms each, most of it stock's conv launcher at the time (since replaced); the KV-cache update of
+the 16 attention layers 6 ms; the drafter 4 ms.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
@@ -1230,10 +1301,17 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
 4. Compressed all-reduce: pipelining message halves across the local link and the uplink (~5% long prefill).
 5. Prefill tail, each ~1% of a chunk: `hc_gate_mix`, a WMMA fp8-block GEMM for prefill widths, the `copyBuffer`
    device copies and the stock per-token quant of the block GEMM.
+6. **First step, what is left** (2026-10-02): take the gated norm out of the token loop of `r9k_gdn_seq` (three
+   block syncs per token; a second pass over the tokens needs none) -- a faster token would move the threshold
+   past 256 / 400 and reach the 300-1,000-token prompts, where the 27B still trails the reference by 5-10%; the
+   GDN metadata built once per KV group (stock, ~14 ms of a profiled step); the conv update in mixed steps.
+7. **`UTIL=0.96` on two cards**: rejected on 2026-10-01 because of the allocation the short-conv fix later
+   removed. Not retested since.
 
 ### Open questions for Brian
-- v0.2.2 (the all-reduce race, the expert-cache leak, the short-conv packing) is committed locally; pushing and
-  publishing it is Brian's call.
+- The short-prefill GDN core is on master without the release checklist (2026-10-02, Brian: no full validation
+  for this push). Before it is tagged: GSM8K on the full set (short prompts now take a numerically different, more
+  exact path), a full BetterBench on the three configurations, the mixed-length soak.
 - The published v0.2.0 and v0.2.1 notes say nothing of either bug. Edit them on GitHub, or let v0.2.2's notes
   carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a

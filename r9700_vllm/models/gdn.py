@@ -18,6 +18,18 @@ MTP decode core (kernels/r9k_gdn.hip r9k_gdn_decode_mtp): stock's fused CUDA op 
 per layer (b/a contiguous, zeros, q/k/v cat, output copy, gated norm). Ours: the layer's forward becomes
 in_proj -> torch.ops.r9700.gdn_core (conv update + one fused gating/recurrence/norm launch when the batch is pure
 spec decode, stock's core + norm otherwise) -> out_proj. R9K_GDN_DECODE=stock keeps vLLM's forward.
+
+Short prefills (kernels/r9k_gdn.hip r9k_gdn_seq): a prefill step runs this op eagerly between the pieces of a
+piecewise graph, and stock's prefill core is the chunked delta rule -- six Triton kernels plus prep, state
+gather/scatter and the norm, ~30 launches and ~1.3 ms of Python per layer whatever the prompt length. On the 27B
+(48 GDN layers) that is ~60 of the ~97 ms a 45-token prompt waits for its first token, and the same stall for
+every running request when a new one joins the batch. For steps with at most R9K_GDN_PREFILL_MAX prefill tokens
+(default 256, serve/27b.sh sets 400; 0 = stock) the core is the token-by-token recurrence in one launch -- the
+same recurrence decode uses, so a short prompt goes through the arithmetic its later tokens will -- after the
+causal conv in one launch (r9k_gdn_conv, bit-identical to stock's Triton kernel; R9K_GDN_PREFILL_CONV=stock keeps
+the Triton one). Longer steps keep the chunked form: token by token costs the GPU ~1.8 us per token and layer,
+more than the chunked kernels, so past ~240 tokens (Flash-Next TP4) to ~440 (the 27B) the step is GPU-bound and
+the chunked form wins again.
 """
 from __future__ import annotations
 
@@ -39,6 +51,8 @@ logger = init_logger("vllm." + __name__)
 MAX_SPEC_TOKENS = 8            # per sequence (num_spec + 1); stock's MAX_FUSED_GDN_MTP_TOKENS
 DEBUG = os.environ.get("R9K_GDN_DEBUG", "0") == "1"   # per-stage syncs + host range checks (slow; diagnosis only)
 FUSED = os.environ.get("R9K_GDN_FUSED", "1") == "1"   # 0: always stock's core + norm inside the op (diagnosis)
+PREFILL_MAX = int(os.environ.get("R9K_GDN_PREFILL_MAX", "256") or 0)   # prefill tokens per step; 0 = stock's chunked core
+CONV = os.environ.get("R9K_GDN_PREFILL_CONV", "r9k") != "stock"         # the conv in front of it: ours, or stock's Triton
 _L = None
 _OPS_DONE = False
 
@@ -51,6 +65,13 @@ def lib():
         L.r9k_gdn_decode_mtp.restype = ctypes.c_int
         L.r9k_gdn_decode_mtp.argtypes = [ctypes.c_long] * 15 + [ctypes.c_int] + [ctypes.c_long] * 2 + [ctypes.c_int] + \
             [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_float] * 2 + [ctypes.c_int] + [ctypes.c_long]
+        if hasattr(L, "r9k_gdn_seq"):
+            L.r9k_gdn_seq.restype = ctypes.c_int
+            L.r9k_gdn_seq.argtypes = [ctypes.c_long] * 15 + [ctypes.c_int] + [ctypes.c_long] * 6 + \
+                [ctypes.c_int] * 5 + [ctypes.c_float] * 2 + [ctypes.c_int] * 2 + [ctypes.c_long]
+        if hasattr(L, "r9k_gdn_conv"):
+            L.r9k_gdn_conv.restype = ctypes.c_int
+            L.r9k_gdn_conv.argtypes = [ctypes.c_long] * 15 + [ctypes.c_int] * 2 + [ctypes.c_long]
         _L = L
     return _L
 
@@ -87,6 +108,142 @@ def decode_mtp(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, A_log:
                            f"Hk={Hk} Hv={Hv}")
 
 
+def seq_available() -> bool:
+    try:
+        return hasattr(lib(), "r9k_gdn_seq")
+    except Exception:
+        return False
+
+
+def seq_core(mixed_qkv: torch.Tensor, b: torch.Tensor, a: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor,
+             w: torch.Tensor, z: torch.Tensor, out: torch.Tensor, state: torch.Tensor, idx: torch.Tensor,
+             cu: torch.Tensor, Hk: int, Hv: int, scale: float, eps: float, *, acc: torch.Tensor | None = None,
+             hasinit: torch.Tensor | None = None, rowmap: torch.Tensor | None = None, zero_from: int | None = None,
+             gate_sigmoid: bool = False) -> None:
+    """The recurrence + gated norm for N sequences of any length, one launch (kernels/r9k_gdn.hip r9k_gdn_seq).
+    acc None -> prefill sequences: idx [N] int32 (any stride) is each sequence's state slot, read when hasinit[n]
+    (bool [N]; None = always) and written with the final state. acc [N] -> spec-decode sequences, as decode_mtp
+    (idx [N, S]). mixed_qkv rows are the sequences back to back (cu [N + 1] int32); b, a, z, out are indexed by
+    rowmap[row] (int64 [cu[N]]) -- the batch's own row order -- or by the same row when rowmap is None. Rows
+    zero_from.. of out are zeroed (None: nothing)."""
+    N = cu.shape[0] - 1
+    spec = acc is not None
+    assert mixed_qkv.dtype == torch.bfloat16 and mixed_qkv.stride(1) == 1 and z.stride(1) == 1 and out.stride(1) == 1
+    assert state.dtype in (torch.float32, torch.bfloat16) and state.stride(-1) == 1
+    assert idx.dtype == torch.int32 and cu.dtype == torch.int32 and cu.is_contiguous() and idx.shape[0] >= N
+    assert A_log.dtype == torch.float32 and w.dtype == torch.float32
+    if spec:
+        assert acc.dtype == torch.int32 and acc.is_contiguous() and idx.dim() == 2 and idx.stride(1) == 1
+    else:
+        assert idx.dim() == 1 and (hasinit is None or (hasinit.dtype == torch.bool and hasinit.is_contiguous()
+                                                       and hasinit.shape[0] >= N))
+    if rowmap is not None:
+        rowmap = rowmap.to(torch.int64).contiguous()
+    rows = out.shape[0]
+    rc = lib().r9k_gdn_seq(mixed_qkv.data_ptr(), mixed_qkv.stride(0), b.data_ptr(), b.stride(0), a.data_ptr(),
+                           a.stride(0), A_log.data_ptr(), dt_bias.data_ptr(), w.data_ptr(), z.data_ptr(), z.stride(0),
+                           out.data_ptr(), out.stride(0), state.data_ptr(), state.stride(0),
+                           1 if state.dtype == torch.float32 else 0, idx.data_ptr(), idx.stride(0), cu.data_ptr(),
+                           acc.data_ptr() if spec else 0, hasinit.data_ptr() if hasinit is not None else 0,
+                           rowmap.data_ptr() if rowmap is not None else 0, N, Hk, Hv,
+                           rows if zero_from is None else int(zero_from), rows, float(scale), float(eps),
+                           1 if gate_sigmoid else 0, 1 if spec else 0, torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_gdn_seq failed ({rc}) N={N} spec={spec} rows={rows} Hk={Hk} Hv={Hv}")
+
+
+def conv_prefill(x: torch.Tensor, C: int, L: int, weight: torch.Tensor, conv_state: torch.Tensor, idx: torch.Tensor,
+                 cu: torch.Tensor, hasinit: torch.Tensor | None = None, rowmap: torch.Tensor | None = None
+                 ) -> torch.Tensor:
+    """[L, C] bf16 <- silu(causal conv) of the prefill sequences in x[:, :C], conv state updated in place: stock's
+    causal_conv1d_fn in one HIP launch (kernels/r9k_gdn.hip r9k_gdn_conv). x rows are the batch's own rows
+    (rowmap[i] int64 is the x row of output row i; None = the same row); weight [C, 4] bf16; conv_state
+    [lines, C, >= 3] bf16 in either layout (dim-first, or the transposed view of the other) -- the first three
+    columns are the prefill history, as in stock; with speculative decoding the state is wider (the conv update's
+    rolling window) and the rest is left alone; idx [N] int32 state slots; cu [N + 1] int32; hasinit [N] bool."""
+    N = cu.shape[0] - 1
+    assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.shape[1] >= C
+    assert weight.dtype == torch.bfloat16 and weight.shape == (C, 4) and weight.stride(1) == 1
+    assert conv_state.dtype == torch.bfloat16 and conv_state.shape[1] == C and conv_state.shape[2] >= 3
+    assert idx.dtype == torch.int32 and idx.dim() == 1 and idx.shape[0] >= N and cu.dtype == torch.int32
+    assert cu.is_contiguous() and (hasinit is None or (hasinit.dtype == torch.bool and hasinit.is_contiguous()))
+    if rowmap is not None:
+        rowmap = rowmap.to(torch.int64).contiguous()
+    out = torch.empty((L, C), dtype=torch.bfloat16, device=x.device)
+    rc = lib().r9k_gdn_conv(x.data_ptr(), x.stride(0), weight.data_ptr(), weight.stride(0), conv_state.data_ptr(),
+                            conv_state.stride(0), conv_state.stride(1), conv_state.stride(2), out.data_ptr(), C,
+                            idx.data_ptr(), idx.stride(0), hasinit.data_ptr() if hasinit is not None else 0,
+                            cu.data_ptr(), rowmap.data_ptr() if rowmap is not None else 0, N, C,
+                            torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_gdn_conv failed ({rc}) N={N} C={C} L={L}")
+    return out
+
+
+def _params(self):
+    p = self.__dict__.get("_r9k_gdn_params")
+    if p is None:
+        p = (self.A_log.detach().float().contiguous(), self.dt_bias.detach().float().contiguous(),
+             self.norm.weight.detach().float().contiguous())
+        self.__dict__["_r9k_gdn_params"] = p
+    return p
+
+
+def _prefill_ok(self, md) -> bool:
+    return (PREFILL_MAX > 0 and md.num_prefills > 0 and md.num_decodes == 0
+            and md.num_prefill_tokens <= PREFILL_MAX and md.prefill_state_indices is not None
+            and md.prefill_query_start_loc is not None and md.has_initial_state is not None
+            and (md.spec_sequence_masks is None or (md.spec_state_indices_tensor is not None
+                                                    and md.num_accepted_tokens is not None
+                                                    and md.spec_state_indices_tensor.size(1) <= MAX_SPEC_TOKENS))
+            and self.kv_cache[1].dtype in (torch.float32, torch.bfloat16) and seq_available())
+
+
+def _prefill(self, md, qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, qkv_size: int, Hv: int) -> None:
+    """A step with short prefills: the conv (which also moves the conv state), then one launch for the core + norm
+    of the prefill sequences -- and, when running spec-decode sequences share the step, stock's conv update and a
+    second launch for theirs. Every launch of ours reads and writes at the batch's own rows, so only the conv
+    update's input is gathered."""
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+    from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_fn, causal_conv1d_update
+    logger.info_once("r9700: GDN short-prefill core on r9k_gdn_seq (steps with <= %d prefill tokens: conv + one "
+                     "recurrence/norm launch per layer)", PREFILL_MAX)
+    A_log, dt_bias, w = _params(self)
+    n_act = md.num_actual_tokens
+    conv_state = self.kv_cache[0] if is_conv_state_dim_first() else self.kv_cache[0].transpose(-1, -2)
+    conv_weights = self.conv1d.weight.view(self.conv1d.weight.size(0), self.conv1d.weight.size(2))
+    b, a = self.split_ba(ba)
+    z, state = qkvz[:, qkv_size:], self.kv_cache[1]
+    Hk, scale, eps = self.num_k_heads // self.tp_size, self.head_k_dim ** -0.5, self.layer_norm_epsilon
+    gs = self.norm.activation == "sigmoid"
+    x = qkvz[:n_act, :qkv_size]
+    spec = md.spec_sequence_masks is not None
+    rowmap = md.non_spec_token_indx if spec else None
+    if CONV and conv_state.dtype == torch.bfloat16 and conv_weights.dtype == torch.bfloat16 \
+            and conv_weights.size(1) == 4 and hasattr(lib(), "r9k_gdn_conv"):
+        mixed = conv_prefill(qkvz, qkv_size, md.num_prefill_tokens, conv_weights, conv_state,
+                             md.non_spec_state_indices_tensor, md.non_spec_query_start_loc,
+                             hasinit=md.has_initial_state, rowmap=rowmap)
+    else:
+        xn = x.index_select(0, rowmap) if spec else x
+        mixed = causal_conv1d_fn(xn.transpose(0, 1), conv_weights, self.conv1d.bias, activation=self.activation,
+                                 conv_states=conv_state, has_initial_state=md.has_initial_state,
+                                 cache_indices=md.non_spec_state_indices_tensor,
+                                 query_start_loc=md.non_spec_query_start_loc, metadata=md).transpose(0, 1)
+    seq_core(mixed, b, a, A_log, dt_bias, w, z, out, state, md.prefill_state_indices, md.prefill_query_start_loc,
+             Hk, Hv, scale, eps, hasinit=md.prefill_has_initial_state, rowmap=rowmap,
+             zero_from=n_act if spec else md.num_prefill_tokens, gate_sigmoid=gs)
+    if not spec:
+        return
+    N = md.num_spec_decodes
+    idx, cu, acc = md.spec_state_indices_tensor, md.spec_query_start_loc, md.num_accepted_tokens
+    ms = causal_conv1d_update(x.index_select(0, md.spec_token_indx), conv_state, conv_weights, self.conv1d.bias,
+                              self.activation, conv_state_indices=idx[:, 0][:N], num_accepted_tokens=acc,
+                              query_start_loc=cu, max_query_len=idx.size(-1), validate_data=False)
+    seq_core(ms, b, a, A_log, dt_bias, w, z, out, state, idx[:N], cu[: N + 1], Hk, Hv, scale, eps, acc=acc[:N],
+             rowmap=md.spec_token_indx, gate_sigmoid=gs)
+
+
 def _fused_ok(self, md) -> bool:
     idx = md.spec_state_indices_tensor
     return (md.spec_sequence_masks is not None and md.num_prefills == 0 and md.num_decodes == 0
@@ -97,7 +254,8 @@ def _fused_ok(self, md) -> bool:
 
 def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name: LayerNameType) -> None:
     """out [T, Hv * 128] bf16 <- norm(core(conv(qkvz), ba), z): one fused launch after the conv update for a pure
-    spec-decode batch; stock's core + gated norm otherwise (prefill, mixed batches, warmup without metadata)."""
+    spec-decode batch; one (two with spec-decode sequences aboard) after stock's conv for a step with short prefills;
+    stock's core + gated norm otherwise (long prefills, non-spec decodes, warmup without metadata)."""
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import GDNAttentionMetadata
     from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
     from vllm.model_executor.layers.mamba.ops.causal_conv1d import causal_conv1d_update
@@ -110,11 +268,7 @@ def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name
     qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
     Hv, D = self.num_v_heads // self.tp_size, self.head_v_dim
     if FUSED and md is not None and isinstance(md, GDNAttentionMetadata) and _fused_ok(self, md):
-        p = self.__dict__.get("_r9k_gdn_params")
-        if p is None:
-            p = (self.A_log.detach().float().contiguous(), self.dt_bias.detach().float().contiguous(),
-                 self.norm.weight.detach().float().contiguous())
-            self.__dict__["_r9k_gdn_params"] = p
+        p = _params(self)
         N, n_act = md.num_spec_decodes, md.num_actual_tokens
         idx, cu, acc = md.spec_state_indices_tensor, md.spec_query_start_loc, md.num_accepted_tokens
         conv_state = self.kv_cache[0] if is_conv_state_dim_first() else self.kv_cache[0].transpose(-1, -2)
@@ -137,6 +291,9 @@ def gdn_core(qkvz: torch.Tensor, ba: torch.Tensor, out: torch.Tensor, layer_name
         if dbg:
             torch.cuda.synchronize()
             logger.info("r9700 gdn debug %s: kernel ok", self.prefix)
+        return
+    if FUSED and md is not None and isinstance(md, GDNAttentionMetadata) and _prefill_ok(self, md):
+        _prefill(self, md, qkvz, ba, out, qkv_size, Hv)
         return
     dbg = DEBUG and not torch.cuda.is_current_stream_capturing()
     if dbg:

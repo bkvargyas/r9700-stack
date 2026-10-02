@@ -18,6 +18,9 @@ exec env \
   `# R9K_R4D_AR=0 puts the all-reduce on RCCL. See notes/independence.md.` \
   VLLM_KV_CACHE_LAYOUT=LBHNC `   # libr4d paged attention needs contiguous per-head slots (serve.sh sets this for ATTN=CUSTOM anyway)` \
   KVMEM=9 `                      # fixed KV budget: vLLM's estimate OOMs once load-time requant is on` \
+  R9K_GDN_PREFILL_MAX=${R9K_GDN_PREFILL_MAX-400} `# token-by-token GDN prefill core for steps up to 400 prefill tokens
+                                 # (plugin default 256): on this model it beats the chunked form up to ~440
+                                 # (first token at 45 / 159 / 320 tokens: 97 / 147 / 148 -> 47 / 81 / 128 ms)` \
   MODEL=/models/Qwen3.8-27B-NVFP4 OFFLOAD_GB=0 MTP= \
   DRAFT=/models/Qwen3.8-27B-DFlash2-FP8 SPEC=7 `# DFlash2 speculative decoding: ~3x` \
   ATTN=CUSTOM DRAFT_ATTN=CUSTOM `# libr4d prefill attention + split-KV verify` \

@@ -6,6 +6,50 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [Unreleased]
 
+On master, not tagged. Checked with the unit tests and a smoke test on the three configurations (below), **not**
+with the release checklist: no quality eval, no full BetterBench, no long soak yet.
+
+### Changed
+- **Time to first token on short prompts: about half.** A prefill step ran vLLM's chunked GDN core eagerly in every
+  GDN layer -- six Triton kernels plus glue, ~30 launches and ~1.2 ms of Python per layer whatever the prompt
+  length: 48 layers on the 27B, ~60 of the ~97 ms a short prompt waited. Steps with few prefill tokens now run the
+  recurrence token by token in one launch per layer (`r9k_gdn_seq`, the arithmetic decode already uses) after the
+  causal conv in one launch (`r9k_gdn_conv`, bit-identical to stock's). Client-side median, one request at a time:
+
+  | prompt tokens | 45 | 83 | 159 | 236 | 320 | 404 | 656 |
+  |---|--:|--:|--:|--:|--:|--:|--:|
+  | 27B, two cards: v0.2.2 | 97 ms | 96 | 147 | ~147 | 148 | 148 | 172 |
+  | 27B, two cards: now | **47** | **60** | **81** | **92** | **128** | 142 | 172 |
+  | reference stack, same cards | 46 | 68 | 93 | | 125 | | 158 |
+  | Flash-Next, four cards: v0.2.2 | 87 | 87 | 88 | 88 | 92 | 107 | 131 |
+  | Flash-Next, four cards: now | **44** | **58** | **73** | 87 | 91 | 107 | 132 |
+
+  The same step is what every running request waits through when a new one joins the batch. Token by token is
+  slower on the GPU than the chunked form (~1.8 us per token and layer), so it only pays while the step is bound
+  by launches rather than compute: `R9K_GDN_PREFILL_MAX` (prefill tokens per step) defaults to 256, where
+  Flash-Next on four cards breaks even, and `serve/27b.sh` sets 400 (the 27B breaks even near 440). `=0` restores
+  vLLM's core; `R9K_GDN_PREFILL_CONV=stock` keeps its conv. Decode, long-prompt prefill and memory are unchanged;
+  an older `libr9k.so` without the two symbols simply keeps the chunked core.
+- Output for prompts under the threshold is no longer bit-identical to v0.2.2: the token-by-token fp32 recurrence
+  is ~300x closer to an fp64 reference than the chunked bf16 form it replaces (relative error 2e-5 against 5e-3),
+  which changes low-order bits of the hidden state and so, now and then, a token.
+
+### Added
+- `tests/test_gdn_prefill_r9k.py`: the new core against an fp64 token-by-token reference (and stock's distance to
+  the same reference), row-mapped runs bit-identical to compact ones, spec-decode sequences bit-identical to
+  `r9k_gdn_decode_mtp`, the conv bit-identical to stock's output and state in every layout.
+- `bench/ttft_breakdown.py`: time to first token by prompt length next to the server's own queue / prefill /
+  iteration counters -- the measurement that showed one 90 ms engine step and nothing else.
+
+### Checked
+- Unit gates: the new test, `test_gdn_decode_r9k.py`, `test_gdn_merge.py`, `test_moe_mxfp4.py`, `test_cache_moe.py`,
+  `test_gemm_fp8.py`, `test_ple_conv.py`.
+- Strict sanity with more requests than `max_num_seqs` (so prefills keep joining running batches), after short and
+  after long prefills: 0 bad answers of 3,850 across the 27B, Flash-Next on four cards and Flash-Next on two.
+  (Run with the threshold at 512, which sends more steps down the new path than the shipped 256 / 400.)
+- Concurrency probes on Flash-Next four cards, three per launch, with and without: 884-887 against 866-880 tok/s
+  at 16 -- no change. The 27B has no like-for-like pair yet (527-534 tok/s at 8 with; one probe without).
+
 ## [0.2.2] - 2026-10-02
 
 A fix release. Three bugs, all present since 0.1.0, all invisible to fixed-depth benchmarks and to evals at

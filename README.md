@@ -137,8 +137,14 @@ known alternative stack for this model.
 | concurrency 1 / 2 / 4 / 8 (aggregate tok/s) | 174 / 280 / 413 / 519 | 180 / 303 / 428 / 558 | 97% / 92% / 96% / 93% |
 | KV cache | 211k tokens | 799k tokens | |
 
-Decode is at parity; prefill, time to first token and KV capacity are where the work is (the reference prefills
-in 8,192-token chunks and keeps an 8-bit KV cache).
+Decode is at parity; prefill and KV capacity are where the work is (the reference prefills in 8,192-token chunks
+and keeps an 8-bit KV cache).
+
+**Time to first token has since been fixed on master** (after v0.2.2, not yet in a release): a short prompt's
+first token went from 97 to 47 ms, against the reference's 46 -- and from 87 to 44 ms for Flash-Next on four
+cards. The cause was vLLM's chunked GDN prefill core running eagerly in every GDN layer; short prefills now take
+one launch per layer. Measured per request with `bench/ttft_breakdown.py`, not yet with a full BetterBench; see
+the [changelog](CHANGELOG.md).
 
 Quality: GSM8K, full 1,319-question test set, greedy, concurrency 1 — **94.4–95.5%** depending on configuration,
 with no statistically detectable difference between them (paired McNemar).
