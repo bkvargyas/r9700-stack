@@ -11,6 +11,13 @@ the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would 
 again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
 [PROGRESS.md](PROGRESS.md).
 
+**Current release: [v0.2.2](notes/release-v0.2.2.md) (2026-10-02). If you run an earlier one, upgrade.** v0.2.2
+changes no benchmark number; it fixes three bugs that are in every earlier release and that only show under real
+traffic: on two cards, one sequence could turn to garbage when a request joined a batch that was already decoding
+(a race in the all-reduce kernel); Flash-Next with offloaded experts leaked VRAM under mixed-length prompts until it
+ran out; and Flash-Next ran out of memory when one step held prompts of very different lengths, four cards first.
+See [Stability](#stability-what-a-release-is-checked-against) for what a release is now put through.
+
 **Built for stock upstream releases.** It targets **released vLLM** and **ROCm 10 or newer**, unmodified — no
 fork, no patched source, no vendored binaries. Everything loads as a plugin at runtime through vLLM's own
 extension points (quantization config, model registry, platform plugin, attention backend, custom ops), so you
@@ -44,7 +51,7 @@ Flash-Next (the MoE + Gated DeltaNet model, MXFP4/fp8 GPTQ checkpoint), tensor-p
 225 W cap, full BetterBench (20 passes), MTP-3 speculative decoding on both stacks. The reference column is the
 fastest known alternative stack for this model on **the same box, the same checkpoint and the same power cap**.
 
-| | this stack (v0.2.0) | reference stack | |
+| | this stack | reference stack | |
 |---|--:|--:|--:|
 | single-stream decode | **159.2 tok/s** | 134.1 | **+19%** |
 | decode step p50 | **16.8 ms** | 20.4 ms | **-18%** |
@@ -52,8 +59,11 @@ fastest known alternative stack for this model on **the same box, the same check
 | prefill 2k / 8k / 16k / 32k (tok/s) | **6,408 / 7,365 / 7,451 / 7,182** | 5,279 / 5,711 / 5,977 / 6,106 | **+21% / +29% / +25% / +18%** |
 | concurrency 1 / 2 / 4 / 8 / 16 (aggregate tok/s) | **151 / 231 / 350 / 478 / 635** | 126 / 197 / 303 / 427 / 542 | **+20% / +17% / +16% / +12% / +17%** |
 
-v0.2.1 changes nothing on this path: with everything in VRAM the expert cache is not in use, and the numerics are
-those of v0.2.0.
+The table is the v0.2.0 measurement against the reference. v0.2.2 on the same box, same settings: 157.3-159.2
+tok/s, step 16.8 ms, first token 97-100 ms, prefill 6,476 / 7,348 / 7,445 / 7,180, concurrency 151 / 239 / 355 /
+473 / 624 -- the same numbers to within the run-to-run band, and unlike v0.2.0 it survives 24 clients sending
+prompts of 200 to 30k tokens (450 requests in 15 minutes, none failed, 30.2 of 32.6 GiB at the peak; the code
+before v0.2.2 ran out of memory about a minute into that).
 
 Where it came from, in one line each: prefill from an MXFP4×FP8 MoE GEMM with the per-row scales in LDS, a
 WMMA scorer for the sparse-attention indexer that only touches the visible columns, and a compressed 4-rank
@@ -74,10 +84,10 @@ individually (`R9K_*=stock`).
 
 The two-card way to run Flash-Next: the routed experts stream from pinned host memory through the plugin's LRU
 expert cache (34 GB per rank offloaded, 270 expert slots per layer resident), so the model fits two cards with
-room for a 120k-token KV cache. Full BetterBench (20 passes), v0.2.1 defaults, measured 2026-09-29 on one card per
-PLX switch:
+room for a 120k-token KV cache. Full BetterBench (20 passes), measured on one card per PLX switch; v0.2.2 has
+v0.2.1's defaults and re-measured at the same numbers (97.4 tok/s, 25.6 ms, 483 ms, 87 / 109 / 116 / 116 / 116):
 
-| | v0.2.1 | v0.2.0 |
+| | v0.2.1 and v0.2.2 | v0.2.0 |
 |---|--:|--:|
 | single-stream decode | **97.4 tok/s** | 93.8 |
 | decode step p50 | 25.6 ms | 25.7 ms |
@@ -99,7 +109,7 @@ narrow that gap without any code change.
 **Prefill here depends on the prompt.** BetterBench's prefill filler is one paragraph's words shuffled, which routes
 to few enough experts for the cache to follow; real text does not. Measured on the same server, real documents
 prefill at about **2,300-2,600 tok/s** (8k-26k tokens) against 3,650 for the filler, and that figure is the same on
-v0.2.0 and v0.2.1: the prefill gain in the table is a gain on narrow prompts (`bench/prefill_kinds.py`).
+every version: the prefill gain in the table is a gain on narrow prompts (`bench/prefill_kinds.py`).
 
 Two operational notes: **restart once after the first launch of a new configuration** (the launch that compiles
 leaves ~0.45 GiB less for the KV pool: 94k against 121k tokens), and pass `NSEQ=16` for four cards
@@ -113,49 +123,49 @@ configuration measured 81 tok/s single-stream, 54 at eight streams and 1,379 tok
 
 ### Qwen3.8-27B-NVFP4, 2× R9700 (TP2)
 
-Measured with
-BetterBench 0.6.0 (29 prompts across 8 categories, 20 passes each) on the shipped default
-configuration — our own attention and all-reduce kernels, nothing third-party loaded.
+The shipped default configuration (`serve/27b.sh`): our own attention and all-reduce kernels, nothing third-party
+loaded. Both columns were measured **on the same day (2026-10-02), on the same two cards, checkpoint and power
+cap**, each with a full BetterBench (29 prompts across 8 categories, 20 passes); the right-hand one is the fastest
+known alternative stack for this model.
 
-The right-hand column is the fastest known alternative stack for this model, measured on **the same box, the
-same checkpoint and the same power cap**, so the comparison is like-for-like.
-
-**Decode**
-
-| | this stack | reference stack | |
+| | this stack (v0.2.2) | reference stack | |
 |---|--:|--:|--:|
-| combined (weighted across categories) | **184.8 tok/s** | 196.5 | 94% |
-| update p99 | 26.2 ms | 24.2 ms | |
-| TTFT p50 | 103 ms | 65 ms | |
+| single-stream decode | **197.5 tok/s** | 197.5 | 100% |
+| decode step p50 | 23.5 ms | 23.2 ms | |
+| time to first token p50 | 114 ms | 65 ms | |
+| prefill 2k / 8k / 16k / 32k (tok/s) | 4,190 / 4,191 / 4,072 / 3,837 | 4,780 / 4,947 / 4,903 / 4,746 | 88% / 85% / 83% / 81% |
+| concurrency 1 / 2 / 4 / 8 (aggregate tok/s) | 174 / 280 / 413 / 519 | 180 / 303 / 428 / 558 | 97% / 92% / 96% / 93% |
+| KV cache | 211k tokens | 799k tokens | |
 
-**Concurrency** (aggregate tok/s)
-
-| level | this stack | reference stack | |
-|--:|--:|--:|--:|
-| 1 | **166.1** | 176.8 | 94% |
-| 2 | **269.5** | 294.4 | 92% |
-| 4 | **393.7** | 427.9 | 92% |
-| 8 | **520.9** | 549.1 | 95% |
-
-**Prompt processing** (prefill, tok/s median, cold prefix cache)
-
-| depth | this stack | reference stack | |
-|--:|--:|--:|--:|
-| 2k | **4,099** | 4,776 | 86% |
-| 8k | **4,143** | 4,950 | 84% |
-| 16k | **4,043** | 4,906 | 82% |
-| 32k | **3,809** | 4,745 | 80% |
+Decode is at parity; prefill, time to first token and KV capacity are where the work is (the reference prefills
+in 8,192-token chunks and keeps an 8-bit KV cache).
 
 Quality: GSM8K, full 1,319-question test set, greedy, concurrency 1 — **94.4–95.5%** depending on configuration,
 with no statistically detectable difference between them (paired McNemar).
 
-**Prefill is where the gap lives, and it is a deliberate trade.** The default configuration uses our own
-all-reduce so that nothing unlicensed is loaded at runtime; that costs about 6% of prefill against the
-third-party one. Setting `R9K_AR_IMPL=r4d R9K_PAGED_ATTN=r4d` recovers it (~4,400 tok/s at 8k) if you have that
-library and would rather have the speed. Beyond that, large-message all-reduce on this host is bandwidth-bound
-on a PCIe 3 link at ~13.7 GB/s, which is the practical ceiling.
+**Part of the prefill gap is a deliberate trade.** The default configuration uses our own all-reduce so that
+nothing unlicensed is loaded at runtime; that costs about 6% of prefill against the third-party one. Setting
+`R9K_AR_IMPL=r4d R9K_PAGED_ATTN=r4d` recovers it if you have that library and would rather have the speed. Beyond
+that, large-message all-reduce on this host is bandwidth-bound on a PCIe 3 link at ~13.7 GB/s, which is the
+practical ceiling.
 
 [PROGRESS.md](PROGRESS.md) has every number, how it was produced, and what was tried and rejected.
+
+### Stability: what a release is checked against
+
+Benchmarks measure speed. They did not notice that three releases produced wrong output for some requests and ran
+out of memory under real traffic, because every check ran at fixed prompt lengths and at or below the sequence
+limit. Since v0.2.2 a release is tagged only after, on **every** configuration above and on the exact release code:
+
+| check | passes when | v0.2.2 |
+|---|---|---|
+| unit gates and all-reduce suites (`tests/`) | all pass | 26 + 5 |
+| strict sanity under overload (`bench/sanity_stress.py`, more requests than `max_num_seqs`) | no bad answer | 0 of 9,500 |
+| mixed-length soak (`bench/soak.py`, 12-24 clients, prompts of 200 to 30k tokens, 15-26 minutes) | nothing fails, VRAM levels off | 1,077 served, 0 failed; peaks 30.9 / 30.2 / 32.5 of 32.6 GiB |
+| strict sanity right after long prompts | no bad answer | 0 of 480 |
+| full BetterBench | within noise of the release before | yes, all three |
+
+The commands are in [notes/picking-up.md](notes/picking-up.md).
 
 ### About the 225 W power cap
 
@@ -187,7 +197,9 @@ GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 serve/flashnext.sh   # Flash-Next on 4 GPUs, ever
 Both are thin wrappers over `serve/serve.sh` and every tuning knob in them is commented with what it was measured
 to be worth. `DRYRUN=1` prints the docker command without starting anything.
 
-An OpenAI-compatible endpoint comes up on `:8080`.
+An OpenAI-compatible endpoint comes up on `:8080`. After upgrading, rebuild the kernel library
+(`kernels/build.sh`): the plugin refuses a `libr9k.so` from before v0.2.2. On a first launch of a new configuration,
+restart once (the launch that compiles gets a smaller KV pool).
 
 ## What's in it
 
@@ -201,6 +213,8 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 - **`serve/`** — launchers, with measured knobs.
 - **`tests/`** — correctness gates. Each kernel is checked against a reference implementation, and several are
   checked to be *bit-identical* to the path they replace.
+- **`bench/`** — the serving-level checks: quality evals (`eval.py`), the strict overload sanity
+  (`sanity_stress.py`), the mixed-length soak (`soak.py`), throughput by workload mix and by kind of prompt.
 - **`tuning/`** — the benchmark harnesses used to pick tile configurations.
 - **`host/`** — Proxmox host setup: 32 GB BARs for cards behind the PLX switches, including a second card on the
   same switch (DKMS kernel module + barfix script + VM hookscript).
@@ -210,6 +224,8 @@ An OpenAI-compatible endpoint comes up on `:8080`.
 
 | file | what it's for |
 |---|---|
+| [CHANGELOG.md](CHANGELOG.md) | What changed in each release. |
+| [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | The current release: the three bugs it fixes, how they were found, and its validation. |
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |
 | [host/README.md](host/README.md) | Host PCIe setup: why a second card on one PLX switch gets no BAR, and the fix. |
