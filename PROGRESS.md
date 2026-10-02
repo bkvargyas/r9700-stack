@@ -1176,6 +1176,31 @@ with 69 MiB free). Every release has had it -- through vLLM's own method in v0.1
 v0.2.0 -- on any configuration; four cards at 16 running sequences reach it first because they admit the most
 prefills per step.
 
+### 2026-10-02: v0.2.2 validated -- the checks every release gets from now on
+
+On the release code (151 source files checksummed against the commit), every configuration: the 26 single-GPU gates
+and the all-reduce suites (`test_ar_race` on both card pairs, `test_ar_r9k`, `test_ar_nrank`, `test_ar4`); then per
+configuration a full BetterBench (20 passes), the 8-way sanity, the strict stress at more requests than
+`max_num_seqs`, a mixed-length soak with VRAM at 1 Hz, and the strict stress after long prompts.
+
+| | Flash-Next TP2 + offload | Flash-Next TP4 | 27B TP2 |
+|---|---|---|---|
+| decode / step p50 / TTFT p50 | 97.4 tok/s / 25.61 ms / 483 ms | 157.3 / 16.81 / 97 | 197.5 / 23.46 / 114 |
+| prefill 2k / 8k / 16k / 32k | 2,210 / 3,558 / 3,839 / 3,800 | 6,476 / 7,348 / 7,445 / 7,180 | 4,190 / 4,191 / 4,072 / 3,837 |
+| concurrency 1 / 2 / 4 / 8 / 16 | 87 / 109 / 116 / 116 / 116 | 151 / 239 / 355 / 473 / 624 | 174 / 280 / 413 / 519 |
+| the release before | 97.4 / 25.62 / 484; 87-109-116-118-113 | 159.2 / 16.79 / 94; 151-231-350-478-635 | 196.6 / 23.43 / 116; 174-287-401-526 |
+| strict stress over `max_num_seqs` | 0 bad of 2,500 (9, 16 conc) | 0 of 4,900 (17, 32) | 0 of 2,100 (9, 12) |
+| mixed-length soak | 16 clients, 26 min: 230 served, 0 failed | 24 clients, 15 min: 450 / 0; 16 long-context clients, 10 min: 165 / 0 | 12 clients, 15 min: 232 / 0 |
+| VRAM peak in the soak (of 32,624 MiB) | 30,948 | 30,210 | 32,505, once (see below) |
+| strict stress after long prompts | 0 of 160 | 0 of 160 | 0 of 160 |
+| sanity | 8 / 8 | 8 / 8 | 8 / 8 |
+
+Speed is the release before's on all three, to within the run-to-run band. The short-conv packing took 0.7 GiB off
+the two-card soak peak (31,640 -> 30,948: the one-time step is gone) and 1.75 GiB off four cards' (31,957 with only
+eight clients -> 30,210 with twenty-four). Open after this: the 27B reached 32,505 MiB once during its soak before
+torch trimmed its cache back to 28.3 GiB -- no error, but `KVMEM=9` leaves it little room; and
+`tests/test_ar_quant.py` is a libr4d-backend test that spawns its own ranks and must not be run under torchrun.
+
 ### 2026-10-02: Qwen3.8-27B on two cards, a same-day baseline against the reference stack
 
 Same two cards (GPUs 0,1, one PLX switch), same checkpoint, full BetterBench each, both sanity 8 / 8. Ours:

@@ -83,6 +83,23 @@ compares with stock); the peak for the cases above is 0.4-0.5 GiB.
 - **Release checklist.** A release is now stressed at more requests than `max_num_seqs` and soaked with
   mixed-length prompts, on every configuration, before it is tagged; the sanity check is strict.
 
+## Validation
+
+Run on the release code, on every configuration: 26 single-GPU unit gates, the all-reduce suites on two and four
+ranks, a full BetterBench, the strict stress at more requests than `max_num_seqs`, and a mixed-length soak with
+VRAM sampled every second.
+
+| | Flash-Next, 2 cards + offload | Flash-Next, 4 cards | 27B, 2 cards |
+|---|--:|--:|--:|
+| single-stream decode (tok/s) | 97.4 | 157.3 | 197.5 |
+| decode step p50 / TTFT p50 | 25.6 ms / 483 ms | 16.8 ms / 97 ms | 23.5 ms / 114 ms |
+| concurrency 1 / 2 / 4 / 8 / 16 | 87 / 109 / 116 / 116 / 116 | 151 / 239 / 355 / 473 / 624 | 174 / 280 / 413 / 519 |
+| bad answers over the sequence limit | 0 of 2,500 | 0 of 4,900 | 0 of 2,100 |
+| mixed-length soak: served / failed | 230 / 0 (16 clients, 26 min) | 450 / 0 (24 clients, 15 min) | 232 / 0 (12 clients, 15 min) |
+| VRAM peak in the soak, of 32.6 GiB | 30.9 | 30.2 | 32.5, once |
+
+Speed matches the previous release on all three within run-to-run noise.
+
 ## Upgrading
 
 No configuration changes. `libr9k.so` must be rebuilt (`kernels/build.sh`): the plugin refuses an older one.

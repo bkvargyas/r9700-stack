@@ -50,7 +50,13 @@ memory when one step holds prompts of very different lengths. Speed and (correct
   197.5 tok/s, prefill 81-87%, TTFT 116 vs 65 ms, concurrency 94-97%.
 
 ### Rejected, with numbers
-- `UTIL=0.96` for TP2 with offload: runs at 69 MiB free and dies when the queue drains (PROGRESS.md 2026-10-01).
+- `UTIL=0.96` for TP2 with offload: ran at 69 MiB free and died when the queue drained (PROGRESS.md 2026-10-01).
+
+### Validation
+- On the release code, every configuration: 26 unit gates, the all-reduce suites, full BetterBench (speed unchanged:
+  97.4 / 157.3 / 197.5 tok/s for Flash-Next TP2 + offload / Flash-Next TP4 / 27B TP2), strict stress over
+  `max_num_seqs` (0 bad of 9,500), mixed-length soaks (1,077 requests served, none failed; VRAM peaks 30.9 / 30.2 /
+  32.5 GiB of 32.6).
 
 ## [0.2.1] - 2026-09-30
 
