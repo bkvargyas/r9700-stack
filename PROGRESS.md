@@ -1331,9 +1331,10 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    soak behind it. Run the full mixed soak on a restarted launch before the next tag.
 
 ### Open questions for Brian
-- The short-prefill GDN core is on master without the release checklist (2026-10-02, Brian: no full validation
-  for this push). Before it is tagged: GSM8K on the full set (short prompts now take a numerically different, more
-  exact path), a full BetterBench on the three configurations, the mixed-length soak.
+- v0.2.3 (the short-prefill GDN core, UTIL=0.96 on two cards) was tagged on 2026-10-02 on a smoke test, by
+  Brian's decision ("no need to run full validation suite", "no need for a full GSM8K set"). Owed with the next
+  release: a quality eval (short prompts take a numerically different, more exact path), a full BetterBench on
+  the three configurations, the mixed soak on a restarted 0.96 launch.
 - The published v0.2.0 and v0.2.1 notes say nothing of either bug. Edit them on GitHub, or let v0.2.2's notes
   carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a

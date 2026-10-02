@@ -6,8 +6,13 @@ Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method be
 
 ## [Unreleased]
 
-On master, not tagged. Checked with the unit tests and a smoke test on the three configurations (below), **not**
-with the release checklist: no quality eval, no full BetterBench, no long soak yet.
+## [0.2.3] - 2026-10-02
+
+Two things: a short prompt's first token in about half the time (the 27B now level with the reference stack), and
+28% more KV cache for Flash-Next on two cards. **Tagged on a smoke test, by decision, not on the v0.2.2 checklist**:
+unit gates, strict sanity under overload on all three configurations (0 bad of 3,850), the two long soaks for the
+memory change; no quality eval, no full BetterBench. The outputs for short prompts are numerically closer to the
+exact recurrence than before, which is a change, so an eval is owed with the next release.
 
 ### Changed
 - **Time to first token on short prompts: about half.** A prefill step ran vLLM's chunked GDN core eagerly in every

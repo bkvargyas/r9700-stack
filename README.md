@@ -11,12 +11,13 @@ the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would 
 again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
 [PROGRESS.md](PROGRESS.md).
 
-**Current release: [v0.2.2](notes/release-v0.2.2.md) (2026-10-02). If you run an earlier one, upgrade.** v0.2.2
-changes no benchmark number; it fixes three bugs that are in every earlier release and that only show under real
-traffic: on two cards, one sequence could turn to garbage when a request joined a batch that was already decoding
-(a race in the all-reduce kernel); Flash-Next with offloaded experts leaked VRAM under mixed-length prompts until it
-ran out; and Flash-Next ran out of memory when one step held prompts of very different lengths, four cards first.
-See [Stability](#stability-what-a-release-is-checked-against) for what a release is now put through.
+**Current release: [v0.2.3](notes/release-v0.2.3.md) (2026-10-02).** A short prompt's first token in about half
+the time -- 97 to 47 ms on the 27B, level with the reference stack; 87 to 44 ms for Flash-Next on four cards -- and
+28% more KV cache for Flash-Next on two cards. Tagged on a smoke test rather than the full
+[release checks](#stability-what-a-release-is-checked-against); the notes say exactly what was run.
+**If you run anything before v0.2.2, upgrade:** v0.2.2 fixed three bugs that only show under real traffic (wrong
+output on two cards when a request joined a running batch, a VRAM leak, and an out-of-memory under mixed-length
+prompts).
 
 **Built for stock upstream releases.** It targets **released vLLM** and **ROCm 10 or newer**, unmodified — no
 fork, no patched source, no vendored binaries. Everything loads as a plugin at runtime through vLLM's own
@@ -140,11 +141,10 @@ known alternative stack for this model.
 Decode is at parity; prefill and KV capacity are where the work is (the reference prefills in 8,192-token chunks
 and keeps an 8-bit KV cache).
 
-**Time to first token has since been fixed on master** (after v0.2.2, not yet in a release): a short prompt's
-first token went from 97 to 47 ms, against the reference's 46 -- and from 87 to 44 ms for Flash-Next on four
-cards. The cause was vLLM's chunked GDN prefill core running eagerly in every GDN layer; short prefills now take
-one launch per layer. Measured per request with `bench/ttft_breakdown.py`, not yet with a full BetterBench; see
-the [changelog](CHANGELOG.md).
+**Time to first token is fixed in v0.2.3**: a short prompt's first token went from 97 to 47 ms, against the
+reference's 46 -- and from 87 to 44 ms for Flash-Next on four cards. The cause was vLLM's chunked GDN prefill core
+running eagerly in every GDN layer; short prefills now take one launch per layer. Measured per request with
+`bench/ttft_breakdown.py`, not yet with a full BetterBench; see the [changelog](CHANGELOG.md).
 
 Quality: GSM8K, full 1,319-question test set, greedy, concurrency 1 — **94.4–95.5%** depending on configuration,
 with no statistically detectable difference between them (paired McNemar).
@@ -161,7 +161,9 @@ practical ceiling.
 
 Benchmarks measure speed. They did not notice that three releases produced wrong output for some requests and ran
 out of memory under real traffic, because every check ran at fixed prompt lengths and at or below the sequence
-limit. Since v0.2.2 a release is tagged only after, on **every** configuration above and on the exact release code:
+limit. Since v0.2.2 a release is meant to be tagged only after, on **every** configuration above and on the exact
+release code (v0.2.3 was tagged on the first two rows plus the soaks for its memory change, by decision; the rest
+is owed):
 
 | check | passes when | v0.2.2 |
 |---|---|---|
@@ -231,7 +233,8 @@ restart once (the launch that compiles gets a smaller KV pool).
 | file | what it's for |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release. |
-| [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | The current release: the three bugs it fixes, how they were found, and its validation. |
+| [notes/release-v0.2.3.md](notes/release-v0.2.3.md) | The current release: the first-token fix, the memory change, and exactly what was checked. |
+| [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | v0.2.2: the three real-traffic bugs it fixes, how they were found, and its validation. |
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |
 | [host/README.md](host/README.md) | Host PCIe setup: why a second card on one PLX switch gets no BAR, and the fix. |
