@@ -1290,6 +1290,28 @@ GDN metadata built once per KV-cache group, 11 times, 14 ms (stock; the referenc
 GDN layers still 0.6 ms each, most of it stock's conv launcher at the time (since replaced); the KV-cache update of
 the 16 attention layers 6 ms; the drafter 4 ms.
 
+### 2026-10-02: UTIL=0.96 on two cards, retested and adopted
+
+Brian's question: could 0.96 work now that the other bugs are fixed? It was rejected on 2026-10-01 after the leak
+fix but before the short-conv packing fix, and the allocation it died on (150 MiB with 69 MiB free, "when the
+queue drained") was that third bug. Never retested since. Flash-Next TP2, GPUs 0,2, offload, master 7806509:
+
+| | UTIL=0.94 | UTIL=0.96 |
+|---|--:|--:|
+| KV cache, first (compiling) launch | 95,429 tokens | 128,772 |
+| KV cache, restarted launch | 121,299 | 155,791 (+28%) |
+| VRAM, first launch, both soaks | | 30,376 -> 30,396 MiB, flat |
+| VRAM, restarted launch, mixed soak | 30,400 -> 30,948 (25 min) | 31,066 -> 31,350 (first 5.7 min) |
+
+First launch at 0.96: the soak that killed it (8 clients, 18k-30k tokens, 956 s) 86 served, 11 rejected for
+length, 0 errors; mixed (16 clients, 200-30k tokens, 1,563 s) 227 served, 11 rejected, 0 errors; strict sanity
+after 24k-token prefills 0 bad of 180; sanity 8 / 8; probe 117.0 tok/s, c8 188, prefill 8k 2,622 (speed unchanged).
+The first launch has the smaller pool, so the case people run -- restarted -- was started as a short check and
+**stopped at 5.7 minutes of the mixed soak on Brian's instruction (no more tests)**: peak 31,350 of 32,624 MiB
+(1,274 free), no OOM or HIP error line, no request summary. At 0.94 all of the soak's growth came in its first
+minute, which is why a short burst was the check; a full-length soak of the restarted launch is still owed.
+Adopted as the default for TP2 with offload only (`serve/serve.sh`; `UTIL=0.94` restores).
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
@@ -1305,8 +1327,8 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
    block syncs per token; a second pass over the tokens needs none) -- a faster token would move the threshold
    past 256 / 400 and reach the 300-1,000-token prompts, where the 27B still trails the reference by 5-10%; the
    GDN metadata built once per KV group (stock, ~14 ms of a profiled step); the conv update in mixed steps.
-7. **`UTIL=0.96` on two cards**: rejected on 2026-10-01 because of the allocation the short-conv fix later
-   removed. Not retested since.
+7. **`UTIL=0.96` on two cards** is the default since 2026-10-02; the restarted launch has only a 5.7-minute
+   soak behind it. Run the full mixed soak on a restarted launch before the next tag.
 
 ### Open questions for Brian
 - The short-prefill GDN core is on master without the release checklist (2026-10-02, Brian: no full validation

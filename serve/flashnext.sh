@@ -9,6 +9,8 @@
 #     CGSIZES= (vLLM's default graph sizes) at TP2: the 2048-token prefill graphs leave no KV room there.
 #     RESTART ONCE after the first launch of a new configuration: the launch that compiles keeps ~0.45 GiB
 #     that the next one gives to the KV pool (45k vs 72k tokens at NSEQ=16, 94k vs 121k at NSEQ=8).
+#     Memory utilization is 0.96 here (serve.sh sets it for TP2 with offload; UTIL=0.94 for the old value):
+#     KV cache 129k tokens on the first launch, 156k restarted, against 95k / 121k at 0.94.
 #     What bounds it (PROGRESS.md 2026-09-29): the link. Every routed expert that is not resident is 1.245 MiB
 #     per rank over PCIe at the link rate, so real traffic levels off near 115 tok/s from 4 requests up; eight
 #     copies of ONE prompt share their experts and run at 434-577. R9K_EXPERT_CACHE_STATS=1 logs the misses.

@@ -34,6 +34,16 @@ with the release checklist: no quality eval, no full BetterBench, no long soak y
   is ~300x closer to an fp64 reference than the chunked bf16 form it replaces (relative error 2e-5 against 5e-3),
   which changes low-order bits of the hidden state and so, now and then, a token.
 
+- **Flash-Next on two cards (offloaded experts): `--gpu-memory-utilization` 0.94 -> 0.96, 28% more KV cache**
+  (121k -> 156k tokens on a restarted launch, 95k -> 129k on the first). 0.2.2 rejected 0.96 because it died with
+  69 MiB free; that allocation was the short-conv prefill batch fixed in the same release, and it had not been
+  retested since. At 0.96 now: the soak that killed it (8 clients, 18k-30k-token prompts, 16 minutes) served 86
+  with none failed, the mixed soak (16 clients, 200-30k tokens, 26 minutes) served 227 with none failed, VRAM
+  flat at 30.4 of 32.6 GiB, sanity after long prefills 0 bad of 180. Those ran on a first launch; on a restarted
+  one (the larger pool) the first 5.7 minutes of the mixed soak peaked at 31,350 of 32,624 MiB with no error, and
+  the run was stopped there -- that case has not had a full-length soak. `UTIL=0.94` restores the old value; four
+  cards and the 27B are unchanged.
+
 ### Added
 - `tests/test_gdn_prefill_r9k.py`: the new core against an fp64 token-by-token reference (and stock's distance to
   the same reference), row-mapped runs bit-identical to compact ones, spec-decode sequences bit-identical to

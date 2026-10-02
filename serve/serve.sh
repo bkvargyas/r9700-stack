@@ -60,6 +60,12 @@ if [ -n "$CHAT_TEMPLATE" ]; then MNT+=(-v "$CHAT_TEMPLATE:/opt/chat_template.jin
 [ -n "$KVMEM" ] && ARGS+=(--kv-cache-memory "$(python3 -c "print(int($KVMEM * 2**30))")")
 # OFFLOAD_GB=0: no expert offload (models that fit in VRAM, e.g. the dense 27B checkpoints)
 OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34} --cpu-offload-params experts)
+# UTIL: vLLM's --gpu-memory-utilization. 0.94, except TP2 with offloaded experts (Flash-Next on two cards): 0.96,
+# which is 28% more KV cache there (121k -> 156k tokens on a restarted launch). Rejected on 2026-10-01 -- it ran
+# at 69 MiB free and died -- because of the short-conv prefill allocation fixed in v0.2.2; soaked again 2026-10-02
+# (PROGRESS.md): 42 minutes, 313 requests, none failed, 2.2 GiB free on a first launch; on a restarted launch
+# 1.2 GiB free at the peak of a 5.7-minute burst (a full soak of that case is still owed). UTIL=0.94 restores.
+UTIL=${UTIL:-$([ "${OFFLOAD_GB:-34}" != 0 ] && [ "${TP:-2}" = 2 ] && echo 0.96 || echo 0.94)}
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
 # PREFIX_CACHE=0: disable prefix caching. On hybrid (GDN + attention) models prefix caching puts the mamba cache in
 # "align" mode, and the scheduler then aligns every prefill chunk end to the mamba block size, so a prompt that is
@@ -121,7 +127,7 @@ sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host ${PIDNS--
   "${ENTRY[@]}" $IMG "${PRE[@]}" ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} \
   --served-model-name Qwen3.8 --host 0.0.0.0 --port ${PORT:-8080} \
   --tensor-parallel-size ${TP:-2} --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
-  --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization ${UTIL:-0.94} \
+  --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization $UTIL \
   "${OFFL[@]}" \
   --reasoning-parser qwen3 --tool-call-parser qwen3_coder --enable-auto-tool-choice ${LMONLY---language-model-only} \
   "${ARGS[@]}" $EXTRA
