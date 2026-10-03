@@ -147,6 +147,23 @@ def _load_target(self, super_load, weights):
 
 
 class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
+    # one GDN state page per request under speculative decoding (models/gdn.py): vLLM sizes the padded mamba page
+    # from these before any layer exists
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from .gdn import onepage_state_shape_from_config
+        return onepage_state_shape_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from .gdn import onepage_state_dtype_from_config
+        return onepage_state_dtype_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config):      # the hook vLLM prefers when a model defines it
+        from .gdn import onepage_specs_from_config
+        return onepage_specs_from_config(Qwen4ExpForConditionalGeneration, vllm_config)
+
 
     def __init__(self, *, vllm_config, prefix: str = "model") -> None:
         with construction_scope():
@@ -171,6 +188,23 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
 
 
 class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
+    # one GDN state page per request under speculative decoding (models/gdn.py): vLLM sizes the padded mamba page
+    # from these before any layer exists
+    @classmethod
+    def get_mamba_state_shape_from_config(cls, vllm_config):
+        from .gdn import onepage_state_shape_from_config
+        return onepage_state_shape_from_config(Qwen4ExpForCausalLM, vllm_config)
+
+    @classmethod
+    def get_mamba_state_dtype_from_config(cls, vllm_config):
+        from .gdn import onepage_state_dtype_from_config
+        return onepage_state_dtype_from_config(Qwen4ExpForCausalLM, vllm_config)
+
+    @classmethod
+    def get_mamba_specs_from_config(cls, vllm_config):      # the hook vLLM prefers when a model defines it
+        from .gdn import onepage_specs_from_config
+        return onepage_specs_from_config(Qwen4ExpForCausalLM, vllm_config)
+
 
     def __init__(self, *, vllm_config, prefix: str = "") -> None:
         with construction_scope():

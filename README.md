@@ -11,10 +11,12 @@ the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would 
 again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
 [PROGRESS.md](PROGRESS.md).
 
-**Current release: [v0.2.3](notes/release-v0.2.3.md) (2026-10-02).** A short prompt's first token in about half
-the time -- 97 to 47 ms on the 27B, level with the reference stack; 87 to 44 ms for Flash-Next on four cards -- and
-28% more KV cache for Flash-Next on two cards. Tagged on a smoke test rather than the full
-[release checks](#stability-what-a-release-is-checked-against); the notes say exactly what was run.
+**Current release: [v0.2.4](notes/release-v0.2.4.md) (2026-10-03).** One state page per request for the GDN layers
+under speculative decoding: 64% more KV cache for the 27B on two cards (223k to 367k tokens), 18% for Flash-Next on
+two cards, 9% on four, and four concurrent 27B requests on one card where stock pages admit two; decode and
+concurrency equal or better, long prefill 1-6% slower. Needs prefix caching off (`PREFIX_CACHE=0`; the default for
+Flash-Next, a knob for the 27B). Tagged on the unit gates and strict sanity under overload (0 bad of 5,680), not on
+the full [release checks](#stability-what-a-release-is-checked-against); the notes say what was run.
 **If you run anything before v0.2.2, upgrade:** v0.2.2 fixed three bugs that only show under real traffic (wrong
 output on two cards when a request joined a running batch, a VRAM leak, and an out-of-memory under mixed-length
 prompts).
@@ -162,8 +164,8 @@ practical ceiling.
 Benchmarks measure speed. They did not notice that three releases produced wrong output for some requests and ran
 out of memory under real traffic, because every check ran at fixed prompt lengths and at or below the sequence
 limit. Since v0.2.2 a release is meant to be tagged only after, on **every** configuration above and on the exact
-release code (v0.2.3 was tagged on the first two rows plus the soaks for its memory change, by decision; the rest
-is owed):
+release code (v0.2.3 was tagged on the first two rows plus the soaks for its memory change, and v0.2.4 on the
+first two rows, both by decision; the rest is owed):
 
 | check | passes when | v0.2.2 |
 |---|---|---|
@@ -191,6 +193,11 @@ have never measured. We have not measured it on purpose, for two reasons:
 
 So treat 225 W as a fixed condition of the benchmarks rather than a tuning knob. If you run uncapped, your
 numbers should be better than these, and they will not be comparable to them.
+
+**From 2026-10-03 (v0.2.4) the cards run at 210 W with a -42 mV GPU voltage offset**, set through LACT. The offset
+alone gained about 5% decode at the same cap (the card sustains higher clocks under it); the lower cap costs 0.7%
+decode, 1.4% at 8 concurrent and 2.2% on an 8k prefill against 225 W. The benchmark tables above are the 225 W
+numbers and stay the reference; PROGRESS.md marks which later measurements are at the new setting.
 
 ## Quick start
 
@@ -233,7 +240,8 @@ restart once (the launch that compiles gets a smaller KV pool).
 | file | what it's for |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release. |
-| [notes/release-v0.2.3.md](notes/release-v0.2.3.md) | The current release: the first-token fix, the memory change, and exactly what was checked. |
+| [notes/release-v0.2.4.md](notes/release-v0.2.4.md) | The current release: one GDN state page per request, the defect found on the way, and exactly what was checked. |
+| [notes/release-v0.2.3.md](notes/release-v0.2.3.md) | v0.2.3: the first-token fix, the memory change, and exactly what was checked. |
 | [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | v0.2.2: the three real-traffic bugs it fixes, how they were found, and its validation. |
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |

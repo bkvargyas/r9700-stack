@@ -1312,6 +1312,196 @@ The first launch has the smaller pool, so the case people run -- restarted -- wa
 minute, which is why a short burst was the check; a full-length soak of the restarted launch is still owed.
 Adopted as the default for TP2 with offload only (`serve/serve.sh`; `UTIL=0.94` restores).
 
+### 2026-10-03: one state page per request for GDN under speculative decoding -- design
+
+**What vLLM does today.** A hybrid model's linear-attention (GDN) state lives in the KV cache as "mamba pages". With
+a drafter, vLLM gives every request `1 + num_speculative_tokens` state pages per GDN group (2 + spec with prefix
+caching, "align" mode): the verify step writes the state after *each* candidate token into its own page, and the
+next step reads the page of the last accepted token (`spec_state_indices[n, num_accepted - 1]`). Measured
+(`~/kvcost.py`, 2026-10-03), the fixed cost per *running* request before it holds any context:
+
+| configuration | per request | at full `max_num_seqs` |
+|---|--:|--:|
+| 27B TP2, SPEC=7 (shipped) | 15,661 token-equivalents = 7.4% of the pool | 8 running: 59% |
+| 27B TP2, SPEC=5 / SPEC=3 | 5.6% / 3.8% | 45% / 31% |
+| Flash-Next TP2 offload, MTP=3 | 10,394 = 8.1% | 8 running: 65% |
+| Flash-Next TP4, MTP=3 | 6,152 = 2.4% | 16 running: 38% |
+
+On the 27B a second, independent waste: the DFlash2 drafter's 5 attention layers make vLLM's group size 5, so the
+16 target attention layers are padded to 20 (25% of attention bytes) and the 48 GDN layers to 50 -- upstream's
+grouping heuristic (`_get_kv_cache_groups_uniform_page_size`), not addressed here. Tried and rejected: the
+block-outermost layout (`VLLM_KV_CACHE_LAYOUT=BLHNC`, which our kernels could take) routes to the packed grouping
+without padding, but that path sizes every block to the widest page (the GDN state) and asked 21.7 GiB for a 32k
+request.
+
+**The design: verify from one checkpoint, replay the accepted tokens at the start of the next step.** vLLM has
+a cousin of this for Kimi-K3's KDA layers ("RecoverSSM": `num_speculative_blocks = 0`, a post-sampling commit hook
+in the runner). Its kernels are not in this build, its flag is validated against Kimi architectures, and the flag
+also stops piecewise graph capture above the decode width (`cudagraph_utils`: "recoverSSM cannot capture a dummy
+query wider than its workspace"), which would cost Flash-Next its prefill graphs. So no runner hook: the layer does
+the replay itself when the request next comes through.
+
+1. **Page layout** (`get_state_shape` / `get_state_dtype` on our GDN layer class, which stock's `bind_kv_cache`
+   turns into views): stock conv window `[C, 3 + spec]`, stock SSM state `[Hv, 128, 128]`, plus a RECORD of the last
+   step's candidate inputs in two slots -- the conv'd q/k/v rows `[2, 1 + spec, C]` bf16, the gating inputs b, a
+   `[2, 1 + spec, 2 Hv]` bf16 -- and a flag `[2]` int32 = {live rows | slot << 8, done counter}. `get_kv_cache_spec`
+   sets `num_speculative_blocks = 0`. Per GDN group that is 1 page per request instead of 1 + spec; the record adds
+   ~10% to a page (two slots).
+2. **Verify** (`r9k_gdn_spec_verify`, the decode kernel's loop): if the page's flag says a record is live, replay
+   the first `num_accepted` of its rows (vLLM hands the previous step's accepted count to this step) from the base
+   state and store the result; then run the new candidates from that state, outputs through the gated norm, no
+   state stored; write the new record into the other slot (sibling blocks of the same sequence may still be
+   replaying from the live one) and, once every value head's block of the sequence has finished (per-page atomic
+   counter), flip the flag. Stock's `causal_conv1d_update` keeps the conv window exactly as today: it only ever
+   used page 0 and its own `num_accepted - 1` offset.
+3. **Every path that touches a spec row is ours**: pure spec decode (in the FULL graph), prefill + spec, long prefill
+   + spec (stock's chunked prefill for the prefill rows, gathered; our verify for the spec rows), and a batch of
+   draft-less decodes (our verify with one candidate, so a live record is replayed first; the builder subclass
+   keeps every row's accepted count for it). Prefill rows clear the flag (our kernels do it in-kernel; a stock
+   fallback zeroes it from Python), so a recycled page never replays a stale record.
+4. **Scope of this stage: mamba cache mode "none" (prefix caching off).** In "align" mode the runner's block-boundary
+   copies pick a spec slot by `num_accepted - 1`, which no longer exists; supporting it means writing the boundary
+   checkpoint from the replay. With prefix caching on the layer logs a warning and keeps vLLM's pages. On the 27B
+   `PREFIX_CACHE=0` also measured 2.1 GiB less VRAM and 6% more KV (2026-10-02); Flash-Next already runs with it off.
+   Knob: `R9K_GDN_STATE=onepage|stock`.
+
+**Numerics.** Bit-identical to the slot design: the slot of the accepted token held `round(h)` after an fp32
+recurrence from the rounded base; the commit recomputes the same fp32 recurrence from the same rounded base on the
+same recorded inputs and rounds once. Outputs are the same kernel as today.
+
+**Cost.** The replay is at most 1 + spec tokens per layer per request inside the verify launch; the one-page verify
+without per-token state stores is *faster* than the slot kernel at 16 sequences (165 vs 281 us on 27B-TP2 heads,
+replaying 8 then running 8). Memory per request per GDN group: 1 + spec pages -> 1.
+
+**Expected.** 27B TP2 at 8 running: 59% -> ~13% of the pool pinned; Flash-Next TP2 65% -> ~16%; TP4 38% -> ~10%;
+the drafter fits at 200k on one card (the 9.35 GiB need drops by the 7 spec pages, ~1.1 GiB at TP1, more than the
+1.15 GiB that was missing).
+
+**Validation.** Unit (`tests/test_gdn_onepage_r9k.py`): multi-step simulation vs the slot design with random
+acceptance -- outputs and the replayed page bit-identical, including the step after a prefill, 1-candidate steps,
+both state dtypes, the sigmoid gate, a row map; the conv-window shift identity for a future align-mode commit.
+Serving: `kvcost`, strict sanity under overload on all configurations, probes vs shipped, VRAM peaks, then the
+release checks (Brian's call).
+
+### 2026-10-03: one state page per request -- what it measured, and a host crash during the tests
+
+**Implemented as designed** (stage 1: `mamba_cache_mode` "none", i.e. `PREFIX_CACHE=0`; `R9K_GDN_STATE=stock` restores
+vLLM's pages). The page is sized at the model level: `R9kQwen3_5*` override `get_mamba_state_shape_from_config`, and
+`R9kQwen4Exp*` must override `get_mamba_specs_from_config` as well, because stock Qwen4Exp defines it and
+`Platform._align_hybrid_block_size` prefers it when present -- the first Flash-Next launch fell back to a page sized
+2x by the layer (`GDN page 851968 -> 1703936 (the model class did not size it)`), which this fixed. Unit test
+`tests/test_gdn_onepage_r9k.py` passes (11 cases, bit-identical to the slot design).
+
+| | stock pages | one page | |
+|---|--:|--:|---|
+| 27B, one card (KVMEM=3, prefix caching off): KV cache | 35,576 | 62,295 | +75% |
+| 27B, one card: pages pinned per running request | 85 | 15 | |
+| 27B, one card: c8 / c16 tok/s | 192 / 196 | 329 / 283 | |
+| 27B, two cards (prefix caching off): KV cache | 223,329 | 367,494 | +64.5% |
+| 27B, two cards: 8 running short requests, pool pinned | 59.4% | 11.5% | |
+| 27B, two cards: decode mean / c8 / prefill 8k (3 probes each) | 206 / 534 / 4,055 | 211 / 586 / 3,900 | |
+| Flash-Next, two cards (0,1; both restarted launches): KV cache | 154,641 | 183,202 | +18.5% |
+| Flash-Next, two cards: pinned per running request (tok-eq.) / 8 running | 10,386 / 53.7% | 6,736 / 35.6% | -35% |
+| Flash-Next, two cards: decode / c8 / c16 / prefill 8k (3 probes) | 93 / 119-122 / 95-96 / 1,690 | 93 / 121-122 / 92-96 / 1,678 | |
+| Flash-Next, four cards (both first launches): KV cache | 256,682 | 279,564 | +8.9% |
+| Flash-Next, four cards: pinned per running request / 8 running | 6,152 / 19.2% | 3,739 / 10.7% | -39% |
+| Flash-Next, four cards: decode / c8 / c16 / prefill 8k | 194 / 568-597 / 893 / 7,230 | 195 / 592-621 / 896 / 6,780 | prefill -6% |
+
+Strict sanity under overload: 27B one card 0 bad of 360; 27B two cards 0 of 990; Flash-Next two cards 0 of 540
+(twice); Flash-Next four cards 0 of 1,020 (both modes). (A first one-page launch of the two-card configuration
+compiles and shows 151,179; the table has the restarted launch, the normal way to run it.)
+Attention block: 27B 1,808 tokens (stock 1,648), Flash-Next two cards 912 (832), four cards 464 (416): the
+attention page grows because the mamba page now carries the 2 x (spec+1)-row record. **Cost: long prefill is 4-6%
+slower with one-page** (27B 8k 4,055 -> 3,900; Flash-Next TP4 7,230 -> 6,780), presumably the bigger attention
+block in the paged-attention prefill; the GDN path is unchanged for long prefills. Decode and concurrency are equal
+or better everywhere.
+
+**The c16 question.** The one-page two-card runs showed 636 / 417 / 444 tok/s at 16 concurrent against stock's
+588-606. It was not the page design: ten further c16 runs on the same server measured 645-697, all above stock; GPU
+power, clocks and preemptions were unchanged in a slow run; the slow runs coincided with other containers loading
+models on the box. The 27B runs `max_num_seqs` 8, so c16 is two waves, and the prose prompts (lowest acceptance)
+are always the stragglers (~41 tok/s each vs ~57 for code). Per-request detail: `~/c16diag2.py` on VM100.
+
+**Host crash 02:21-02:25 UTC, and what it turned out to be.** With all five cards loading at once (27B TP2 on HIP
+0,1, Flash-Next TP2 on HIP 2,3, a 27B reviewer on HIP 4), the second chain B card (guest 08:00.0, host c5:00.0)
+logged `MES(1) failed to respond to msg=INVALIDATE_TLBS` three times two seconds apart, then failed REMOVE_QUEUE and
+SUSPEND, amdgpu began a GPU reset, eight seconds later the card read back as all ones ("device lost from bus"), and
+two minutes after that the host hard-reset: firmware reason "an uncorrected error caused a data fabric sync flood",
+a fatal machine check on one core (SMCA EX, code 0: a core watchdog on a stalled transaction). The BMC log has no
+power event. The first suspects (the fifth card, the new host kernel 7.0.14-20 and QEMU 11.0.3-4 that the same
+maintenance window installed, five-way load) were all cleared the same night:
+- The MES timeout is **chronic**: ~130 occurrences since 2026-09-17 in every guest boot, on every card, on host
+  kernel -19 and -20, with four cards and five, clustering at model load and graph capture (page-table churn), and
+  self-recovering every time but this one. Two more single timeouts on 10-03 (04:06, 04:07) on two different
+  cards during a Flash-Next TP4 launch, at 32-75 W and 32-38 C: not power, not heat.
+- The exact 02:17 configuration, relaunched deliberately (three servers at once on five cards, then probes and
+  stress on all three together): clean, 0 bad of 1,380.
+- The guest already runs the TLB-fence rework (Linux 7.0, backported to 6.19.10) that fixed MES deadlocks on Strix
+  Point, and the newest Debian backports firmware (MES 0x91). No fix specific to this message on gfx12 was found.
+So the crash is: a chronic firmware hang escalated once into a GPU reset, and a GPU reset under passthrough on these
+cards takes the link and then the host down. Containment proposed (Brian's call, a guest kernel parameter):
+`amdgpu.gpu_recovery=0`, so a hung MES wedges one GPU and its container instead of resetting the card; a VM reboot
+recovers it through the vfio function reset that every VM start already does. This matters for the eight-card plan
+too: the hang rate scales with load/capture churn, not with cards per VM, and a reset in any VM takes the host.
+Operational notes from the same night: the guest's power-cap service had failed at boot (an inline comment in
+`/etc/r9700-powercap.conf` was read as the value; fixed); LACT 0.10.1 (headless) now runs in the guest with
+`amdgpu.ppfeaturemask=0xffffffff`, applying -42 mV on every card (Brian's instruction) and the caps (225 W, the
+passively cooled fifth card 210 W), then 210 W on every card (Brian, 05:25 UTC): at -42 mV the 27B two-card probe lost
+0.7% decode, 1.4% at 8 concurrent and 2.2% on an 8k prefill going from 225 to 210 W, and strict sanity under
+overload was 0 bad of 2,040 at 210 W. **Numbers from here on are at 210 W with -42 mV; everything published so far
+was 225 W without the undervolt** (the undervolt alone gained ~5% decode at 225 W).
+
+**Found and fixed the same night: the conv window's candidate width.** At temperature 0 the stock-page server gives
+the same text for a request alone or in a batch of identical copies; one-page gave the same text within a batch but,
+with >= 4 identical copies, two of four prompts differed from the lone run (coherent alternatives, a near-tie flipped),
+and under `--enforce-eager` one-page was garbage even alone while stock was coherent. What cleared on the way: the
+kernel (new lockstep unit cases, 4 and 8 identical sequences vs lone, one-page and slot bit-identical), page
+distinctness and the code path (debug trace), the attention backend (vLLM's own: same divergence) and the larger
+attention block (stock kernels on a one-page-sized page: invariant). A per-step checksum trace of layer 0 in eager
+mode (`R9K_GDN_TRACE=1`) then showed it: step 1 after the prefill identical to stock in every input and the output;
+at step 2 b, a and z still identical but the conv output different -- the conv window written by step 1 was wrong.
+Cause: stock's `causal_conv1d_update` takes `max_query_len`, the number of candidate columns the window rolls by, and
+the plugin passed `idx.size(1)`. With one page per request the mamba KV group's block table has one column (no
+speculative blocks), so on every eagerly built step -- mixed prefill+spec steps, non-uniform batches, enforce-eager
+-- `idx` is `[N, 1]` and the window rolled as if one candidate per step. FULL-cudagraph steps were right only by
+accident: vLLM copies the `[N, 1]` slice into its `[N, S]` cudagraph buffer with `copy_`, which broadcasts the
+column. The fix takes S from the record (`_spec_width`) in the fused path, the mixed-step path and the debug check.
+The unit test could not see this (it feeds the conv output directly); the serving check that does is
+`~/batchid.py`: identical copies in one batch must equal the lone run, in graph and eager mode.
+
+After the fix (27B two cards, 210 W, -42 mV, prefix caching off): eager one-page bit-identical to stock per step;
+strict sanity under overload 0 bad of 990; the six single-request texts identical to stock; sixteen fixed prompts
+at 16 concurrent, six runs: every run completes all 4,096 tokens (before the fix one-page runs ended early),
+one-page runs agree with each other on 7-16 of 16 texts (stock: 5-16), one-page vs stock 5-9 -- the same spread
+stock shows against itself. The remaining run-to-run variation comes from vLLM's mixed prefill+decode steps, which
+send a running request's rows through the prefill attention path: the stock-page server shows the same thing
+(staggered arrivals: 3 distinct texts of 4), and in the traced mixed step one-page and stock produce identical
+conv, input and output checksums for the same request state. Probes after the fix: decode 212, c8 554-579,
+c16 673, 8k prefill 3,940 (210 W). Flash-Next two cards after the fix: sanity 8/8, 0 bad of 990, probes unchanged;
+four cards: sanity 8/8, 0 bad of 1,870, decode 193-197, c16 898.
+
+**What is left of batch dependence, and what it is.** Two sources, neither in the GDN path:
+- On two cards, the compressed all-reduce (`R9K_AR_QUANT=1`, messages >= 128 KB) is lossy, and its rounding depends on
+  the message, so a request's logits depend on who shares its batch: four identical copies prefilled together differ
+  from the lone run from the fourth character on, in stock mode as much as one-page (the layer-1 prefill input
+  already differs by 1.4% while layer 0's output matches). This is the documented trade of that knob, not new.
+- On one card there is no all-reduce, and the step trace of four identical copies prefilled together against the
+  lone run reads: prefill identical, verify steps 1-3 identical in every input and output, step 4 GDN state still
+  identical but the step's rows differ by 1-2% -- the drafter proposed different tokens for the batch than for the
+  lone request; acceptance then differs (4 vs 5) and the text flips at char 506. The target's GDN state never
+  deviated before the drafts did. Whether stock pages behave the same at four requests on one card cannot be
+  measured: stock pins 85 blocks per request there and admits at most two at a time (the thing one-page fixes).
+  Four *different* prompts in one batch match their lone runs, and so do two or three identical copies; the effect
+  needs three or more identical prompts at temperature 0 in one step, which production traffic does not produce.
+Diagnosis knobs kept, off by default: `R9K_GDN_TRACE=1` (per-step checksums of layers 0 and 1 on eagerly built
+steps), `R9K_GDN_PAGE_PAD=1` (stock pages with a one-page-sized page). Helper scripts on VM100: `~/batchid.py`
+(identical copies vs lone), `~/stepcmp.py` (step trace comparison), `~/c16diag2.py`, `~/lockstep_prefill.py`.
+
+**Remaining**: Flash-Next TP2 on the split pair and TP4 with one-page; whether `R9K_GDN_STATE=onepage` becomes the
+default (it needs `PREFIX_CACHE=0`, a serving-behaviour change on the 27B, Brian's call); align-mode (prefix
+caching) support via boundary checkpoints from the replay; the 200k single-card run with the drafter still needs
+the 25% attention-page padding addressed upstream.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:

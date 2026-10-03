@@ -2,9 +2,45 @@
 
 All notable changes to r9700-stack. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project uses [semantic versioning](https://semver.org/). Every number below was measured on 4× (or 2×)
-Radeon AI PRO R9700 at a 225 W cap; [PROGRESS.md](PROGRESS.md) has the method behind each one.
+Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV voltage offset from v0.2.4 on;
+[PROGRESS.md](PROGRESS.md) has the method behind each one.
 
 ## [Unreleased]
+
+## [0.2.4] - 2026-10-03
+
+One state page per request for the GDN layers under speculative decoding: 64% more KV cache for the 27B on two
+cards, 18% for Flash-Next on two cards, 9% on four, and four concurrent 27B requests fit on one card where stock
+pages admit two. **Tagged on the unit gates and strict sanity under overload on every configuration, by decision**
+(0 bad of 5,680); not on a quality eval, a BetterBench or a mixed-length soak -- those are still owed, now for two
+releases. The test box also moved to 210 W and a -42 mV voltage offset on every card this day; the probe numbers in
+this entry are at that setting, the earlier entries at 225 W.
+
+### Added
+- **One GDN state page per request under speculative decoding** (`R9K_GDN_STATE=onepage`, the default when
+  prefix caching is off; `stock` restores vLLM's pages). vLLM keeps 1 + spec-tokens mamba pages per request so it
+  can verify candidates from any accepted position; the plugin's verify kernel instead replays the accepted rows of
+  the previous step from a record carried in the page, so one page serves. 27B on two cards: KV cache 223,329 ->
+  367,494 tokens (+64.5%), 8 running requests pin 11.5% of the pool instead of 59.4%, decode and 8-way concurrency
+  unchanged or better (206 -> 211, 534 -> 586 tok/s), prefill -4%. 27B on one card: 35,576 -> 62,295. Flash-Next
+  on two cards: +18%. Bit-identical to the slot design (unit test with multi-step simulation); strict sanity under
+  overload 0 bad of 1,890 across the three configurations. Stage 1 requires `mamba_cache_mode` "none"
+  (`PREFIX_CACHE=0`); with prefix caching on, stock pages are used. One defect found and fixed before release: with
+  one page per request the KV group's block table has a single column, and the conv update's candidate width was
+  taken from it on eagerly built steps (mixed prefill+decode batches), rolling the conv window as if one candidate
+  per step; the width now comes from the record (PROGRESS.md 2026-10-03 has the trace that found it).
+- `tests/test_gdn_onepage_r9k.py`; kernels `r9k_gdn_spec_verify` / `r9k_gdn_spec_commit`; model classes
+  `R9kQwen3_5ForConditionalGeneration` / `R9kQwen3_5ForCausalLM`.
+
+### Changed
+- Test and production cards run at 210 W with a -42 mV GPU voltage offset (LACT, overdrive enabled in the guest).
+  Against 225 W without the offset the 27B on two cards gains ~5% decode from the offset and loses 0.7% decode,
+  1.4% at 8 concurrent and 2.2% on an 8k prefill from the lower cap; strict sanity under overload 0 bad of 2,040 at
+  the new setting. The 225 W reference numbers in README.md are unchanged and labelled.
+
+### Fixed
+- Guest power-cap service: an inline comment in `/etc/r9700-powercap.conf` was read as the cap value and the service
+  failed at boot, leaving every card at 225 W.
 
 ## [0.2.3] - 2026-10-02
 

@@ -78,6 +78,28 @@ These cost real time to learn:
 
 ## Current state
 
+**2026-10-03, v0.2.4.** Read this block first; the older paragraphs below it are still true where they do not
+contradict it.
+- **One GDN state page per request under speculative decoding** is in and validated (release notes
+  `notes/release-v0.2.4.md`). It is the default (`R9K_GDN_STATE=onepage`) but only takes effect with prefix
+  caching off (`PREFIX_CACHE=0`: already the default for Flash-Next, a knob on the 27B -- whether the 27B should
+  default to it is Brian's call, it changes multi-turn behaviour). 27B two cards: 223k -> 367k KV tokens.
+- **The cards run at 210 W with a -42 mV voltage offset** (LACT in the guest, `amdgpu.ppfeaturemask=0xffffffff`,
+  `/etc/lact/config.yaml`; the boot service `r9700-powercap.service` sets the same caps). The 225 W numbers in
+  README stay the reference and are labelled; measure new things at 210 W and say so. Item 3 below is superseded
+  by this decision (Brian, 2026-10-03), not by the perf argument.
+- **The host crashed once on 2026-10-03** when a chronic `MES failed to respond to msg=INVALIDATE_TLBS` on one card
+  (~130 occurrences since September, every card, normally self-recovering) escalated into a GPU reset; under
+  passthrough the reset took the card off the bus and the EPYC sync-flooded. Not this code, not load, not heat.
+  Proposed containment, Brian's call: `amdgpu.gpu_recovery=0` in the guest. PROGRESS.md 2026-10-03 has the
+  evidence; `reference_r9700_host_100` in the agent memory has the host notes.
+- **Owed for two releases now:** a quality eval (GSM8K/HumanEval), a full BetterBench, a mixed-length soak -- on
+  every configuration. Do these before the next tag unless Brian waives them again.
+- The fifth card (chain C, passively cooled) is in VM100 as HIP 4; three more arrive later (8 total, two VMs or a
+  4+2+2 split; the hang rate does not depend on cards per VM and a reset in any VM takes the host).
+- TTFT (the section below) was fixed in v0.2.3 (97 -> 47 ms on the 27B); the section is kept as the record of the
+  investigation.
+
 Working and default: our own paged attention; A-tiled (fragment-tiled activation) prefill GEMM; folded-exponent
 MXFP4; DFlash2 speculative decoding; NVFP4→MXFP4 conversion at load; GDN `in_proj` merge; expert LRU cache.
 
@@ -96,6 +118,13 @@ costs −55% prefill, so the work took "unusable without it" down to "11% behind
 `notes/replacement-plan.md` is the plan for removing the remaining non-permissive dependencies entirely.
 
 ## What's actually left, roughly in order
+
+**Added 2026-10-03:** (a) the owed release checks above; (b) one-page stage 2: `mamba_cache_mode` "align" (prefix
+caching on) via boundary checkpoints from the replay, so the 27B can keep prefix caching and the memory; (c) the
+200k-context single-card run with the drafter needs the 25% attention-group padding in vLLM's hybrid grouping
+addressed upstream (report a candidate); (d) the mixed-step numerics: vLLM sends a running request's rows through
+the prefill attention path when a prefill shares the step, so texts depend on batching -- stock behaviour, noted so
+nobody chases it again (`~/batchid.py`, `~/stepcmp.py` on VM100 are the tools if it comes up).
 
 1. **An eval that can detect regressions.** See the GSM8K point above. Until this exists, quality claims here are
    weaker than they look.
