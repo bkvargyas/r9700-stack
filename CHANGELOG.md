@@ -11,10 +11,13 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 One state page per request for the GDN layers under speculative decoding: 64% more KV cache for the 27B on two
 cards, 18% for Flash-Next on two cards, 9% on four, and four concurrent 27B requests fit on one card where stock
-pages admit two. **Tagged on the unit gates and strict sanity under overload on every configuration, by decision**
-(0 bad of 5,680); not on a quality eval, a BetterBench or a mixed-length soak -- those are still owed, now for two
-releases. The test box also moved to 210 W and a -42 mV voltage offset on every card this day; the probe numbers in
-this entry are at that setting, the earlier entries at 225 W.
+pages admit two. Tagged on the unit gates and strict sanity under overload on every configuration (0 bad of
+5,680), by decision; **the full checklist ran the same day, all green**: GSM8K full set and HumanEval on all three
+configurations, the paired thinking-mode GSM8K against the September baselines and the reference stack (no
+detectable difference), a full BetterBench on all three (decode level or better than the 225 W references,
+concurrency up, prefill 0-11% lower), 25-minute mixed soaks with flat VRAM, and 0 bad of 8,340 under overload
+(`notes/release-v0.2.4.md`). The test box also moved to 210 W and a -42 mV voltage offset on every card this day;
+the probe numbers in this entry are at that setting, the earlier entries at 225 W.
 
 ### Added
 - **One GDN state page per request under speculative decoding** (`R9K_GDN_STATE=onepage`, the default when

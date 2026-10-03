@@ -519,6 +519,9 @@ def _nonspec_decodes(self, md, qkvz, ba, out, qkv_size, Hv):
                 self.kv_cache[3], self.kv_cache[4], idx, md.non_spec_query_start_loc[: N + 1],
                 acc[:N].to(torch.int32).contiguous(), Hk, Hv, scale, eps, zero_from=n_act,
                 gate_sigmoid=self.norm.activation == "sigmoid")
+    if TRACE:
+        _trace(self, "nonspec", md, mixed, b, a, qkvz[:, qkv_size:], out, idx.view(-1, 1), md.non_spec_query_start_loc,
+               acc[:N].to(torch.int32), N, self.kv_cache)
 
 
 def _fused_ok(self, md) -> bool:

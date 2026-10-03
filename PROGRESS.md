@@ -1502,6 +1502,38 @@ default (it needs `PREFIX_CACHE=0`, a serving-behaviour change on the 27B, Brian
 caching) support via boundary checkpoints from the replay; the 200k single-card run with the drafter still needs
 the 25% attention-page padding addressed upstream.
 
+### 2026-10-03, evening: the validation debt paid, the MES firmware tested, and what determinism looks like
+
+**Validation debt (v0.2.3 and v0.2.4 had been tagged on unit gates and strict sanity only).** Run on the production
+copy at v0.2.4, 210 W, -42 mV, one server at a time: GSM8K full set (1,319, conc 1) and HumanEval (164) on all three
+configurations; the paired thinking-mode GSM8K (first 800, conc 1) on the 27B with one-page and with stock pages;
+full BetterBench on all three; 25-minute mixed-length soaks (16 clients, 200-30k tokens) with VRAM sampled; strict
+sanity under overload at NSEQ+1 and 2xNSEQ. Everything green; the tables are in `notes/release-v0.2.4.md`. Headlines:
+one-page and stock pages score identically with thinking (96.88%, 0 discordant); against the v0.2.0-era baseline
+(97.50%) and the reference stack (97.62%) the paired test finds no difference (p = 0.36 / 0.21); BetterBench decode
+is level with or above the 225 W references (27B 200.3 vs 197.5, four cards 160.9 vs 159.2, two-card offload 97.3 vs
+97.4), concurrency up 6-12% on the 27B, prefill 0-11% lower (cap + attention block); soaks 1,283 requests, 0 errors.
+A GSM8K caveat worth remembering: the September baselines are thinking-on, first 800 questions; a no-think full-set
+run (94.69% on the 27B) is a different test and `eval.py compare` across the two is meaningless (100% of outputs
+differ by construction).
+
+**Determinism, settled.** 18 of 800 thinking answers differed between one-page and stock at conc 1. Replayed alone
+with every step traced: no draft-less or short step anywhere (so not the `_nonspec_decodes` path); one-page gave
+identical text and identical step counts in every run and on both card pairs; stock pages changed one answer's
+length between two runs on the same server (514 vs 536 steps) and its step counts moved again when given the
+one-page attention block size. So the slot design (`r9k_gdn_decode_mtp`, stock pages) has a rare run-to-run
+nondeterminism and one-page does not; accuracy is unaffected. Low-priority follow-up now that one-page replaces it;
+the tools are `~/replay18.py` / `~/replay18b.py` on VM100 and `R9K_GDN_TRACE=1` (now also on the non-spec path).
+
+**MES firmware.** linux-firmware's 2026-09-11 GC 12.0.1 drop (20260916 release: `gc_12_0_1_uni_mes.bin` 0x93, ME
+0xc12, PFP 0xc76, MEC 0xd7a; the 20260810 package had MES 0x91 with `uni_mes` a symlink to the 12.0.0 blob) was
+installed in the guest and tested with nine launches: 16 `INVALIDATE_TLBS` timeouts in six four-card Flash-Next
+launches (four of six affected, 0-6 each, four different cards), none in the two-card and 27B launches, no
+escalation, throughput identical. On 0x91 the same day: 5 in four such launches. Not a fix. Rollback to the packaged
+set (backup in `~/fw-20260810-backup`) recommended, Brian's call. The report for AMD is a comment on drm/amd #5759
+(`notes/bug-mes-invalidate-tlbs.md`), which already describes this stack's problem on another box. Lesson from the
+day: VM100 has no cron; `@reboot` hooks silently do nothing -- use systemd or run by hand.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:

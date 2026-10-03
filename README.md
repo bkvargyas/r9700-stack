@@ -164,8 +164,8 @@ practical ceiling.
 Benchmarks measure speed. They did not notice that three releases produced wrong output for some requests and ran
 out of memory under real traffic, because every check ran at fixed prompt lengths and at or below the sequence
 limit. Since v0.2.2 a release is meant to be tagged only after, on **every** configuration above and on the exact
-release code (v0.2.3 was tagged on the first two rows plus the soaks for its memory change, and v0.2.4 on the
-first two rows, both by decision; the rest is owed):
+release code (v0.2.3 was tagged on the first two rows plus the soaks for its memory change, by decision; v0.2.4
+was tagged on the first two rows and the rest ran the same day -- all green, numbers in its notes):
 
 | check | passes when | v0.2.2 |
 |---|---|---|

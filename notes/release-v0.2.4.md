@@ -6,11 +6,13 @@ Flash-Next gains 18% on two cards and 9% on four; a running request pins a quart
 and four concurrent 27B requests fit on one card, where stock pages admit two. Decode and concurrency are equal or
 better, long prefill is 1-6% slower (a larger attention block). Output is bit-identical to the slot design.
 
-**What this release was checked with, and what it was not.** Tagged, by decision, on the unit gates and strict
-sanity under overload on every configuration (0 bad answers of 5,680), single-request texts identical to stock
-pages, and sixteen-way concurrency agreement at least as good as stock's. **Not run:** a quality eval (GSM8K,
-HumanEval), a full BetterBench, a mixed-length soak. Those were owed with v0.2.3 and are still owed. The test box
-moved to 210 W and a -42 mV voltage offset the same day; probe numbers here are at that setting.
+**Checked, the same day as the tag (2026-10-03, 210 W and -42 mV on every card, prefix caching off so one-page
+is active on the 27B):** the unit gates; strict sanity under overload on all three configurations (0 bad of 8,340
+across the day); GSM8K on the full 1,319-question test set at concurrency 1 and HumanEval on all 164 problems on
+all three configurations; the paired thinking-mode GSM8K against the September baselines on the 27B; a full
+BetterBench on all three configurations; a 25-minute mixed-length soak (16 clients, 200-30k-token prompts) on all
+three with VRAM sampled. Numbers in the tables below. The tag itself went out a few hours before these finished,
+by decision; nothing in them changed the code.
 
 ## What it does
 
@@ -55,21 +57,39 @@ all-reduce on two cards, and the drafter's choices at three or more identical pr
 
 ## Checked
 
-- Unit gates: `test_gdn_onepage_r9k.py` (new, 13 cases), `test_gdn_prefill_r9k.py`, the rest of the suite
-  unchanged.
-- Strict sanity under overload (more requests than `max_num_seqs`): 27B one card 0 bad of 360 and 0 of 2,040 at
-  210 W with 17 clients; 27B two cards 0 of 990 twice; Flash-Next two cards 0 of 990 twice; Flash-Next four cards
-  0 of 1,870. Reviewer passes by the 27B itself on the three diffs: no confirmed defect.
-- Texts: six single-request prompts identical to stock pages at temperature 0; sixteen fixed prompts at 16
-  concurrent, six runs, every run completing all 4,096 tokens, run-to-run agreement 7-16 of 16 (stock 5-16).
-- Probes vs stock on every configuration (table above): decode and concurrency equal or better.
+| 210 W, -42 mV, one-page | 27B two cards | Flash-Next four cards | Flash-Next two cards (offload) |
+|---|--:|--:|--:|
+| GSM8K full 1,319, no thinking, conc 1 | 94.69% | 95.68% | 95.60% |
+| HumanEval 164 | 97.56% (160) | 96.34% (158) | 98.17% (161) |
+| BetterBench combined decode, tok/s (README 225 W ref.) | 200.3 (197.5) | 160.9 (159.2) | 97.3 (97.4) |
+| BetterBench concurrency 1 / 2 / 4 / 8, tok/s | 185 / 314 / 450 / 558 | 151 / 236 / 353 / 505 | 88 / 109 / 117 / 114 |
+| BetterBench prefill 2k / 8k / 16k / 32k, tok/s | 3,860 / 4,076 / 4,035 / 3,825 | 5,689 / 6,930 / 7,169 / 6,929 | 2,149 / 3,511 / 3,834 / 3,784 |
+| time to first token p50 | 71 ms | 77 ms | 463 ms |
+| mixed soak, 16 clients, 25 min | 383 served, 0 errors, VRAM flat | 661 served, 0 errors, VRAM plateau | 239 served, 0 errors, 14 over-length prompts rejected by design |
+| strict sanity under overload | 0 bad of 900 and 960 | 0 bad of 1,700 and 1,920 | 0 bad of 900 and 960 |
+
+Against the README's 225 W references: decode and step time level or slightly better (the undervolt), concurrency
+up 6-12% on the 27B and 6% at 8 clients on four cards (the KV room), first token keeps the v0.2.3 gain, prefill
+4-11% lower on four cards and 0-8% on the 27B at the short depths (the lower cap plus the larger attention block).
+
+**Paired GSM8K, 27B two cards, thinking on, first 800 questions, concurrency 1** (the comparable form of the
+September baselines): one-page 96.88% and stock pages 96.88% on the same code, 0 discordant questions, 782 of 800
+outputs byte-identical; against our v0.2.0-era baseline (97.50%) 7 vs 12 discordant, p = 0.36; against the reference
+stack (97.62%) 5 vs 11, p = 0.21: no detectable difference either way. The 99% output divergence from the September
+runs is the v0.2.3 short-prefill core taking a more exact numeric path.
+
+**Determinism.** Replaying the 18 differing thinking answers alone, twice per server: one-page gave identical
+text and identical step counts every time, on both card pairs; stock pages did not (one question changed length
+between two runs on the same server), and stock's step counts moved with the attention block size too. The slot
+design has a rare run-to-run wobble that one-page does not; accuracy is unaffected. Low-priority follow-up now that
+one-page replaces it.
+
+- Reviewer passes by the 27B itself on the three diffs: no confirmed defect.
 - The deliberate five-card reproduction of the night's host crash (three servers launched at once): clean.
 
 ## Not checked
 
-- No quality eval (GSM8K or HumanEval) on this code or on v0.2.3's.
-- No full BetterBench; the probe numbers are per-request client medians.
-- No mixed-length soak.
+- Nothing from the v0.2.2 checklist is outstanding for this release.
 
 ## Operational notes from the same day (PROGRESS.md 2026-10-03)
 
