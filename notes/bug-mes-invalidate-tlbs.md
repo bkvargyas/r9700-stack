@@ -44,11 +44,14 @@ does not recover anything. Data points:
    core (SMCA EX bank, code 0: watchdog timeout on a stalled transaction). The host BMC log shows no power event;
    AER afterwards shows only advisory correctable errors; the card re-enumerated normally after the power cycle.
    So on this platform the reset that #5759 calls a 1-2 s recovery costs the whole host.
-3. Firmware: linux-firmware 20260810 set -- MES 0x91 (`gc_12_0_1_mes.bin`/`mes1.bin`, no `uni_mes`), SMC
+3. **MES 0x93 does not help.** With the 2026-09-11 GC 12.0.1 set (`gc_12_0_1_uni_mes.bin` 0x93, ME 0xc12, PFP
+   0xc76, MEC 0xd7a) installed and the guest rebooted, six consecutive launches of the same four-card vLLM
+   configuration produced 16 `INVALIDATE_TLBS` timeouts across four cards (0-6 per launch, four of six launches
+   affected) against 5 in four launches on 0x91 the same day; no escalation either way; throughput identical.
+4. Firmware before that: linux-firmware 20260810 set -- MES 0x91 (`gc_12_0_1_mes.bin`/`mes1.bin`, no `uni_mes`), SMC
    104.79.0, PSP SOS 0x003a1214, MEC 0x0d66, PFP 0x0c6c, ME 0x0c08, RLC 0x00be7da0, IMU 0x0c302b00, SDMA
-   0x00798e96. The guest kernel has the Linux 7.0 TLB-fence rework. We are about to try the 2026-09-11 GC 12.0.1
-   drop (`gc_12_0_1_uni_mes.bin`, MES 0x93 per #5909) and will report back.
-4. A deliberate reproduction of the configuration that crashed (three vLLM servers launched at once across five
+   0x00798e96. The guest kernel has the Linux 7.0 TLB-fence rework. (see 3 for the 2026-09-11 drop.)
+5. A deliberate reproduction of the configuration that crashed (three vLLM servers launched at once across five
    cards, then concurrent stress) ran clean, and so did ~8 hours of serving since; the timeouts recur, the
    escalation has not.
 
