@@ -23,47 +23,53 @@ Posting needs a gitlab.freedesktop.org account; none is configured on the manage
 
 ---
 
-**Comment for #5759 (paste as is; the long form below it is the standalone version if a new issue is preferred).**
+**Comment for #5759 (final text, 2026-10-04; posts under Brian's account after his review).**
 
-Same symptom family on five Radeon AI PRO R9700 (Navi 48, `1002:7551`, `1849:5413`, VBIOS 113-APM107573-101) --
-with one important difference: ours sit behind vfio-pci in a KVM guest (Debian 13, kernel 7.2.6, QEMU 11.0.3,
-EPYC 7H12 host, PLX PEX 8747 switches, an emulated PCIe switch in the guest for p2p), and there the MODE1 reset
-does not recover anything. Data points:
+Same symptom family on five Radeon AI PRO R9700 (Navi 48, `1002:7551`, `1849:5413`, VBIOS 113-APM107573-101),
+with two findings that may help: a workaround that removes the `INVALIDATE_TLBS` timeouts entirely in our testing,
+and a reproducer that takes about four minutes.
 
-1. The soft variant `MES(1) failed to respond to msg=INVALIDATE_TLBS`: 131 occurrences 2026-09-17 to 2026-10-03,
-   on every card (45 / 20 / 20 / 31 on the four long-serving cards, 0 so far on a fifth added on 10-02 that has had
-   little load), in bursts during model weight loading and CUDA-graph capture under vLLM (ROCm 10 nightly). Not
-   power or heat: two episodes caught at 32-75 W and 32-38 C; the rest at 210-225 W and 55-78 C. Also seen on an
-   idle-ish card during another card's load.
-2. The escalation, once (2026-10-03 02:21 UTC), on the card that is only ever used in four-card runs: three
-   `INVALIDATE_TLBS` timeouts two seconds apart, then `MES(0) failed to respond to msg=REMOVE_QUEUE`, `SUSPEND`,
-   "failed to suspend all gangs", "MES might be in unrecoverable state, issue a GPU reset", `GPU reset begin!.
-   Source: 3`, "Dumping IP State" -- and eight seconds later `device lost from bus!` with SMU bus errors
-   (`response:0xFFFFFFFF`). Under passthrough the device never came back; about two minutes later the host
-   platform reset itself with "an uncorrected error caused a data fabric sync flood event" and a fatal MCE on one
-   core (SMCA EX bank, code 0: watchdog timeout on a stalled transaction). The host BMC log shows no power event;
-   AER afterwards shows only advisory correctable errors; the card re-enumerated normally after the power cycle.
-   So on this platform the reset that #5759 calls a 1-2 s recovery costs the whole host.
-3. **MES 0x93 does not help.** With the 2026-09-11 GC 12.0.1 set (`gc_12_0_1_uni_mes.bin` 0x93, ME 0xc12, PFP
-   0xc76, MEC 0xd7a) installed and the guest rebooted, six consecutive launches of the same four-card vLLM
-   configuration produced 16 `INVALIDATE_TLBS` timeouts across four cards (0-6 per launch, four of six launches
-   affected) against 5 in four launches on 0x91 the same day; no escalation either way; throughput identical.
-4. Firmware before that: linux-firmware 20260810 set -- MES 0x91 (`gc_12_0_1_mes.bin`/`mes1.bin`, no `uni_mes`), SMC
-   104.79.0, PSP SOS 0x003a1214, MEC 0x0d66, PFP 0x0c6c, ME 0x0c08, RLC 0x00be7da0, IMU 0x0c302b00, SDMA
-   0x00798e96. The guest kernel has the Linux 7.0 TLB-fence rework. (see 3 for the 2026-09-11 drop.)
-5. A deliberate reproduction of the configuration that crashed (three vLLM servers launched at once across five
-   cards, then concurrent stress) ran clean, and so did ~8 hours of serving since; the timeouts recur, the
-   escalation has not.
+**Environment.** vfio-pci passthrough into a KVM guest (Debian 13, kernel 7.2.6 mainline build, QEMU 11.0.3; host
+EPYC 7H12 under Proxmox 9.2 with PLX PEX 8747 switches; an emulated PCIe switch in the guest for p2p DMA, hence
+`amdgpu.pcie_gen_cap=0x001F001F amdgpu.pcie_lane_cap=0x003F003F`). Workload: vLLM (ROCm 10 nightly) serving a
+~250B MoE across four cards with speculative decoding. Cards at 210 W.
 
-Questions for the amdgpu side: (a) is the INVALIDATE_TLBS timeout a known gfx12 MES issue with a firmware fix in
-0x93 or planned? (b) for passthrough guests, is `amdgpu.gpu_recovery=0` (keep the hung queues, let the VM be
-rebooted, which does a working FLR) the recommended containment, or is there a knob to retry / lengthen the MES
-timeout before declaring the MES unrecoverable? (c) could the emulated switch's lack of PCIe atomics (we run with
-`amdgpu.pcie_gen_cap=0x001F001F amdgpu.pcie_lane_cap=0x003F003F`) add MES message latency, or is the trigger the
-mapping churn alone? Full dmesg of the escalation boot, `amdgpu_firmware_info`, `lspci -vv` (host and guest), the VM
-topology and the per-card history are available.
+**The soft variant** (`MES(1) failed to respond to msg=INVALIDATE_TLBS`): ~150 occurrences since 2026-09-17 on
+every card, all of them during model weight loading and CUDA-graph capture, i.e. while page tables are being
+written at full speed; never during serving. **Reproducer:** launching the four-card server produces about one
+timeout per launch (6 in 6 launches, 5 in 4, 6 in 6 across three sessions); the two-card servers and a 27B dense
+model almost never do (0 in dozens of launches).
 
----
+**Escalation, once** (2026-10-03 02:21 UTC): three `INVALIDATE_TLBS` timeouts two seconds apart, then `MES(0)
+failed to respond to msg=REMOVE_QUEUE`, `SUSPEND`, "failed to suspend all gangs", "MES might be in unrecoverable
+state, issue a GPU reset", `GPU reset begin!. Source: 3`, "Dumping IP State", and eight seconds later `device lost
+from bus!` with SMU bus errors (`response:0xFFFFFFFF`). Under passthrough the device never came back; two minutes
+later the host reset itself ("an uncorrected error caused a data fabric sync flood event", fatal MCE on the core
+that was stalled on the dead device). On this platform the MODE1 reset that recovers in 1-2 s on bare metal costs
+the whole host, so for us a hang is a reset is an outage.
+
+**What does not change the rate** (six four-card launches each, same box, same day):
+- MES firmware: 0x8b (linux-firmware 20260622), 0x91 (20260810), 0x93 (20260916, `gc_12_0_1_uni_mes.bin`):
+  6 / 5-in-4 / 16 timeouts. Same ME/PFP/MEC generations as those packages.
+- Power and temperature: timeouts at 32-75 W and 32-38 C as readily as at 210 W and 75 C.
+- `amdgpu.vm_update_mode=3` and `amdgpu.ras_enable=0`: both ran clean, but see the next point.
+
+**What does:** `amdgpu.mes_log_enable=1`. With it, 0 timeouts in 24 four-card launches (three sessions, two of
+them with the knobs above, one with nothing else changed); back to default in between, 6 in 6 again; then on again.
+Launch time, decode and prefill throughput are identical with and without it. As far as I can read mes_v12_0.c,
+the only thing the flag changes toward the firmware is `enable_mes_event_int_logging = 1` plus the
+`event_intr_history_gpu_mc_ptr` buffer in SET_HW_RESOURCES; the message timeout (2100 ms) and polling are the same.
+So the firmware's handling of the INVALIDATE_TLBS message on pipe 1 appears to differ when event logging is on, which
+looks like a completion-signalling race in the MES that the logging path happens to paper over. We are running with
+the flag permanently now; happy to collect the event log or anything else useful.
+
+**Questions:** (a) does the logging-on/off difference point at a known MES issue, and is a firmware fix planned?
+(b) for passthrough guests, is `amdgpu.gpu_recovery=0` the recommended containment, given that the MODE1 reset
+takes the device off the bus here? (c) would a retry of INVALIDATE_TLBS before declaring the MES unrecoverable be
+acceptable upstream?
+
+Full dmesg of the escalation boot, `amdgpu_firmware_info` for all three firmware sets, host/guest `lspci -vv`,
+the VM topology and the per-launch counts are available on request.
 
 ---
 

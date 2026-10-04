@@ -1534,6 +1534,40 @@ set (backup in `~/fw-20260810-backup`) recommended, Brian's call. The report for
 (`notes/bug-mes-invalidate-tlbs.md`), which already describes this stack's problem on another box. Lesson from the
 day: VM100 has no cron; `@reboot` hooks silently do nothing -- use systemd or run by hand.
 
+### 2026-10-04: the MES timeouts have a workaround -- `amdgpu.mes_log_enable=1`
+
+Method: six launches of the four-card Flash-Next server per condition (the launch is where every timeout we have
+ever seen occurred; serving never produced one), one change per reboot, same box, same day, the kernel log watched
+for `MES(1) failed to respond to msg=INVALIDATE_TLBS`.
+
+| condition | launches | timeouts |
+|---|--:|--:|
+| MES 0x91 (linux-firmware 20260810, the Debian package), defaults | 4 | 5 |
+| MES 0x93 (20260916), defaults | 6 | 16 |
+| MES 0x8b (20260622, what production runs), defaults | 6 | 6 |
+| MES 0x8b, `vm_update_mode=3` + `mes_log_enable=1` | 6 | 0 |
+| MES 0x8b, `ras_enable=0` + `mes_log_enable=1` | 6 | 0 |
+| MES 0x8b, `mes_log_enable=1` alone | 6 | 0 |
+| MES 0x8b, defaults again (negative control) | 6 | 6 |
+
+So: not the firmware version (three generations, same rate), not power or heat, not page-table update mode or RAS,
+and not the box healing -- the one variable that moves the count is the MES event log, 0 in 18 launches with it
+against 6, 6, 5-in-4 and 16 without. In the driver the flag only adds `enable_mes_event_int_logging = 1` and a
+buffer address to the SET_HW_RESOURCES packet; timeout (2,100 ms) and polling are unchanged, so the difference is in
+the firmware's behaviour when it is logging. Launch time, decode and prefill were identical in every condition.
+PyTorch's expandable-segments allocator was also tried as a way to reduce mapping churn and does not start on this
+stack (HSA memory fault at engine init; the IPC handles the all-reduce uses do not cover VMM-backed allocations).
+
+Production (two cards, MES 0x8b, kernel 7.1.10, ROCm 7.14, idle for weeks) has 3 timeouts in its whole history,
+all in one burst during its setup period; two-card launches on the test box run at a similar low rate, so the
+production comparison mostly says "four-card launches are the trigger", not "production's stack is immune".
+
+State: the test box runs with `amdgpu.mes_log_enable=1` on MES 0x8b (production's firmware set; the 20260810 and
+20260916 sets are backed up in `~/fw-20260810-backup` and `~/fw-20260916-backup`), caps 210 W, -42 mV. Proposed
+for Brian: the same flag plus `amdgpu.gpu_recovery=0` on production and on every future VM; the drm/amd #5759
+comment (`notes/bug-mes-invalidate-tlbs.md`) rewritten around this result. Keep counting: the meswatch stays on and
+every launch from here is a data point.
+
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
 1.5x, prefill +18..+29%, concurrency +12..+20%. What is left, in the order it looks worth doing:
