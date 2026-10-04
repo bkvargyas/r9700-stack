@@ -7,6 +7,12 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+### Added
+- `notes/mes-timeouts.md`: the RDNA4 `MES(1) failed to respond to msg=INVALIDATE_TLBS` timeouts under KVM
+  passthrough, the host crash they caused once, the experiment matrix (three firmware versions, power, page-table
+  mode, RAS: no effect) and the workaround now on both of our boxes, `amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0`
+  (0 timeouts in 24 launches vs ~1 per launch). Reported to AMD on drm/amd #5759.
+
 ## [0.2.5] - 2026-10-04
 
 The v0.2.4 code with its validation record, and two housekeeping fixes. No behaviour change.
