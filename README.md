@@ -11,7 +11,7 @@ the cards talk to each other at ~13.7 GB/s; the same code on a PCIe 5 box would 
 again. The numbers are in [Benchmarks](#benchmarks); the story of how each one moved is in
 [PROGRESS.md](PROGRESS.md).
 
-**Current release: [v0.2.4](notes/release-v0.2.4.md) (2026-10-03).** One state page per request for the GDN layers
+**Current release: [v0.2.5](notes/release-v0.2.5.md) (2026-10-04)**, the v0.2.4 code with its full validation record and the version string fixed. **v0.2.4 (2026-10-03):** One state page per request for the GDN layers
 under speculative decoding: 64% more KV cache for the 27B on two cards (223k to 367k tokens), 18% for Flash-Next on
 two cards, 9% on four, and four concurrent 27B requests on one card where stock pages admit two; decode and
 concurrency equal or better, long prefill 1-6% slower. Needs prefix caching off (`PREFIX_CACHE=0`; the default for
@@ -240,7 +240,8 @@ restart once (the launch that compiles gets a smaller KV pool).
 | file | what it's for |
 |---|---|
 | [CHANGELOG.md](CHANGELOG.md) | What changed in each release. |
-| [notes/release-v0.2.4.md](notes/release-v0.2.4.md) | The current release: one GDN state page per request, the defect found on the way, and exactly what was checked. |
+| [notes/release-v0.2.5.md](notes/release-v0.2.5.md) | The current release: v0.2.4 plus its validation record and the version string. |
+| [notes/release-v0.2.4.md](notes/release-v0.2.4.md) | v0.2.4: one GDN state page per request, the defect found on the way, and exactly what was checked. |
 | [notes/release-v0.2.3.md](notes/release-v0.2.3.md) | v0.2.3: the first-token fix, the memory change, and exactly what was checked. |
 | [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | v0.2.2: the three real-traffic bugs it fixes, how they were found, and its validation. |
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |

@@ -7,6 +7,23 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-10-04
+
+The v0.2.4 code with its validation record, and two housekeeping fixes. No behaviour change.
+
+### Fixed
+- The plugin announced itself as 0.2.3 in the startup log of the v0.2.4 tag; the version string is now right.
+
+### Added
+- The full release checklist for v0.2.4, run the day it was tagged and all green, is in
+  `notes/release-v0.2.4.md` (GSM8K full set and HumanEval on all three configurations, the paired thinking-mode
+  GSM8K against the September baselines and the reference stack, full BetterBench, mixed soaks, strict sanity under
+  overload: 0 bad of 8,340) and summarized in PROGRESS.md 2026-10-03.
+- `R9K_GDN_TRACE=1` (diagnosis, off by default) now also covers the draft-less decode path.
+- `notes/bug-mes-invalidate-tlbs.md`: the write-up of the gfx1201 MES `INVALIDATE_TLBS` timeouts and the reset that
+  took a card off the bus, as a comment for drm/amd issue 5759, with the result that the 2026-09-11 MES firmware
+  (0x93) does not reduce them.
+
 ## [0.2.4] - 2026-10-03
 
 One state page per request for the GDN layers under speculative decoding: 64% more KV cache for the 27B on two
