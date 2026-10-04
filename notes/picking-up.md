@@ -93,8 +93,13 @@ contradict it.
   passthrough the reset took the card off the bus and the EPYC sync-flooded. Not this code, not load, not heat.
   Proposed containment, Brian's call: `amdgpu.gpu_recovery=0` in the guest. PROGRESS.md 2026-10-03 has the
   evidence; `reference_r9700_host_100` in the agent memory has the host notes.
-- **Owed for two releases now:** a quality eval (GSM8K/HumanEval), a full BetterBench, a mixed-length soak -- on
-  every configuration. Do these before the next tag unless Brian waives them again.
+- **MES timeouts, solved for now (2026-10-04):** `amdgpu.mes_log_enable=1` on the guest kernel line removes the
+  `MES(1) failed to respond to msg=INVALIDATE_TLBS` timeouts (0 in 24 four-card launches vs ~1 per launch without;
+  firmware version, power, page-table mode and RAS made no difference). Both VMs run it plus `amdgpu.gpu_recovery=0`
+  so a future hang wedges one card instead of resetting it off the bus and taking the host. Put both on every new
+  VM. The write-up for AMD is `notes/bug-mes-invalidate-tlbs.md` (drm/amd #5759). PROGRESS.md 2026-10-03/04.
+- ~~Owed for two releases~~ -- paid 2026-10-03 (`notes/release-v0.2.4.md`): GSM8K/HumanEval, BetterBench and the
+  mixed soaks on every configuration, all green. v0.2.5 is the tag that carries the record.
 - The fifth card (chain C, passively cooled) is in VM100 as HIP 4; three more arrive later (8 total, two VMs or a
   4+2+2 split; the hang rate does not depend on cards per VM and a reset in any VM takes the host).
 - TTFT (the section below) was fixed in v0.2.3 (97 -> 47 ms on the 27B); the section is kept as the record of the

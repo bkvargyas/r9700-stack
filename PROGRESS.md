@@ -1562,11 +1562,13 @@ Production (two cards, MES 0x8b, kernel 7.1.10, ROCm 7.14, idle for weeks) has 3
 all in one burst during its setup period; two-card launches on the test box run at a similar low rate, so the
 production comparison mostly says "four-card launches are the trigger", not "production's stack is immune".
 
-State: the test box runs with `amdgpu.mes_log_enable=1` on MES 0x8b (production's firmware set; the 20260810 and
-20260916 sets are backed up in `~/fw-20260810-backup` and `~/fw-20260916-backup`), caps 210 W, -42 mV. Proposed
-for Brian: the same flag plus `amdgpu.gpu_recovery=0` on production and on every future VM; the drm/amd #5759
-comment (`notes/bug-mes-invalidate-tlbs.md`) rewritten around this result. Keep counting: the meswatch stays on and
-every launch from here is a data point.
+Applied (Brian, 2026-10-04 03:30 UTC): both VMs boot with `amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0`. The
+test box is back on the Debian-packaged firmware (20260810, MES 0x91) and ran six more four-card launches clean
+with the flag -- 24 of 24 across three firmware versions now, against ~1 per launch without it. Production rebooted
+into the same parameters and its stack came back on its own (container restarted, endpoint answering in three
+minutes). The drm/amd #5759 comment is written (`notes/bug-mes-invalidate-tlbs.md`); the tracker's spam filter
+rejects API posts from the day-old account, so it goes in from the browser. Keep counting: the meswatch stays on
+and every launch from here is a data point.
 
 ### Next
 State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same box): decode +19%, step -18%, TTFT
