@@ -1597,3 +1597,26 @@ State at v0.2.0 (Flash-Next TP4, full BetterBench, vs Rob's image on the same bo
   carry it?
 - Prefix caching is off by default for Flash-Next (`PREFIX_CACHE=1` restores cross-request prefix reuse): a
   serving-behaviour change, right for benchmarks and one-shot prompts, wrong for long multi-turn sessions.
+
+## 2026-10-04 (evening): the MES workaround under a soak; radiance test run
+
+**MES workaround, more evidence.** Twelve cycles of {Flash-Next four cards, 27B two cards, Flash-Next two cards}
+on the test box (`~/mes-soak.sh`): launch, strict sanity (conc NS+1 x 10), a 5-8 minute mixed-length soak with 16
+clients, teardown. 36 launches, 0 MES or GPU kernel events, 0 bad answers, 0 soak errors; with the 24 launches of
+the reboot experiments that is 60 launches on `amdgpu.mes_log_enable=1` against the ~1 timeout per four-card launch
+without it. One blemish unrelated to MES: in cycle 9 the 27B server answered `/v1/models` after 234 s (it normally
+takes ~580 s) and then refused every connection; its log had 7 error lines, which the soak script deleted with the
+container before anyone read them; no kernel event. The other 35 launches were normal. A container-log snapshotter
+(`~/logsnap.sh`) now keeps the last 400 lines of the running server on disk for the next time.
+
+**radiance.** Brian asked for a test run of https://codeberg.org/StillDeadcode/radiance, an LLM server with its own
+C++/HIP engine and kernels (not vLLM). Built VM 102 on the production host to the test box's kernel and firmware,
+handed it the two production cards (production VM stopped for five hours, idle anyway), ran the published image (the 1.0.4 build) and
+containers through our release checklist with our clients, then gave the cards back. Write-up with the tables:
+`notes/radiance-test-run.md`. In short: the 27B (FP8) is correct and stable, GSM8K 95.60% to our 94.69% (p = 0.06),
+HumanEval equal, KV pool 549k tokens to our 367k, 38 s to serve; decode 112 vs our 200 tok/s combined (FP8 bytes vs
+our 4-bit), prefill equal, concurrency 422 vs 558 at eight. Flash-Next is not usable under load by our bar: 2-6% wrong
+or off-format answers in batches of 9-16 (clean alone; worse with speculation off; better but not clean with the exact
+all-reduce wire), and prefill falls from 5.6k tok/s alone to ~400 tok/s aggregate with four long prompts in flight
+(16-client soak: 72 requests served to our 239). Quality at conc 1 equal to ours (95.83% / 98.17%), time to first
+token 141 ms to our 463, eight-client decode 143 to our 114.

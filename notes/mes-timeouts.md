@@ -10,8 +10,8 @@
 amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0
 ```
 
-The first one made the timeouts disappear in our testing (0 in 24 heavy launches, against about 1 per launch
-without it). The second one stops the driver from resetting a hung card, because under passthrough that reset takes
+The first one made the timeouts disappear in our testing (0 in 60 heavy launches, 36 of them followed by sanity
+checks and a mixed-length soak under 16 clients, against about 1 per launch without it). The second one stops the driver from resetting a hung card, because under passthrough that reset takes
 the card off the bus and, on our EPYC host, resets the whole host. Neither costs measurable performance.
 
 ## What it looks like

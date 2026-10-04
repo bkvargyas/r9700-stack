@@ -187,7 +187,7 @@ escalated into a GPU reset that took the card off the bus and the host down. Two
 amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0
 ```
 
-The first removed the timeouts in 24 of 24 launches that produced them otherwise, at no measurable cost; the second
+The first removed the timeouts in 60 of 60 launches that produced them otherwise, at no measurable cost; the second
 keeps a future hang from becoming a host reset. The evidence, the mechanism as far as we can read it, and how to
 apply it are in [notes/mes-timeouts.md](notes/mes-timeouts.md); the report to AMD is
 [drm/amd #5759](https://gitlab.freedesktop.org/drm/amd/-/issues/5759#note_3693873).
@@ -261,6 +261,7 @@ restart once (the launch that compiles gets a smaller KV pool).
 | [notes/release-v0.2.2.md](notes/release-v0.2.2.md) | v0.2.2: the three real-traffic bugs it fixes, how they were found, and its validation. |
 | [PROGRESS.md](PROGRESS.md) | The full engineering log: every change, what it measured, and what was tried and rejected. |
 | [notes/picking-up.md](notes/picking-up.md) | **Start here if you're returning to this after a break.** Current state, open threads, how to run things. |
+| [notes/radiance-test-run.md](notes/radiance-test-run.md) | A test run of radiance (a C++/HIP LLM server with its own kernels) on two R9700 through our release checklist, with our numbers beside it. |
 | [notes/mes-timeouts.md](notes/mes-timeouts.md) | RDNA4 MES timeouts under KVM passthrough: the symptom, the host crash it can cause, what we ruled out, and the two kernel parameters that stop it. |
 | [host/README.md](host/README.md) | Host PCIe setup: why a second card on one PLX switch gets no BAR, and the fix. |
 | [notes/independence.md](notes/independence.md) | Which third-party pieces were replaced with our own, and why. |
