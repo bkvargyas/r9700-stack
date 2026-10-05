@@ -98,6 +98,39 @@ are scheduled against the expert stream is the likely place; we did not look fur
 four-minute run reports 45,740 tok/s "prefill" with the tiers on -- that is a prefix-cache hit on probe's fixed prompt,
 not prefill.
 
+## Re-test on 1.0.8 (2026-10-05)
+
+Brian asked for the 1.0.8 image (built 2026-10-04 20:03 UTC; the diff from 1.0.3 is four-card Flash-Next support, a
+batch-size-4 paged-attention kernel, tests and docs; the two-card flags are unchanged). Same VM, same cards at 210 W and
+-42 mV, same clients. Raw numbers only on his instruction: the 27B's BetterBench and soak were cut short and
+Flash-Next skipped the evals.
+
+| 27B, two cards | 1.0.8 | 1.0.4 |
+|---|--:|--:|
+| start to healthy | 42 s | 38 s |
+| GSM8K 1,319, no thinking, conc 1 | 95.60% (1,261) | 95.60% (1,261) |
+| HumanEval 164 (runs concurrently, thinking on) | 96.34% (158) | 97.56% (160) |
+| probe: decode / 8 conc / 16 conc / 8k prefill, tok/s | 133 / 412 / 609 / 3,884 | 135 / 405 / 622 / 3,861 |
+| strict sanity, conc 33 x 100 and conc 64 x 60 | 0 bad of 7,140 | 0 bad of 7,140 |
+
+| Flash-Next, two cards | 1.0.8 | 1.0.4 |
+|---|--:|--:|
+| probe on a fresh server: decode / 8 conc / 16 conc / 8k prefill, tok/s | 56 / 191 / 258 / 5,670 | 54 / 167 / 236 / 5,653 |
+| strict sanity, conc 1 | 0 bad of 60 | 0 bad of 40 |
+| strict sanity, conc 9 | 6 bad of 270 | 18 bad of 900 |
+| strict sanity, conc 16 | 2 bad of 320, and one run of 0 bad of 960 | 21 bad of 960 |
+| 4 clients, 6-10k-token prompts, 4 min | 12 served, 418 prompt tok/s | 13-14 served, 400-430 prompt tok/s |
+| 16-client soak, 200-30k tokens | 26 served in 759 s, 577 prompt tok/s, median latency 427 s | 72 served in 1,500 s, 565 prompt tok/s, 359 s |
+
+So 1.0.8 changes nothing we measured on two cards. The 27B repeats to the question (HumanEval moved two problems, which
+is what that concurrent, thinking-on test does run to run). Flash-Next still answers wrongly in a batch at the same
+2% rate and in the same two shapes (an explanation at temperature 0 with thinking off; another row's or a nonsense
+number: 64, 155, 12), with one clean run of 960 among the batched checks, and its prefill under concurrent long prompts
+is the same ~420 tok/s. Two cautions on the raw run's own numbers: its first conc-9 sanity check produced an unreadable
+log and no summary line, so it is not counted (the rerun with logs kept is what the table shows), and a probe repeated
+against a server that has seen the same prompts reports 52,568 tok/s "prefill" and 189 tok/s decode, both prefix-cache
+effects, not performance.
+
 ## Things worth copying
 
 - The startup log states every budget before allocating (weights, experts, KV, host pool, headroom, what the elastic

@@ -1620,3 +1620,13 @@ or off-format answers in batches of 9-16 (clean alone; worse with speculation of
 all-reduce wire), and prefill falls from 5.6k tok/s alone to ~400 tok/s aggregate with four long prompts in flight
 (16-client soak: 72 requests served to our 239). Quality at conc 1 equal to ours (95.83% / 98.17%), time to first
 token 141 ms to our 463, eight-client decode 143 to our 114.
+
+## 2026-10-05: radiance 1.0.8 re-test, two cards
+
+At Brian's request, the 1.0.8 image on the same VM and cards, raw numbers only (27B BetterBench and soak cut short,
+Flash-Next without evals). Nothing changed on two cards: 27B GSM8K 95.60% again (1,261), probe 133 / 412 / 609 /
+3,884, strict sanity 0 of 7,140; Flash-Next probe 56 / 191 / 258 / 5,670 fresh, strict sanity still failing in a
+batch (6 of 270 at conc 9, 2 of 320 at conc 16, one clean run of 960; 0 of 60 alone), concurrent long-prompt prefill
+still ~420 tok/s, the 16-client soak 26 requests in 759 s. The 1.0.3 -> 1.0.8 diff is four-card Flash-Next support,
+a bs4 paged-attention kernel, tests and docs; two-card flags unchanged. Section added to notes/radiance-test-run.md.
+Cards returned to production afterwards. Also corrected: the first run's image was the 1.0.4 build, not 1.0.3.

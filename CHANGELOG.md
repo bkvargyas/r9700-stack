@@ -15,7 +15,7 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 - `notes/radiance-test-run.md`: radiance 1.0.4 (its own C++/HIP engine, not vLLM) on two R9700 through our release
   checklist. 27B FP8: correct and stable, equal or better quality, 549k-token KV, 38 s start, decode 112 vs our 200
   tok/s. Flash-Next: 2-6% wrong or off-format answers in batches of 9-16 and prefill collapsing under concurrent long
-  prompts; quality at concurrency 1 equal to ours.
+  prompts; quality at concurrency 1 equal to ours. Re-tested on 1.0.8 (2026-10-05): no change on two cards.
 
 ## [0.2.5] - 2026-10-04
 
