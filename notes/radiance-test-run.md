@@ -131,6 +131,74 @@ log and no summary line, so it is not counted (the rerun with logs kept is what 
 against a server that has seen the same prompts reports 52,568 tok/s "prefill" and 189 tok/s decode, both prefix-cache
 effects, not performance.
 
+## 1.1.1 on two, three and four cards (2026-10-06)
+
+Brian asked for the latest release, tested for accuracy, and whether TP=3 could run. 1.1.1 was published 2026-10-06
+12:50 UTC, five releases past 1.0.8. The 1.0.8 -> 1.1.1 diff, by its commit titles: three-rank serving (`docs/TP3.md`:
+"any world size", attention served on the largest multiple of the KV head count under the world and the ranks past it
+attention-zero; the delta-net heads split unevenly, 5/5/6, nothing padded), three- and four-rank all-reduce and
+all-gather kernels, a fused router GEMM + top-k + scatter launch, a second prefill form for `hc_read`, a decode form of
+the quantised grouped GEMM with two K blocks a pass, `--embedding-placement` and `--ngram-placement`, a request log,
+a Grafana dashboard, and `--expert-vs-cache-ratio` removed (a compose file that still passes it does not start).
+Only Flash-Next serves at three ranks: the qwen4exp plugin asks for the attention world; the 27B's plugin does not,
+and `docs/ARCHITECTURES.md` says a world that neither divides nor is a multiple of the KV head count is refused.
+
+Two cards: VM 102 as before (210 W, -42 mV, the same compose files less the removed flag). Three and four cards: the
+production host has exactly two R9700s, so these ran on the five-card test box (VM 100 on .100, same caps), HIP
+devices 0,1,2 for three (the switch-local pair 03/04:00.0 plus 07:00.0 across the root complex) and 0-3 for four
+(both switch-local pairs); the passively cooled fifth card stayed out. Flags from the README's three- and four-rank
+rows: exact wire, `--host-pool-mib` 8192 / 12288, otherwise the two-card recipe (which runs the lossy wht6 wire); the
+disk prefix tier was 16 GiB there for lack of disk. Clients on the test box in every case. Accuracy was the ask, so
+no BetterBench and no long soak: strict sanity alone and under overload with every log kept, GSM8K 1,319 at conc 1
+without thinking, HumanEval 164, then for Flash-Next the 4-client long-prompt prefill that collapsed on 1.0.x.
+
+| 27B, two cards | 1.1.1 | 1.0.8 | 1.0.4 |
+|---|--:|--:|--:|
+| start to healthy | 58 s | 42 s | 38 s |
+| KV pool, fp8 | 584,400 tokens | 548,816 | 548,816 |
+| GSM8K 1,319, no thinking, conc 1 | 95.60% (1,261), output identical to 1.0.8 and 1.0.4 on 100% of questions | 95.60% | 95.60% |
+| HumanEval 164 | 97.56% (160) | 96.34% (158) | 97.56% (160) |
+| probe, fresh: decode / 8 conc / 16 conc / 8k prefill, tok/s | 156 / 466 / 725 / 3,933 | 133 / 412 / 609 / 3,884 | 135 / 405 / 622 / 3,861 |
+| strict sanity, conc 1 x 40, 33 x 100, 64 x 60, then 33 x 40 after the evals | 0 bad of 8,540 | 0 of 7,140 | 0 of 7,140 |
+
+| Flash-Next, 1.1.1 | two cards (VM 102) | three cards (test box) | four cards (test box) |
+|---|--:|--:|--:|
+| start to healthy | 222 s | 85 s | 120 s |
+| VRAM a card at rest | 32.5 / 32.5 GB | 32.6 / 32.6 / 23.4 GB | 31.6 GB x 4 |
+| experts resident | elastic 26.2 GiB, host pool 12 GiB | 15.8 GiB a card, host pool 8 GiB | all of them ("the whole expert plane is resident"), host pool 12 GiB unused |
+| GSM8K 1,319, no thinking, conc 1 | 95.83% (1,264) | 95.91% (1,265) | 95.83% (1,264) |
+| paired vs two cards (McNemar) | - | p = 1.00, 72% of outputs differ | p = 1.00, 73% of outputs differ |
+| HumanEval 164 | 97.56% (160) | 96.34% (158) | 96.95% (159) |
+| strict sanity, conc 1 x 40, 9 x 100, 16 x 60, 9 x 40 after | 0 bad of 2,260 | 0 bad of 2,260 | 0 bad of 2,260 |
+| probe, fresh: decode / 8 conc / 16 conc / 8k prefill, tok/s | 193 / 625 / 652 / 5,990 | 205 / 568 / 600 / 5,053 | 263 / 710 / 722 / 5,191 |
+| 4 clients, 6-10k-token prompts, 4 min | 112 served, 3,836 prompt tok/s, median latency 8.7 s | 109 served, 3,153 tok/s, 8.8 s | 118 served, 3,365 tok/s, 8.3 s |
+| MES timeouts, E-lines | 0, 0 | 0, 0 | 0, 0 |
+
+For reference, two cards on 1.0.8: probe 56 / 191 / 258 / 5,670, strict sanity 6 of 270 at conc 9 and 2 of 320 at
+conc 16, the long-prompt test 12 served at 418 prompt tok/s.
+
+So 1.1.1 is the release that fixed Flash-Next on two cards. The batched wrong answers are gone (0 of 4,520 across
+the three Flash-Next configurations, where 1.0.4 and 1.0.8 failed about 2% of every batch), the concurrent
+long-prompt prefill went from ~420 to 3,836 prompt tok/s, and the fresh-server decode from 56 to 193 tok/s, with
+GSM8K unchanged and the two-card output identical to the 1.0.4 run on 99.8% of questions. The 27B repeats to the
+question and gained 10-20% on the probe. Nothing in the 1.0.8 -> 1.1.1 commit titles names the batch bug; the
+candidates are the router fusion, the new decode form of the grouped GEMM and the KV changes that came with the
+three-rank work, and we test radiance as a black box, so this stays an observation.
+
+On cards: the third buys about 6% single-stream decode and nothing else (lower aggregate, lower prefill, the exact
+wire against wht6 and a root-complex hop against the pair are both in that number); the fourth makes every expert
+resident and is the fastest configuration we have measured on this model, 263 tok/s single-stream and 722 at 16 streams, with the long-prompt test between the other two (118 served at 3,365 prompt tok/s), at the same accuracy (GSM8K 95.83%, p = 1.00 against two and three ranks). Three ranks change the
+summation order, so 72% of GSM8K outputs differ from two ranks, with no accuracy effect.
+
+Mistakes this run: stripping the removed flag with a `sed` that also ate the line's indentation broke the three
+Flash-Next compose files on VM 102 (go-yaml "did not find expected key"); the two-card Flash-Next phase was
+relaunched after the fix, which is why its results are in `radtest12.log` rather than `radtest10.log`.
+
+Where things are: the Flash-Next container (122 GB, sha256-verified copy of the host's) is at `~/rad` on the test
+box with `~/radiance-compose-tp3/flashnext-tp{3,4}.yaml` (port 8010, state `~/radiance-state`); the 1.1.1 image is
+on both VMs; GSM8K outputs `~/.r9keval/radiance111-{27b,fn,fn-tp3,fn-tp4}.json` and sanity logs `~/san111-*.log` on
+the test box; run logs `radtest1{0,1,2,3}.log` in the job directory on the mgmt VM. VM 102 is still up with the cards.
+
 ## Things worth copying
 
 - The startup log states every budget before allocating (weights, experts, KV, host pool, headroom, what the elastic

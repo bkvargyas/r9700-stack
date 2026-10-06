@@ -1630,3 +1630,18 @@ batch (6 of 270 at conc 9, 2 of 320 at conc 16, one clean run of 960; 0 of 60 al
 still ~420 tok/s, the 16-client soak 26 requests in 759 s. The 1.0.3 -> 1.0.8 diff is four-card Flash-Next support,
 a bs4 paged-attention kernel, tests and docs; two-card flags unchanged. Section added to notes/radiance-test-run.md.
 Cards returned to production afterwards. Also corrected: the first run's image was the 1.0.4 build, not 1.0.3.
+
+## 2026-10-06: radiance 1.1.1 on two, three and four cards
+
+Brian: pull the latest (1.1.1, published that day), test for accuracy, and can TP=3 run. Two cards on VM 102 as
+before; three and four on the five-card test box, since the production host has two R9700s and 1.1.0 added
+three-rank serving for Flash-Next only (`docs/TP3.md`). 1.1.1 is the release that fixed Flash-Next on two cards:
+strict sanity 0 bad of 2,260 (1.0.x failed ~2% of every batch), the 4-client long-prompt prefill 3,836 prompt tok/s
+(was ~420), fresh decode 193 tok/s (was 56), GSM8K 95.83% with output identical to the 1.0.4 run on 99.8% of
+questions, HumanEval 160. 27B: GSM8K 95.60% and identical output to 1.0.8/1.0.4 on 100% of questions, HumanEval 160,
+probe 156 / 466 / 725 / 3,933 (+10-20%), sanity 0 of 8,540. Three ranks: GSM8K 95.91%, HumanEval 158, probe 205 /
+568 / 600 / 5,053, long prompts 3,153 tok/s -- about 6% single-stream for the third card and nothing else. Four
+ranks: every expert resident, probe 263 / 710 / 722 / 5,191, long prompts 3,365 tok/s, GSM8K 95.83%, HumanEval 159;
+every paired comparison p = 1.00. `--expert-vs-cache-ratio` was removed in 1.1.x (compose files updated; my sed
+broke their indentation once, relaunched). Section in notes/radiance-test-run.md. VM 102 left up with the cards;
+the Flash-Next container and the TP3/TP4 compose files stay on the test box.
