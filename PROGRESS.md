@@ -1645,3 +1645,11 @@ ranks: every expert resident, probe 263 / 710 / 722 / 5,191, long prompts 3,365 
 every paired comparison p = 1.00. `--expert-vs-cache-ratio` was removed in 1.1.x (compose files updated; my sed
 broke their indentation once, relaunched). Section in notes/radiance-test-run.md. VM 102 left up with the cards;
 the Flash-Next container and the TP3/TP4 compose files stay on the test box.
+
+## 2026-10-06: sixth R9700 on the test host, chain C switch-local
+
+Brian added a card to the third PLX and put a fan on the passively cooled one. Chain C = 05:00.0 + 08:00.0 at
+0x380/0x390 with switch-local P2P; VM 100 gets a third emulated switch, X-PciMmio64Mb 384G and pci-hole64-size 3072G
+(2048G stopped at 0x33f and broke placement for every card); guest 0b/0c, HIP 4/5. Verified 25.25 GB/s both ways on the
+new pair, all 30 pairs ~13 GB/s one-way, 0 faults. radiance 1.1.1 refuses --tp 6 on the Flash-Next container (an
+expert's 5 blocks of 128 do not split six ways); 2/3/4 ranks are what it serves here. Details host/README.md.

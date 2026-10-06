@@ -6,6 +6,8 @@
 #
 # chain A: root 40:01.1  up 41:00.0  -> 45:00.0 (PLX port 42:08.0), 48:00.0 (PLX port 42:10.0)
 # chain B: root c0:01.1  up c1:00.0  -> c5:00.0 (PLX port c2:08.0), c8:00.0 (PLX port c2:10.0)
+# chain C: root 00:03.1  up 01:00.0  -> 05:00.0 (PLX port 02:08.0), 08:00.0 (PLX port 02:10.0); each card behind its own
+#          Navi bridge pair. 2026-10-03 one card (06:00.0); 2026-10-06 the second card made it a pair (05 + 08).
 #
 # A chain may carry MORE THAN ONE card (45 and 48 are on the same PEX 8747): every card on the
 # chain gets its ReBAR control set before the single remove+rescan, otherwise the cards that were
@@ -25,16 +27,19 @@ set -u
 # Override to change which cards are attached to which chain, e.g. CHAIN_A="45:00.0" CHAIN_B="c5:00.0"
 CHAIN_A="${CHAIN_A-45:00.0 48:00.0}"
 CHAIN_B="${CHAIN_B-c5:00.0 c8:00.0}"
+CHAIN_C="${CHAIN_C-05:00.0 08:00.0}"
 FORCE="${FORCE:-0}"
 # Chain windows pre-programmed before the rescan: "<upper32 base> <upper32 limit root> <upper32 limit upstream>"
 CHAIN_A_WIN="${CHAIN_A_WIN-00000260 000002e0 000002df}"
 CHAIN_B_WIN="${CHAIN_B_WIN-00000140 00000160 0000015f}"
+CHAIN_C_WIN="${CHAIN_C_WIN-00000380 000003c0 000003bf}"   # inside bus 00 aperture 0x300b0200000-0x400b01fffff
 # Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x26000000000; the
 # second card follows 64GB above it. The guest's r9700_guestplace.ko moves each card to the same address
 # (switch-local P2P), so these must match /etc/modprobe.d/r9700-guestplace.conf in VM100. Any address inside
 # the chain's own root-complex aperture works; empty = kernel's first fit (then the guest cannot match).
 CHAIN_A_AT="${CHAIN_A_AT-0x26000000000}"
 CHAIN_B_AT="${CHAIN_B_AT-0x14000000000}"
+CHAIN_C_AT="${CHAIN_C_AT-0x38000000000}"
 # Switch-local P2P: clear ACS ReqRedir/CmpltRedir on the chain's PLX downstream ports so peer traffic between
 # its cards stays inside the switch. Only valid when the VM sees the cards at their HOST addresses
 # (r9700_guestplace in the guest), and only while every card on the chain belongs to ONE VM (it removes IOMMU
@@ -42,6 +47,7 @@ CHAIN_B_AT="${CHAIN_B_AT-0x14000000000}"
 # Set CHAIN_*_P2P=0 to leave ACS alone.
 CHAIN_A_P2P="${CHAIN_A_P2P-1}"
 CHAIN_B_P2P="${CHAIN_B_P2P-1}"
+CHAIN_C_P2P="${CHAIN_C_P2P-1}"
 
 CHAINFIX=r9700_chainfix   # DKMS package r9700-chainfix/1.2 (src /usr/src/r9700-chainfix-1.2), rebuilt per kernel
 
@@ -196,3 +202,5 @@ echo "chain A (${CHAIN_A:-none}):"
 resize_chain 40:01.1 41:00.0 $CHAIN_A_WIN "${CHAIN_A_AT:--}" "$CHAIN_A_P2P" $CHAIN_A
 echo "chain B (${CHAIN_B:-none}):"
 resize_chain c0:01.1 c1:00.0 $CHAIN_B_WIN "${CHAIN_B_AT:--}" "$CHAIN_B_P2P" $CHAIN_B
+echo "chain C (${CHAIN_C:-none}):"
+resize_chain 00:03.1 01:00.0 $CHAIN_C_WIN "${CHAIN_C_AT:--}" "$CHAIN_C_P2P" $CHAIN_C

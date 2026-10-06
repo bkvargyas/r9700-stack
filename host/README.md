@@ -122,7 +122,7 @@ treat every switch the same way.
   - `blacklist amdgpu` in `/etc/modprobe.d/r9700-guestplace.conf` stops udev from binding the cards first;
     the service loads amdgpu itself afterwards, even if placement fails (the cards then work, just not
     switch-local).
-  - The VM's 64-bit hole must cover every target: `-global q35-pcihost.pci-hole64-size=2048G`. That pushes
+  - The VM's 64-bit hole must cover every target: `-global q35-pcihost.pci-hole64-size=3072G` since chain C (0x380, six cards, 2026-10-06; 2048G ended at 0x33f and guestplace failed -16). That pushes
     the end of the hole past the HyperTransport hole, so QEMU moves above-4G RAM to 1 TB (GPA
     0x100-0x13f8), and the hole starts right after it at 0x140. **Host chain windows must not overlap guest
     RAM**, which is why chain B sits at 0x140 and not at its first fit (0x108).
@@ -134,7 +134,7 @@ treat every switch the same way.
 VM100 (`/etc/pve/qemu-server/100.conf` `args:`):
 
 ```
--global q35-pcihost.pci-hole64-size=2048G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=262144
+-global q35-pcihost.pci-hole64-size=3072G -fw_cfg name=opt/ovmf/X-PciMmio64Mb,string=393216   # 3072G / 384G since six cards (2026-10-06); was 2048G / 256G with four
 -device pcie-root-port,id=p2prp,bus=pcie.0,chassis=90,slot=90,x-speed=32,x-width=16     # chain A switch
 -device x3130-upstream,id=p2pup,bus=p2prp
 -device xio3130-downstream,id=p2pdn1,bus=p2pup,chassis=91,slot=1
@@ -251,3 +251,25 @@ Decode all-reduces are small and limited by latency: the P2P all-reduce kernel c
 (RCCL) to ~3 µs and gave Flash-Next +9.5% single-stream decode (PROGRESS.md). Prefill all-reduces are large and
 limited by bandwidth, which is what switch-local P2P doubles. The 2026-09-18 "P2P gives nothing" A/B is **not**
 valid: both arms used P2P IPC.
+
+### Six cards, three switch-local pairs (2026-10-06)
+
+A sixth card went onto the third PLX (root `00:03.1`, upstream `01:00.0`), so chain C is the pair **05:00.0 (port
+`02:08.0`) + 08:00.0 (port `02:10.0`)**; the card that was alone there renumbered from 06:00.0 to 08:00.0. The
+fourth PLX (`87:00.0`, ports `88:08.0`/`88:10.0`, bus 80 aperture) is still empty. What changed, all in this directory:
+
+- `r9700-barfix.sh`: `CHAIN_C="05:00.0 08:00.0"`, `CHAIN_C_AT=0x38000000000` (05 at 0x380, 08 at 0x390, window
+  0x380-0x3c0 inside bus 00's 3-4 TB aperture), `CHAIN_C_P2P=1`.
+- VM 100 args: chain C is a switch like A and B (`p2prpc` -> `x3130-upstream p2pupc` -> `p2pdn5` chassis 97 slot 5
+  = 05:00.0, `p2pdn6` chassis 98 slot 6 = 08:00.0); `X-PciMmio64Mb` 327680 -> **393216** (384G, OVMF's base stayed at
+  0x140); **`pci-hole64-size` 2048G -> 3072G**, because the guest's root-bus window must reach chain C's 0x380-0x39f
+  (with 2048G it ended at 0x33f, guestplace failed -16 and every card got amdgpu -22).
+- Guest: chain C is `0b:00.0` (host 05) and `0c:00.0` (host 08), HIP ordinals 4 and 5; `r9700-guestplace.conf` lists
+  all six; LACT has entries for 0b/0c; the powercap script counts the cards itself.
+
+Result: all six at 32 GB at their host addresses, 6 KFD nodes with 5 peer links each, 0 MES timeouts, 0 IOMMU/AER
+faults on host and guest. `p2pbidir.py` on the chain C pair: 13.01 / 13.02 GB/s each way alone, **25.25 GB/s both at
+once**, data checks OK (chains A and B: 25.23); a cross-chain pair 25.32. `p2ptest4.py` matrix: every one of the 30
+pairs 12.5-13.0 GB/s one-way; its RCCL phase fails `hipIpcGetMemHandle` in `r9700/vllm:dev` without the overlay (the
+known IPC wall, not the hardware). Run the scripts with `docker run --entrypoint python3 --group-add 44 --group-add
+991 ...` (group names do not resolve inside the image). Idle host draw 395 W by in-band `ipmitool dcmi power reading`.

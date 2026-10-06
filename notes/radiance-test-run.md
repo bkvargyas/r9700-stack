@@ -190,6 +190,10 @@ wire against wht6 and a root-complex hop against the pair are both in that numbe
 resident and is the fastest configuration we have measured on this model, 263 tok/s single-stream and 722 at 16 streams, with the long-prompt test between the other two (118 served at 3,365 prompt tok/s), at the same accuracy (GSM8K 95.83%, p = 1.00 against two and three ranks). Three ranks change the
 summation order, so 72% of GSM8K outputs differ from two ranks, with no accuracy effect.
 
+Six cards, later the same day: `--tp 6` on this container is refused at declare ("an expert is 5 blocks of 128, which
+6 ranks cannot each take a whole block of in both parities; lower the rank count, or serve whole experts"), so two,
+three, four and (per the docs) eight ranks are the widths this container serves.
+
 Mistakes this run: stripping the removed flag with a `sed` that also ate the line's indentation broke the three
 Flash-Next compose files on VM 102 (go-yaml "did not find expected key"); the two-card Flash-Next phase was
 relaunched after the fix, which is why its results are in `radtest12.log` rather than `radtest10.log`.
