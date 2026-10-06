@@ -1653,3 +1653,12 @@ Brian added a card to the third PLX and put a fan on the passively cooled one. C
 (2048G stopped at 0x33f and broke placement for every card); guest 0b/0c, HIP 4/5. Verified 25.25 GB/s both ways on the
 new pair, all 30 pairs ~13 GB/s one-way, 0 faults. radiance 1.1.1 refuses --tp 6 on the Flash-Next container (an
 expert's 5 blocks of 128 do not split six ways); 2/3/4 ranks are what it serves here. Details host/README.md.
+
+## 2026-10-06: radiance 1.2.0, Flash-Next TP4 + 27B TP2 side by side on the six-card box
+
+1.2.0 adds a Quark MXFP4 27B container with vision and a --p2p flag, removes nothing we use. Flash-Next TP4 on HIP 0-3
+and the 27B TP2 on the new chain C pair, together: probes alone vs together agree within noise (FN 264/740/786 vs
+263/742/725; 27B 147/430/657 vs 152/432/656), strict sanity 0 of 1,900 and 0 of 7,180 with both loaded, GSM8K 95.83%
+and 95.60% with output identical to the 1.1.1 runs on 100% of questions, HumanEval 158 and 160, mixed load 106 long
+prompts at 3,579 tok/s beside a 16-client soak of 47 requests. BMC: 783-1,804 W at the wall under load. Chain C pair
+runs 15 C hotter (max 67 C) with fans at twice the speed. 0 MES / errors / faults. Section in notes/radiance-test-run.md.

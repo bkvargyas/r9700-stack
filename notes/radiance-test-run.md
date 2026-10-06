@@ -203,6 +203,39 @@ box with `~/radiance-compose-tp3/flashnext-tp{3,4}.yaml` (port 8010, state `~/ra
 on both VMs; GSM8K outputs `~/.r9keval/radiance111-{27b,fn,fn-tp3,fn-tp4}.json` and sanity logs `~/san111-*.log` on
 the test box; run logs `radtest1{0,1,2,3}.log` in the job directory on the mgmt VM. VM 102 is still up with the cards.
 
+## 1.2.0: Flash-Next TP4 and the 27B TP2 side by side on six cards (2026-10-06)
+
+Brian: "run flash next TP4 and the 27B side by side; pull the latest update". 1.2.0 (published 19:42 UTC, one squashed
+commit) adds a Qwen3.8-27B container in AMD's Quark AWQ-MXFP4 with vision and a `--p2p auto|on|off` flag; nothing our
+compose files pass was removed. The test box now has six cards on three switch-local PLX pairs (`host/README.md`), so
+Flash-Next ran at `--tp 4` on HIP 0-3 (chains A and B) and the 27B FP8 at `--tp 2` on HIP 4,5 (chain C, the new pair)
+at the same time, two compose projects on ports 8010 and 8011, both at 210 W / -42 mV, clients on the same VM. The 27B
+container was copied over for this (sha256-verified).
+
+| | Flash-Next TP4 (HIP 0-3) | 27B TP2 (HIP 4,5) |
+|---|--:|--:|
+| start to healthy, both loading from one disk at once | 527 s | 527 s |
+| VRAM a card | 31.5 GB | 32.5 GB |
+| probe ALONE: decode / 8 conc / 16 conc / 8k prefill, tok/s | 264 / 740 / 786 / 5,197 | 147 / 430 / 657 / 3,405 |
+| probe TOGETHER (other server probed at the same moment) | 263 / 742 / 725 / cache hit | 152 / 432 / 656 / cache hit |
+| strict sanity, both servers loaded at once | 0 bad of 1,900 (c1/9/16) + 0 of 360 after | 0 bad of 7,180 (c1/33/64) + 0 of 1,320 after |
+| GSM8K 1,319, no thinking, conc 1, both at once | 95.83% (1,264), output identical to 1.1.1 TP4 on 100% | 95.60% (1,261), identical to 1.1.1 on VM 102 on 100% |
+| HumanEval 164, both at once | 96.34% (158) | 97.56% (160) |
+| mixed load, 4 min, both at once | 4 clients 6-10k prompts: 106 served, 3,579 prompt tok/s, 9.1 s median | 16 clients 200-30k: 47 served, 2,558 prompt tok/s, 91 s median |
+| hottest card during the mixed load | 61 C (fans ~1.1-1.3k rpm) | 67 C (fans 2.5-2.8k rpm) |
+| MES timeouts / E-lines / IOMMU+AER faults | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Host draw by the BMC during the mixed load: 783 to 1,804 W (idle floor ~400 W), so six cards at the 210 W cap want
+1.8 kW at the wall, not the 1.5 kW I had estimated.
+
+The two servers do not see each other: decode and aggregate numbers alone and together agree within noise (the only
+move is Flash-Next's 16-stream aggregate, 786 -> 725, while the 27B's probe ran), and every accuracy number repeats
+to the question. The 27B on the PLX pair is a few percent under the same model on VM 102 (147 / 430 / 657 / 3,405
+against 156 / 466 / 725 / 3,933): the PEX 8747 links each card at Gen3 x16, the production box has Gen5 root ports.
+The chain C pair runs 15 C hotter than the other four under the same cap, with its fans at twice the speed; the
+hotter of the two is the card that was passively cooled until today. Total 57 minutes. Logs `radtest14.log` and the
+samplers `sbs-{temps,power}.log` in the job directory; evals `radiance120-{fn-tp4,27b-tp2}` on the test box.
+
 ## Things worth copying
 
 - The startup log states every budget before allocating (weights, experts, KV, host pool, headroom, what the elastic
