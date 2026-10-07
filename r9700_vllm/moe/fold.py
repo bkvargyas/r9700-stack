@@ -128,7 +128,9 @@ def install(model: torch.nn.Module) -> int:
             logger.warning_once("r9700: shared-expert fold skipped for %s (runner shape changed)", name)
             continue
         gate.check("moe_shared_fold")
-        re_._r9k_runner = mod
+        # a plain attribute: nn.Module.__setattr__ would register the runner as a child of its own child and
+        # vLLM's tied-weight scan (named_modules) would recurse forever at load
+        object.__setattr__(re_, "_r9k_runner", mod)
         re_._r9k_shared_folded = False
         mod.forward = types.MethodType(_forward, mod)
         n += 1
