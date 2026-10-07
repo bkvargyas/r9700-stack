@@ -15,6 +15,9 @@
 // (one prefix sum over 512 experts and the scatter) is now the only thing one block does alone. Above
 // ROUTE_MAX_ROWS rows the caller keeps the stock path (prefill uses other block sizes anyway).
 // Scratch (int32, zeroed by the caller ONCE at allocation; the kernel leaves it zero): counts[E], cursor[E], arrive.
+// When one block covers every row (M <= 8: single-stream decode with MTP-3 is 4 rows) the counts and the cursor
+// stay in LDS and there is no handshake at all -- the global version costs ~2 us a layer more at that width, which
+// at 48 layers was the whole gain.
 //
 // Numerics: fp32 softmax (max, expf(x - max), sum over the row, p = e / sum), top-k on the probabilities, and if
 // renormalize, w_k = p_k / sum_k p_k. Same operations as vLLM's topk_softmax (TensorRT-LLM lineage); the only
@@ -126,32 +129,44 @@ __global__ void __launch_bounds__(NT) r9k_moe_route_kernel(
     int* __restrict__ sorted_ids, int* __restrict__ expert_ids, int* __restrict__ ntpp, int* __restrict__ scratch,
     int M, int E, int topk, int renorm, int blk) {
   __shared__ int offs[MAX_E];       // first sorted position of each expert (padded layout)
+  __shared__ int l_counts[MAX_E];   // single-block path: counts and cursor in LDS, no global atomics, no handshake
+  __shared__ int l_cursor[MAX_E];
   __shared__ int scan[WAVES];
   __shared__ int s_last;
-  int* __restrict__ g_counts = scratch;           // [E] rows per expert
-  int* __restrict__ g_cursor = scratch + E;       // [E] scatter cursor
-  int* __restrict__ g_arrive = scratch + 2 * E;   // [1] blocks done with phase 1
+  const bool single = gridDim.x == 1;
+  int* __restrict__ counts = single ? l_counts : scratch;             // [E] rows per expert
+  int* __restrict__ cursor = single ? l_cursor : scratch + E;         // [E] scatter cursor
+  int* __restrict__ g_arrive = scratch + 2 * E;                        // [1] blocks done with phase 1
   const int tid = threadIdx.x, wave = tid / WAVE, lane = tid % WAVE;
+  if (single) {
+    for (int e = tid; e < E; e += NT) { l_counts[e] = 0; l_cursor[e] = 0; }
+    __syncthreads();
+  }
 
   // Phase 1: this block's rows, one per wave.
   const int r = blockIdx.x * WAVES + wave;
   if (r < M)
     route_row<EPL>(logits + (long)r * ldl, E, topk, renorm != 0, weights + (long)r * topk, ids + (long)r * topk,
-                   g_counts, lane);
-  // publish this block's ids and counts, then count the block in; the last one builds the tables
-  __threadfence();
-  __syncthreads();
-  if (tid == 0) s_last = (atomicAdd(g_arrive, 1) == (int)gridDim.x - 1) ? 1 : 0;
-  __syncthreads();
-  if (!s_last) return;
-  __threadfence();
+                   counts, lane);
+  if (single) {
+    __syncthreads();
+  } else {
+    // publish this block's ids and counts, then count the block in; the last one builds the tables
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = (atomicAdd(g_arrive, 1) == (int)gridDim.x - 1) ? 1 : 0;
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+  }
 
-  // Phase 2 (last block only): exclusive prefix sum of the block-padded counts over E experts, in NT-wide chunks.
+  // Phase 2 (one block): exclusive prefix sum of the block-padded counts over E experts, in NT-wide chunks.
   int carry = 0;
   for (int base = 0; base < E; base += NT) {
     const int e = base + tid;
-    const int n = e < E ? ((__hip_atomic_load(g_counts + e, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) + blk - 1)
-                           / blk) * blk : 0;
+    int c = 0;
+    if (e < E) c = single ? counts[e] : __hip_atomic_load(counts + e, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    const int n = e < E ? ((c + blk - 1) / blk) * blk : 0;
     int x = n;
 #pragma unroll
     for (int o = 1; o < WAVE; o <<= 1) {
@@ -173,7 +188,7 @@ __global__ void __launch_bounds__(NT) r9k_moe_route_kernel(
   if (tid == 0) ntpp[0] = carry;
   const int numel = M * topk;
   for (int e = tid; e < E; e += NT) {
-    const int c = __hip_atomic_load(g_counts + e, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    const int c = single ? counts[e] : __hip_atomic_load(counts + e, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     if (c == 0) continue;
     const int o = offs[e], n = ((c + blk - 1) / blk) * blk;
     for (int b = o / blk; b < (o + n) / blk; ++b) expert_ids[b] = e;
@@ -183,14 +198,16 @@ __global__ void __launch_bounds__(NT) r9k_moe_route_kernel(
 
   // Phase 3: scatter every routed row (ids written by every block, visible after the fences above).
   for (int t = tid; t < numel; t += NT) {
-    const int e = __hip_atomic_load(ids + t, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-    const int pos = offs[e] + atomicAdd(g_cursor + e, 1);
+    const int e = single ? ids[t] : __hip_atomic_load(ids + t, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    const int pos = offs[e] + atomicAdd(cursor + e, 1);
     sorted_ids[pos] = t;
   }
-  __syncthreads();
-  // leave the scratch zero for the next call (stream order separates calls)
-  for (int e = tid; e < E; e += NT) { g_counts[e] = 0; g_cursor[e] = 0; }
-  if (tid == 0) g_arrive[0] = 0;
+  if (!single) {
+    __syncthreads();
+    // leave the scratch zero for the next call (stream order separates calls)
+    for (int e = tid; e < E; e += NT) { counts[e] = 0; cursor[e] = 0; }
+    if (tid == 0) g_arrive[0] = 0;
+  }
 }
 
 }  // namespace
