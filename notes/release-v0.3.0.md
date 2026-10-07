@@ -1,0 +1,44 @@
+# r9700-stack v0.3.0
+
+**Flash-Next on four cards: 70% more KV cache, 4% more prefill, the same decode, on new measured defaults.**
+The code of v0.2.5 plus the decode-step fusions of 2026-10-07 (the P2P all-gather on by default) and the
+prefill round of the same day (`notes/prefill-fp8-pipe.md`, `notes/decode-nodes.md`).
+
+## What changed for someone running it
+
+- `serve/flashnext.sh` at TP4: the fp8 hyper-connection up GEMM with the gate mix fused (`R9K_HC_FP8=r9k`),
+  memory utilization 0.98, cudagraphs only for prefill chunks up to 256 tokens. KV cache 279,564 -> 442-475k
+  tokens (`KVMEM=7.0` pins 475k), 8k prefill 6,769 -> 6,852-7,069 tok/s, decode step 16.4 ms and 199 tok/s
+  unchanged, 888-905 tok/s at 16 streams. `UTIL=0.94 CGSIZES=1,...,2048 R9K_HC_FP8=stock` restores v0.2.5.
+- The one-shot P2P all-gather for decode-sized gathers at TP > 2 (`R9K_AG`, default on): step 16.70 -> 16.40 ms.
+- New kernels in the tree, off or opt-in: fp8 prefill GEMMs on the tiled WMMA kernel (163-182 TFLOPS), an exact
+  block-scaled fp8 variant (slower than Triton here), one-launch MoE routing and the fused top-k sum with the
+  shared expert, prefill all-reduce pipelining by row parts (correct, a loss on this topology), `R9K_MEMSNAP`.
+
+## Why the KV cache moved
+
+vLLM sizes the KV cache from its profiling run's peak memory, and on this stack that peak was torch.compile and
+inductor transients, not activations: 3.83 GiB against a measured 0.6 GiB model peak for a 4096-token chunk
+(`compat/memsnap.py`). The graphs for 384-2048-token chunks cost another 1.4 GiB a card and 1.4 GiB of the
+estimate for no soak-measured throughput. Utilization 0.98 then leaves about 1 GB at the soaked peak.
+
+## Checked (on this code, 2026-10-07/08, 210 W and -42 mV, prefix caching off)
+
+Flash-Next TP4 on the new defaults, 2026-10-07: GSM8K full set at concurrency 1, paired per question against
+the v0.2.6-era record: 95.45% vs 95.60%, 14 vs 16 discordant, McNemar p = 0.86, no detectable difference;
+HumanEval 160 / 164 (the record). Mixed-length soak, 16 clients, 25 minutes: 684 requests, 0 errors, 6,666
+prompt tok/s, VRAM peak 31,766 of 32,624 MiB a card. Strict sanity: 0 bad of 320 after long prompts, 0 of 1,700
+at concurrency 17, 0 of 1,920 at 32. The 2048-chunk, 7.5 GiB and pipelined variants ran the same checks and are
+documented as rejected.
+
+The release validation chain on the final tree (`~/validate-030.sh` -> `~/val030.log`): fn4 full BetterBench +
+soak + sanity, 27B two cards soak + sanity, Flash-Next two cards soak + sanity, the 4-rank all-reduce /
+all-gather / 2-rank race tests, the unit gates. Record:
+
+VALIDATION_RECORD
+
+## Also in this tag
+
+- `notes/mes-timeouts.md` and the guest kernel parameters that settle the RDNA4 MES timeouts under KVM.
+- `notes/radiance-test-run.md`: the radiance engine (1.0.4 / 1.0.8 / 1.1.1 / 1.2.0) through our checklist.
+- README cut to highlights and a stats table.

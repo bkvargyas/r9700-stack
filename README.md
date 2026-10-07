@@ -54,8 +54,8 @@ The serve scripts carry the measured defaults and document each knob next to it;
 kernel back to vLLM's. Tests are in `tests/`, the benchmark and gate tools in `bench/`, the release checklist
 in [notes/picking-up.md](notes/picking-up.md).
 
-**Current release: [v0.2.5](notes/release-v0.2.5.md).** The 2026-10-07 defaults above are on `master` and
-validated as described in the changelog; the next tag carries them.
+**Current release: [v0.3.0](notes/release-v0.3.0.md)** (2026-10-08): the defaults above, validated on every
+configuration; [CHANGELOG.md](CHANGELOG.md) has the full list.
 
 ## Notes for operators
 

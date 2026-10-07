@@ -7,6 +7,13 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] - 2026-10-08
+
+**Flash-Next on four cards: 70% more KV cache, 4% more prefill, same decode, on new measured defaults.** Validated on
+every configuration on this code (`notes/release-v0.3.0.md`).
+
 ### Changed
 - **Flash-Next TP4 defaults** (`serve/flashnext.sh`, 2026-10-07): the fp8 hyper-connection up GEMM with the
   gate mix fused (`R9K_HC_FP8=r9k`, below), memory utilization 0.98 and cudagraphs only for prefill chunks up to
