@@ -274,15 +274,35 @@ def install_mix(model: torch.nn.Module) -> int:
         mod.mix = types.MethodType(_mix, mod)
         mod.combine_and_mix = types.MethodType(_combine_and_mix, mod)
         mod._r9k_mix = True
-        if FP8 and down.weight.shape[1] % 32 == 0 and up.weight.shape[1] % 32 == 0 and up.weight.shape[0] % 64 == 0:
-            from .kernels import fp8 as F8
-            d = F8.quantize_rows_fp8(down.weight.data)
-            u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
-            mod._r9k_hc_fp8 = (d.wq, d.ws, u.wq, u.ws)       # plain tuple: not a parameter, not a child module
         n += 1
     if n:
         logger.info("r9700: r9k hyper-connection mix (down+silu, up+sigmoid+mean) installed on %d modules (M <= %d)"
                     "%s", n, MIX_MAX_M, f"; fp8 tiled GEMMs from {FP8_MIN_M} rows" if FP8 else "")
+    return n
+
+
+def quantize_fp8(model: torch.nn.Module) -> int:
+    """AFTER load_weights (install_mix runs at construction, when the weights are still uninitialised): the fp8
+    copies of the hyper-connection down / up weights for the prefill paths, on every module install_mix bound.
+    The forward reads the tuple at trace time (the profiling run follows weight loading), so this must run
+    before the first forward. 2026-10-07: quantising at install served garbage above 256 rows."""
+    if not FP8:
+        return 0
+    from .kernels import fp8 as F8
+    n = 0
+    for mod in model.modules():
+        if not getattr(mod, "_r9k_mix", False):
+            continue
+        down = mod.input_mix_weight_down_block_inject if getattr(mod, "use_combine", False) else mod.input_mix_weight_down
+        up = mod.input_mix_weight_up
+        if down.weight.shape[1] % 32 or up.weight.shape[1] % 32 or up.weight.shape[0] % 64:
+            continue
+        d = F8.quantize_rows_fp8(down.weight.data)
+        u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
+        mod._r9k_hc_fp8 = (d.wq, d.ws, u.wq, u.ws)       # plain tuple: not a parameter, not a child module
+        n += 1
+    if n:
+        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load)", n)
     return n
 
 
