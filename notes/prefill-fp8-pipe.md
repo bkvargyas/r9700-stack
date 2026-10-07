@@ -102,3 +102,26 @@ if not, the pipeline is shelved and the all-reduce stays what it is: bandwidth.
 Commits (local master): b0eb1d2 F8 + MIX, 246d35f F8B, 10b22e6 pipe. Test box tree `~/r9700-build/repo-f8`
 (libr9k.so built), card-4 runs `~/f8gates.log` / `~/f8sweep.log` / `~/f8mix.log` / `~/f8blk2.log`, tools
 `~/f8run.sh` (one test, full output, no build) and `~/f8wait.sh`. Production copy `~/r9700-build/repo` untouched.
+
+### Gate, sweep, and where the KV cache went (18:00-18:35 UTC)
+
+**Gate (hc fp8 + pipe, `f8-both-fn4`)**: GSM8K 95.45% (1,259 / 1,319) vs the v0.2.6-era record `r9knodes-fn4`
+95.60%; discordant 14 vs 16, McNemar p = 0.86, identical outputs 14.9% (the fp8 gate changes bits in every
+layer); HumanEval 160 / 164 = the record. No detectable difference: the hc fp8 mix is clean to ship as a knob.
+
+**Comm-instance sweep** (4-rank stand-in, stock tail 5.15 ms, ideal 3.68): fused pushes 128 blocks 4.93, 16 blocks
+6.06 (AR alone 1.96 ms: too few pushers for the uplink); DMA pushes 128 blocks **4.67** (AR alone 1.21), 32 blocks
+5.61. DMA engines overlap a third of the all-reduce; the rest still serialises. One serving run with DMA pushes
+is queued; if it does not beat the hc fp8 config alone the pipeline is shelved.
+
+**The KV cache.** Brian: "So TP4 QFN only has 259k of KV cache?" Per card at utilisation 0.94 (31.86 GiB, budget
+29.95): weights + non-torch 22.59 GiB, "peak activation" 3.83, CUDA graphs 3.2 (captured after the KV cache is
+sized, so outside vLLM's arithmetic), KV 3.53 GiB = 279k tokens; the fn4 soak peaked at 30.0 GB of 32.6 a card.
+`compat/memsnap.py` (R9K_MEMSNAP=1, EAGER=1) on the same 4096-token profiling forward: **the model's peak is
+608 MiB above entry** (largest part the layer-1 PLE gather at 840 MiB), and eager vLLM sized the KV cache at
+7.57 GiB = **513,088 tokens**. The 3.83 GiB is torch.compile / inductor autotuning during the profiling run,
+counted as activation. Levers measured or queued: utilisation 0.98 (`kv-hc-u98`): 348,834 tokens, probe
+unchanged (dec 199.7, c16 910, prefill 7069), 25-min soak with VRAM sampling + conc 17/32 sanity running;
+capture sizes <= 256 + explicit `--kv-cache-memory` (KVMEM 6.5 / 7.5 GiB a rank, ~440k / ~500k tokens) queued
+with soaks; a 2048-token chunk for comparison. fp8 KV cache (2x) assessed as its own item (QSA / decode /
+drafter fp8 read paths, ~a day, then the long-context gate).
