@@ -67,15 +67,34 @@ def alias(moe_kernel) -> bool:
 
 # ------------------------------------------------------------------------------------- 2. shared-expert fold
 def shared_output(experts, M: int, N: int) -> torch.Tensor | None:
-    """The runner's shared-expert output for this call, if the fold is installed and the tensor fits."""
+    """The runner's shared-expert output for this call, if the fold is installed and the tensor fits.
+
+    Peeks at the SharedExperts slot rather than reading its `output` property, which CONSUMES the slot (the
+    runner reads it after the experts return and asserts it is still there). At decode vLLM runs the shared
+    expert on an aux stream overlapped with the routed experts, so the read is ordered after its ready event."""
     layer = getattr(experts, "r9k_layer", None)
     runner = getattr(layer, "_r9k_runner", None)
     se = getattr(runner, "_shared_experts", None)
-    out = getattr(se, "output", None) if se is not None else None
-    if (isinstance(out, torch.Tensor) and out.dim() == 2 and out.shape[0] == M and out.shape[1] == N
+    if se is None:
+        return None
+    try:
+        idx = se._output_idx
+        out = se._output[idx]
+    except (AttributeError, IndexError, TypeError):
+        return None
+    if not (isinstance(out, torch.Tensor) and out.dim() == 2 and out.shape[0] == M and out.shape[1] == N
             and out.dtype == torch.bfloat16 and out.stride(1) == 1 and out.stride(0) % 8 == 0):
-        return out
-    return None
+        return None
+    stream, events = getattr(se, "_stream", None), getattr(se, "_output_ready_event", None)
+    if stream is not None and events is not None:
+        try:
+            from vllm.model_executor.layers.fused_moe.runner.shared_experts import SharedExpertsOrder
+            if se._determine_shared_experts_order(out) == SharedExpertsOrder.MULTI_STREAM_OVERLAPPED:
+                events[idx].wait(torch.cuda.current_stream())
+        except Exception as e:                                  # unknown runner shape: do not fold this call
+            logger.warning_once("r9700: shared-expert fold off (%s)", e)
+            return None
+    return out
 
 
 def mark(experts, folded: bool) -> None:
