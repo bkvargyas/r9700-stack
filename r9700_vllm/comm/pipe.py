@@ -36,6 +36,8 @@ ENABLED = os.environ.get("R9K_AR_PIPE", "stock") == "r9k"
 ROWS = int(os.environ.get("R9K_AR_PIPE_ROWS", "2048"))          # rows per part
 MAX_PARTS = int(os.environ.get("R9K_AR_PIPE_PARTS", "4"))
 PIPE_MB = float(os.environ.get("R9K_AR_PIPE_MB", "24"))          # the comm-stream ar4 instance's largest message
+PIPE_BLOCKS = int(os.environ.get("R9K_AR_PIPE_BLOCKS", "128"))   # its push kernels' workgroups (CUs it takes)
+PIPE_SDMA = os.environ.get("R9K_AR_PIPE_SDMA", "0") == "1"       # DMA-engine pushes: no CUs held while bytes move
 
 _LAYERS: dict[int, torch.nn.Module] = {}
 _ST = types.SimpleNamespace(stream=None, ar=None, tried=False)
@@ -59,7 +61,8 @@ def comm():
         from .r9k_ar4 import R9kAllReduce4
         tp = get_tp_group()
         if tp.world_size == 4:
-            a = R9kAllReduce4(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB)
+            a = R9kAllReduce4(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB, blocks=PIPE_BLOCKS,
+                              sdma=PIPE_SDMA)
         elif tp.world_size == 2 and os.environ.get("R9K_AR_IMPL", "r9k") == "r9k":
             from .r9k_ar import R9kAllReduce                 # the 2-rank P2P all-reduce (wht-compressed >= 128 KB)
             a = R9kAllReduce(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB)

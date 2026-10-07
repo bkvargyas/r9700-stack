@@ -79,9 +79,11 @@ class R9kAllReduce4:
     # phase indices into the flag / seq arrays
     P1, P2, P3, P4 = 0, 1, 2, 3
 
-    def __init__(self, group, device, max_mb: float | None = None):
-        """max_mb: the largest message (bf16 bytes) this instance accepts (default R9K_AR4_MAX_MB); a second,
-        smaller instance serves the pipelined prefill parts on their own stream (comm/pipe.py)."""
+    def __init__(self, group, device, max_mb: float | None = None, blocks: int | None = None,
+                 sdma: bool | None = None):
+        """max_mb: the largest message (bf16 bytes) this instance accepts (default R9K_AR4_MAX_MB); blocks / sdma
+        override R9K_AR4_BLOCKS / R9K_AR4_SDMA. A second, smaller instance serves the pipelined prefill parts on
+        their own stream (comm/pipe.py): fewer blocks or DMA pushes leave the CUs to the compute it overlaps."""
         self.disabled = True
         self.world = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -95,8 +97,9 @@ class R9kAllReduce4:
         if self.bits not in (4, 6):
             raise RuntimeError(f"R9K_AR4_BITS={self.bits} unsupported (4 or 6)")
         self.max_bytes = int(float(os.environ.get("R9K_AR4_MAX_MB", "64") if max_mb is None else max_mb) * 2**20)
-        self.nblocks = min(int(os.environ.get("R9K_AR4_BLOCKS", "128")), L.r9k_ar4_max_blocks())
-        self.sdma = os.environ.get("R9K_AR4_SDMA", "0") == "1"
+        self.nblocks = min(int(os.environ.get("R9K_AR4_BLOCKS", "128") if blocks is None else blocks),
+                           L.r9k_ar4_max_blocks())
+        self.sdma = (os.environ.get("R9K_AR4_SDMA", "0") == "1") if sdma is None else bool(sdma)
         pairs = _pairs(self.world)
         pos = {r: (pi, h) for pi, p in enumerate(pairs) for h, r in enumerate(p)}
         if len(pos) != 4:

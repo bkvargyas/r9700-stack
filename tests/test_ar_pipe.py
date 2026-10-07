@@ -161,6 +161,21 @@ def main():
         print(f"one 21 MB ar4 {t_ar:.2f} ms, the compute stand-in {t_moe:.2f} ms")
         print(f"tail stock (AR + compute + AR) {t_stock:.2f} ms;  pipelined P=2 {res[2]:.2f} ms  P=4 {res[4]:.2f} ms"
               f"  (ideal: compute + one AR = {t_moe + t_ar:.2f})")
+    # the comm instance's footprint on the CUs: fewer push blocks, or DMA pushes
+    for blocks, sdma in ((64, False), (32, False), (16, False), (128, True), (32, True)):
+        try:
+            ar_pipe = R9kAllReduce4(dist.group.WORLD, dev, max_mb=24, blocks=blocks, sdma=sdma)
+        except Exception as e:                                           # noqa: BLE001
+            if rank == 0:
+                print(f"  blocks {blocks} sdma {int(sdma)}: unavailable ({str(e)[:60]})")
+            continue
+        if ar_pipe.disabled:
+            continue
+        t_alone = t(lambda: ar_pipe.all_reduce(attn))
+        r2 = t(lambda: piped(2))
+        if rank == 0:
+            print(f"  comm instance blocks {blocks:3d} sdma {int(sdma)}: AR alone {t_alone:.2f} ms, "
+                  f"pipelined P=2 {r2:.2f} ms")
         print("test_ar_pipe:", "FAIL" if fails else "PASS")
     dist.barrier()
     dist.destroy_process_group()
