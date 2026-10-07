@@ -47,7 +47,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 )
 
 from ..moe.experts import R9700Mxfp4Experts, r9k_available
-from ..moe import prep
+from ..moe import fold, prep
 
 logger = init_logger("vllm." + __name__)
 
@@ -95,6 +95,8 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
             moe_quant_config=self.moe_quant_config, moe_config=self.moe, experts_cls=R9700Mxfp4Experts,
             mxfp4_backend=self.mxfp4_backend, routing_tables=layer._expert_routing_tables())
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+        self.moe_kernel.fused_experts.r9k_layer = layer     # where moe/route.py leaves the routing tables
+        fold.alias(self.moe_kernel)                          # no finalize copy: experts write the output
         prep.maybe_attach_cache(self, layer)
 
 

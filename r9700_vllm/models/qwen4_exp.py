@@ -38,6 +38,8 @@ from ..ple import short_conv as _ple_conv
 from .. import hc as _hc
 from .. import router as _router
 from ..moe import shared as _shared
+from ..moe import route as _route
+from ..moe import fold as _fold
 
 logger = init_logger("vllm." + __name__)
 
@@ -174,6 +176,8 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -215,6 +219,8 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
@@ -236,6 +242,8 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
         _router.install(self)
         _hc.install_mix(self)
         _shared.install(self)
+        _route.install(self)
+        _fold.install(self)
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))

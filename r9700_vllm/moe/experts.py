@@ -27,6 +27,7 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import TopKWeig
 from vllm.platforms import current_platform
 
 from ..kernels import moe as K
+from . import fold, route
 
 
 def _cfg(env: str, default: tuple[int, int, int]) -> tuple[int, int, int]:
@@ -51,6 +52,7 @@ def _legal(cfg: tuple[int, int, int], W) -> tuple[int, int, int]:
 
 
 FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
+FUSED_SUM = os.environ.get("R9K_FUSED_SUM", "1") == "1"
 ZERO_DOWN = os.environ.get("R9K_MOE_ZERO_DOWN", "0") == "1"
 # Cold-pass strategy by step width (routed rows = tokens x top-k). Measured 2026-09-18, MTP-3, 270 slots:
 #  - few rows (e.g. 4 concurrent = 160 rows): bulk-staging the few cold experts beats latency-bound UVA reads
@@ -153,9 +155,12 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         pf_gate = K.pick_moe_prefill(MT, K1, gate_up=True)
         cache = getattr(self, "r9k_cache", None)
         if cache is None:
+            # the fused router (moe/route.py) leaves this call's align tables on the RoutedExperts object
+            tabs = route.take(getattr(self, "r9k_layer", None), topk_ids, blk, numel) if expert_map is None else None
+            if tabs is None:
+                tabs = moe_align_block_size(topk_ids, blk, global_num_experts, expert_map)
             passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1, self.fold[0]),
-                       K.Mxfp4Experts(w2, self.w2_scale, N2, K2, self.fold[1]),
-                       moe_align_block_size(topk_ids, blk, global_num_experts, expert_map))]
+                       K.Mxfp4Experts(w2, self.w2_scale, N2, K2, self.fold[1]), tabs)]
         else:
             assert expert_map is None, "r9k expert cache: expert parallelism not supported"
             (h1, h2), (c1, c2) = cache.hot(), cache.cold()
@@ -202,4 +207,10 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *_legal(CFG_DOWN, W2),
                        num_experts=global_num_experts, MT=MT, prefill=pf_down)
-        ops.moe_sum(down.view(M, topk, N2), output)
+        if FUSED_SUM and hasattr(K.lib(), "r9k_moe_sum"):
+            shared = fold.shared_output(self, M, N2)      # the runner's shared-expert output, when the fold is on
+            K.moe_sum(down.view(M, topk, N2), shared, output)
+            fold.mark(self, shared is not None)
+        else:
+            fold.mark(self, False)
+            ops.moe_sum(down.view(M, topk, N2), output)

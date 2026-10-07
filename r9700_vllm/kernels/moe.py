@@ -521,6 +521,24 @@ def pick_moe_prefill(MT: int, K_down: int, gate_up: bool = False) -> int | None:
     return cfg
 
 
+
+def moe_sum(down: torch.Tensor, shared: torch.Tensor | None, out: torch.Tensor) -> torch.Tensor:
+    """out[M, N] = sum over top-k of down[M, topk, N] (+ shared[M, N]) in fp32, one bf16 rounding
+    (kernels/r9k_moe_sum.hip). Replaces ops.moe_sum, the finalize copy and the runner's shared add."""
+    M, topk, N = down.shape
+    assert down.is_contiguous() and out.shape == (M, N) and out.dtype == torch.bfloat16 and out.stride(1) == 1
+    L = lib()
+    if not hasattr(L, "_moe_sum_bound"):
+        L.r9k_moe_sum.restype = ctypes.c_int
+        L.r9k_moe_sum.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long] * 3
+        L._moe_sum_bound = True
+    rc = L.r9k_moe_sum(down.data_ptr(), shared.data_ptr() if shared is not None else 0, out.data_ptr(), M, topk, N,
+                       shared.stride(0) if shared is not None else 0, out.stride(0), _stream())
+    if rc:
+        raise RuntimeError(f"r9k_moe_sum failed ({rc}) M={M} topk={topk} N={N}")
+    return out
+
+
 def align_block_size_ref(topk_ids: torch.Tensor, num_experts: int, block: int = MOE_BLOCK):
     """Pure-torch equivalent of vLLM's moe_align_block_size (for tests): pads each expert's rows to a
     multiple of `block`, pad value = numel. Returns (sorted_ids, expert_ids, ntpp) sized to capacity."""
