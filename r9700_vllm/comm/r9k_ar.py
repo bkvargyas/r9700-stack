@@ -58,9 +58,11 @@ def _lib():
 
 
 class R9kAllReduce:
-    """Same contract as R4dAllReduce: .disabled, .should(x), .all_reduce(x)."""
+    """Same contract as R4dAllReduce: .disabled, .should(x), .all_reduce(x[, out])."""
 
-    def __init__(self, group, device):
+    def __init__(self, group, device, max_mb: float | None = None):
+        """max_mb: largest message (default R9K_R4D_AR_MAX_MB); a second instance with its own scratch serves the
+        pipelined prefill parts on their own stream (comm/pipe.py)."""
         self.disabled = True
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -69,7 +71,8 @@ class R9kAllReduce:
         self.L = _lib()
         self.device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
         torch.cuda.set_device(self.device)
-        self.max_bytes = (int(float(os.environ.get("R9K_R4D_AR_MAX_MB", "48")) * 2**20) // 16) * 16
+        mb = os.environ.get("R9K_R4D_AR_MAX_MB", "48") if max_mb is None else max_mb
+        self.max_bytes = (int(float(mb) * 2**20) // 16) * 16
         self.slot16 = self.max_bytes // 16
         self.max_nb = min(24, self.L.r9k_ar_max_blocks())
         self.words_per_block, self.min_nb = 1400, 4
@@ -177,8 +180,11 @@ class R9kAllReduce:
                 f"{(b >> 20) or b >> 10}{'MiB' if b >> 20 else 'KiB'}{'/c' if c else '/x'}:{v}"
                 f"({100.0 * v / tot:.0f}%)" for (b, c), v in rows[:8]))
 
-    def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.empty_like(x)
+    def all_reduce(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        if out is None:
+            out = torch.empty_like(x)
+        else:
+            assert out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous(), (out.shape, x.shape)
         nbytes = x.numel() * x.element_size()
         use_wht = (self._wht and x.dtype in (torch.bfloat16, torch.float16) and nbytes >= self._qmin
                    and x.numel() % self._qgroup == 0)

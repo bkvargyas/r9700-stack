@@ -15,8 +15,9 @@ Mechanics: the layer's forward is rebound (Qwen4ExpDecoderLayer.forward, compat/
 RowParallelLinear no longer reduces (reduce_results=False) and the MoE runner skips its final all-reduce
 (moe_config.skip_final_all_reduce); the whole post-attention tail is one opaque custom op (layer_tail) that at
 decode widths does the stock sequence with the two all-reduces moved into it (the same kernels; captured by the
-cudagraph as before) and at prefill widths runs the pipeline. A second ar4 instance (own IPC scratch, 24 MiB
-messages) serves the part all-reduces on the comm stream, so it never shares flags with the main-stream instance.
+cudagraph as before) and at prefill widths runs the pipeline. A second all-reduce instance (ar4 at TP=4, the
+2-rank P2P kernel at TP=2; own IPC scratch, 24 MiB messages) serves the part all-reduces on the comm stream, so it
+never shares flags with the main-stream instance.
 """
 from __future__ import annotations
 
@@ -57,13 +58,17 @@ def comm():
         from vllm.distributed.parallel_state import get_tp_group
         from .r9k_ar4 import R9kAllReduce4
         tp = get_tp_group()
-        if tp.world_size != 4:
-            logger.info("r9700: all-reduce pipelining needs TP=4 (ar4); off")
+        if tp.world_size == 4:
+            a = R9kAllReduce4(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB)
+        elif tp.world_size == 2 and os.environ.get("R9K_AR_IMPL", "r9k") == "r9k":
+            from .r9k_ar import R9kAllReduce                 # the 2-rank P2P all-reduce (wht-compressed >= 128 KB)
+            a = R9kAllReduce(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB)
+        else:
+            logger.info("r9700: all-reduce pipelining needs TP=4 (ar4) or TP=2 (r9k 2-rank); off")
             return None
-        a4 = R9kAllReduce4(tp.cpu_group, torch.cuda.current_device(), max_mb=PIPE_MB)
-        if a4.disabled:
+        if a.disabled:
             return None
-        _ST.ar = a4
+        _ST.ar = a
         _ST.stream = torch.cuda.Stream(priority=-1)
     except Exception as e:                                   # noqa: BLE001
         logger.warning("r9700: all-reduce pipelining off (%s)", e)
