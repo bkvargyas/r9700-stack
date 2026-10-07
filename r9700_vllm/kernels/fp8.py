@@ -4,6 +4,8 @@ from __future__ import annotations
 import ctypes
 from dataclasses import dataclass
 
+import os
+
 import torch
 
 from .moe import lib as _lib, _stream
@@ -22,6 +24,9 @@ def _L():
         L.r9k_gemm_fp8_block.argtypes = [ctypes.c_long] * 5 + [ctypes.c_int] * 8 + [ctypes.c_long]
         L.r9k_quant_group128_fp8.restype = ctypes.c_int
         L.r9k_quant_group128_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
+        if hasattr(L, "r9k_fp8_prefill_mix"):
+            L.r9k_fp8_prefill_mix.restype = ctypes.c_int
+            L.r9k_fp8_prefill_mix.argtypes = [ctypes.c_long] * 10 + [ctypes.c_int] * 5 + [ctypes.c_long]
         _BOUND = True
     return L
 
@@ -102,4 +107,81 @@ def gemm_fp8_block(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: t
                                  M, K, N, out.stride(0), WV, SK, NPW, MT, _stream())
     if rc:
         raise RuntimeError(f"r9k_gemm_fp8_block failed ({rc}) M={M} N={N} K={K}")
+    return out
+
+
+# Tile cfgs (kPfCfgs in r9k_moe_4bit_prefill): 9 = 256 x 128 / 8 waves / BK=32 double-buffered is the sweep's best
+# on every served shape at 4096 rows (tests/test_fp8_prefill_r9k.py, 2026-10-07: 163-182 TFLOPS); smaller M-tiles
+# below 512 rows so a tile is not mostly padding. R9K_FP8_PREFILL_CFGS="N,K=cfg;..." overrides per shape.
+PREFILL_CFG = int(os.environ.get("R9K_FP8_PREFILL_CFG", "9"))
+PREFILL_MIN_M = int(os.environ.get("R9K_FP8_PREFILL_MINM", "64"))   # below: the split-K decode kernel
+MIX_CFG = int(os.environ.get("R9K_FP8_MIX_CFG", "9"))               # TN == 4 cfgs only: 1, 9, 16, 17, 19
+_TILE: dict[tuple[int, int], int] = {}
+for _kv in os.environ.get("R9K_FP8_PREFILL_CFGS", "").split(";"):
+    if "=" in _kv:
+        _nk, _c = _kv.split("=")
+        _TILE[tuple(int(v) for v in _nk.split(","))] = int(_c)
+
+
+def tile_cfg(N: int, K: int, M: int, mix: bool = False) -> int:
+    c = _TILE.get((N, K))
+    if c is not None:
+        return c
+    if M < 512:
+        return 17 if (mix or M < 256) else 10                       # 64 x 128 (4 waves) / 128 x 128 (8 waves)
+    return MIX_CFG if mix else PREFILL_CFG
+
+
+def hc4_interleave(w_up: torch.Tensor) -> torch.Tensor:
+    """[4*HD, LR] -> rows reordered so each 64-row group holds 16 output columns x the 4 hyper-connection streams
+    (r' = g*64 + s*16 + i <- r = s*HD + g*16 + i): the layout gemm_fp8_mix's epilogue expects."""
+    DIM, LR = w_up.shape
+    assert DIM % 64 == 0, DIM
+    return w_up.reshape(4, DIM // 64, 16, LR).permute(1, 0, 2, 3).reshape(DIM, LR).contiguous()
+
+
+def hc4_perm(DIM: int, device) -> torch.Tensor:
+    """perm[r'] = r of hc4_interleave (w_up[perm] == hc4_interleave(w_up))."""
+    return torch.arange(DIM, device=device).reshape(4, DIM // 64, 16).permute(1, 0, 2).reshape(-1)
+
+
+def gemm_fp8_mix(a_q: torch.Tensor, a_s: torch.Tensor, w: Fp8Weight, xn: torch.Tensor,
+                 out: torch.Tensor | None = None, cfg: int | None = None) -> torch.Tensor:
+    """The hyper-connection up GEMM with hc_gate_mix fused (HC = 4): out[M, N/4] bf16 =
+    (1/4) sum_s sigmoid(bf16(fp8 GEMM)[m, s*HD + c]) * xn[m, s*HD + c]; w = quantize_rows_fp8(hc4_interleave(w_up)),
+    a_q / a_s the per-row fp8 lora [M, K]. K % 32 == 0, N % 64 == 0."""
+    from . import moe as KM
+    from ..ops import _identity_tables
+    M = a_q.shape[0]
+    HD = w.N // 4
+    cfg = tile_cfg(w.N, w.K, M, mix=True) if cfg is None else cfg
+    if out is None:
+        out = torch.empty((M, HD), dtype=torch.bfloat16, device=a_q.device)
+    if M == 0:
+        return out
+    assert xn.shape == (M, w.N) and xn.dtype == torch.bfloat16 and xn.stride(1) == 1 and xn.stride(0) % 8 == 0
+    blk = KM.prefill_block(cfg)
+    (sid, eid, ntpp), _ = _identity_tables(a_q, M, blk // KM.MOE_BLOCK)
+    rc = _L().r9k_fp8_prefill_mix(a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), w.ws.data_ptr(), out.data_ptr(),
+                                  xn.data_ptr(), xn.stride(0), sid.data_ptr(), eid.data_ptr(), ntpp.data_ptr(),
+                                  eid.numel(), M, w.K, w.N, cfg, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_fp8_prefill_mix failed ({rc}) M={M} N={w.N} K={w.K} cfg={cfg}")
+    return out
+
+
+def gemm_fp8_tiled(a_q: torch.Tensor, a_s: torch.Tensor, w: Fp8Weight, out: torch.Tensor | None = None,
+                   cfg: int | None = None) -> torch.Tensor:
+    """Prefill-width fp8 x fp8 GEMM on the LDS-tiled WMMA kernel (kernels/r9k_moe_mxfp4a8.hip, F8 path):
+    out[M, N] bf16 = (a_q[M, K] e4m3 * a_s[M]) . (w e4m3 * w.ws[N])^T. K % 32 == 0, N % 16 == 0."""
+    from . import moe as KM
+    from ..ops import _identity_tables
+    M = a_q.shape[0]
+    cfg = tile_cfg(w.N, w.K, M) if cfg is None else cfg
+    if out is None:
+        out = torch.empty((M, w.N), dtype=torch.bfloat16, device=a_q.device)
+    if M == 0:
+        return out
+    t, _ = _identity_tables(a_q, M, KM.prefill_block(cfg) // KM.MOE_BLOCK)
+    KM.moe_gemm(a_q, a_s, w, out, *t, M, 1, None, num_experts=1, prefill=cfg)
     return out

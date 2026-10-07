@@ -427,6 +427,15 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     if prefill is not None:
         blk = prefill_block(prefill)
         max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+        if type(w).__name__ == "Fp8Weight":           # kernels/fp8.py: e4m3 fragments + one fp32 scale a column
+            rc = lib().r9k_moe_4bit_prefill(
+                3, a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(), 0, w.ws.data_ptr(), out.data_ptr(),
+                sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+                topk_w.data_ptr() if topk_w is not None else 0, 0, w.N,
+                max_blocks, numel, a_row_div, w.K, w.N, prefill, _stream())
+            if rc:
+                raise RuntimeError(f"r9k_moe_4bit_prefill (fp8) failed ({rc}) N={w.N} K={w.K} cfg={prefill}")
+            return out
         nv = isinstance(w, Nvfp4Experts)
         rc = lib().r9k_moe_4bit_prefill(
             1 if nv else (2 if w.fold else 0), a_q.data_ptr(), a_s.data_ptr(), w.wq.data_ptr(),

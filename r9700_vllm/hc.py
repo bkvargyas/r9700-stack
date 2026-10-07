@@ -36,6 +36,16 @@ MIN_ROWS_GATE = int(os.environ.get("R9K_HC_MIN_ROWS_GATE", "1024"))
 MIX_MAX_M = int(os.environ.get("R9K_HC_MIX_MAX_M", "8"))
 MIX_SPLIT = int(os.environ.get("R9K_HC_MIX_SPLIT", "8"))      # K splits per row of the 336 x 10240 down GEMM
 MIX_LPR = int(os.environ.get("R9K_HC_MIX_LPR", "4"))          # lanes per weight row of the up GEMM (2 or 4)
+# Prefill widths: the down (336 x 10240) GEMM in fp8 on the LDS-tiled WMMA kernel (kernels/fp8.py gemm_fp8_tiled)
+# instead of hipBLASLt bf16, and the up GEMM (10240 x 320) with the sigmoid-gated mean fused into its epilogue
+# (gemm_fp8_mix: no [M, 10240] gate round trip) -- per-token fp8 activations, per-row fp8 weights (quantized once
+# at install). Rows below FP8_MIN_M (decode, also at concurrency: 16 x MTP-4 = 64 rows) keep the
+# exact bf16 paths. Opt-in until the GSM8K / HumanEval gate has passed with it: R9K_HC_FP8=r9k.
+FP8 = os.environ.get("R9K_HC_FP8", "stock") == "r9k"
+FP8_MIN_M = int(os.environ.get("R9K_HC_FP8_MINM", "256"))
+# The down GEMM alone does not pay: its per-token quant of xn (84 MB read, 42 written: 212 us at 4096 rows)
+# costs more than the fp8 GEMM saves (334 -> 172 us). Off until the combine-norm kernel emits the fp8 copy.
+FP8_DOWN = FP8 and os.environ.get("R9K_HC_FP8_DOWN", "0") == "1"
 
 
 def lib():
@@ -117,20 +127,33 @@ def mix_available() -> bool:
         return False
 
 
-def down_silu(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int) -> torch.Tensor:
+def _fp8_gemm(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: int) -> torch.Tensor:
+    """[M, N] bf16 = fp8(x) . fp8 weight^T on the tiled prefill kernel (per-token / per-row scales)."""
+    from .kernels import fp8 as F8, moe as KM
+    q, s = KM.quant_rows_fp8(x)
+    return F8.gemm_fp8_tiled(q, s, F8.Fp8Weight(wq, ws, N, K))
+
+
+def down_silu(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int,
+              wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
     """[M, N] bf16 = xn [M, K] . w [N, K]^T with hc_silu(., hc) applied to the first lora_rank columns (the merged
-    down + injection GEMM); stock's F.linear + hc_silu above MIX_MAX_M rows."""
+    down + injection GEMM); stock's F.linear + hc_silu above MIX_MAX_M rows, the fp8 tiled GEMM from FP8_MIN_M
+    rows when the fp8 weight (wq, ws) is given."""
     from . import router as R
     out = R.router_gemm(xn, w, True, MIX_SPLIT, lora_rank, float(hc_count), MIX_MAX_M) if mix_available() else None
     if out is None:
-        out = torch.nn.functional.linear(xn, w)
+        if wq is not None and FP8_DOWN and xn.shape[0] >= FP8_MIN_M:
+            out = _fp8_gemm(xn, wq, ws, w.shape[0], w.shape[1])
+        else:
+            out = torch.nn.functional.linear(xn, w)
         out[:, :lora_rank] = torch.ops.vllm.qwen4_exp_hc_silu(out[:, :lora_rank], hc_count)
     return out
 
 
-def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: int, lpr: int | None = None
-            ) -> torch.Tensor:
-    """[M, HD] bf16 = hc_gate_mix(xn, lora . w_up^T, hc): the up GEMM, sigmoid and gated mean in one launch."""
+def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: int, lpr: int | None = None,
+           wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
+    """[M, HD] bf16 = hc_gate_mix(xn, lora . w_up^T, hc): the up GEMM, sigmoid and gated mean in one launch;
+    stock's F.linear + gate_mix above MIX_MAX_M rows, the fp8 tiled GEMM from FP8_MIN_M rows with (wq, ws)."""
     lpr = MIX_LPR if lpr is None else lpr
     M, LR = lora.shape
     DIM = xn.shape[1]
@@ -140,6 +163,10 @@ def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: i
           and lora.stride(1) == 1 and w_up.stride(1) == 1 and xn.stride(1) == 1
           and lora.stride(0) % 8 == 0 and w_up.stride(0) % 8 == 0 and xn.stride(0) % 8 == 0)
     if not ok:
+        if wq is not None and M >= FP8_MIN_M:                 # fp8 up GEMM with the gate mix in its epilogue
+            from .kernels import fp8 as F8, moe as KM
+            q, s = KM.quant_rows_fp8(lora)
+            return F8.gemm_fp8_mix(q, s, F8.Fp8Weight(wq, ws, DIM, LR), xn)
         gate = torch.nn.functional.linear(lora, w_up)
         return torch.ops.vllm.qwen4_exp_hc_gate_mix(xn, gate, hc_count)
     out = xn.new_empty((M, HD))
@@ -151,11 +178,14 @@ def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: i
     return out
 
 
-def _down_silu_fake(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int) -> torch.Tensor:
+def _down_silu_fake(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int,
+                    wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
     return xn.new_empty((xn.shape[0], w.shape[0]))
 
 
-def _up_mix_fake(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: int) -> torch.Tensor:
+def _up_mix_fake(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: int,
+                 lpr: int | None = None, wq: torch.Tensor | None = None, ws: torch.Tensor | None = None
+                 ) -> torch.Tensor:
     return xn.new_empty((xn.shape[0], xn.shape[1] // hc_count))
 
 
@@ -183,13 +213,14 @@ def op_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injectio
 
 def _mix_tail(self, xn: torch.Tensor):
     lr, hc = self.lora_rank, self.hc_count
+    dq, ds, uq, us = getattr(self, "_r9k_hc_fp8", (None, None, None, None))
     if self.use_combine:
-        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down_block_inject.weight, lr, hc)
+        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down_block_inject.weight, lr, hc, dq, ds)
         injection = buf[:, lr:lr + hc]
     else:
-        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down.weight, lr, hc)
+        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down.weight, lr, hc, dq, ds)
         injection = None
-    block_input = torch.ops.r9700.hc_up_mix(buf[:, :lr], self.input_mix_weight_up.weight, xn, hc)
+    block_input = torch.ops.r9700.hc_up_mix(buf[:, :lr], self.input_mix_weight_up.weight, xn, hc, None, uq, us)
     return block_input, injection
 
 
@@ -232,10 +263,15 @@ def install_mix(model: torch.nn.Module) -> int:
         mod.mix = types.MethodType(_mix, mod)
         mod.combine_and_mix = types.MethodType(_combine_and_mix, mod)
         mod._r9k_mix = True
+        if FP8 and down.weight.shape[1] % 32 == 0 and up.weight.shape[1] % 32 == 0 and up.weight.shape[0] % 64 == 0:
+            from .kernels import fp8 as F8
+            d = F8.quantize_rows_fp8(down.weight.data)
+            u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
+            mod._r9k_hc_fp8 = (d.wq, d.ws, u.wq, u.ws)       # plain tuple: not a parameter, not a child module
         n += 1
     if n:
-        logger.info("r9700: r9k hyper-connection mix (down+silu, up+sigmoid+mean) installed on %d modules (M <= %d)",
-                    n, MIX_MAX_M)
+        logger.info("r9700: r9k hyper-connection mix (down+silu, up+sigmoid+mean) installed on %d modules (M <= %d)"
+                    "%s", n, MIX_MAX_M, f"; fp8 tiled GEMMs from {FP8_MIN_M} rows" if FP8 else "")
     return n
 
 

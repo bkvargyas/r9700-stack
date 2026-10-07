@@ -18,7 +18,10 @@ _DONE = False
 def _fp8_linear(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: int) -> torch.Tensor:
     from .kernels import fp8 as F8, moe as KM
     q, s = KM.quant_rows_fp8(x)
-    return F8.gemm_fp8(q, s, F8.Fp8Weight(wq, ws, N, K), None, *F8.pick_cfg("fp8row", N, K, x.shape[0]))
+    M = x.shape[0]
+    if M >= F8.PREFILL_MIN_M and K % 32 == 0:            # prefill widths: the LDS-tiled WMMA kernel
+        return F8.gemm_fp8_tiled(q, s, F8.Fp8Weight(wq, ws, N, K))
+    return F8.gemm_fp8(q, s, F8.Fp8Weight(wq, ws, N, K), None, *F8.pick_cfg("fp8row", N, K, M))
 
 
 def _fp8_linear_fake(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: int) -> torch.Tensor:
