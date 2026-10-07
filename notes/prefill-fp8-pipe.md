@@ -152,3 +152,13 @@ Sanity 0 bad at conc 17 / 32 on both. Recommendation for the fn4 defaults: utili
 <= 256 (442k tokens, 1.3 GB free at the soak peak; a 25-minute soak is still owed on exactly that pair, the
 0.98 and the trim were soaked separately for 25 and 10 minutes); `KVMEM=7.0` (475k, 0.95 GiB free) as the
 documented opt-in for the longest contexts; 7.5 is the measured edge, not a setting.
+
+### The pipeline's verdict (20:01 UTC)
+
+Serving with DMA pushes (`R9K_AR_PIPE=r9k R9K_AR_PIPE_SDMA=1`, hc fp8 on): 8k prefill 6637 against 7044-7069 for
+the hc fp8 config alone, decode 198.0. The pipeline is shelved: correct (sanity clean, gate passed with it on),
+in the tree behind `R9K_AR_PIPE` (default stock), and not worth its own overhead on this topology because the
+all-reduce kernels, fused or DMA, do not run beside the GEMMs. What would change the verdict: an all-reduce that
+holds no CUs while the bytes move (a DMA-only push with a host-side or SDMA-side completion), or a topology where
+the message is short enough that the split's overhead is the smaller term. For eight cards the message grows and
+the split's overhead does not, so the structure is worth keeping in the tree.

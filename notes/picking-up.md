@@ -179,6 +179,15 @@ and the only honest lever left.
 
 ## Already tried, measured, and rejected — don't redo these
 
+- **Prefill all-reduce pipelining by row parts (2026-10-07, comm/pipe.py, `R9K_AR_PIPE`).** The layer tail
+  (hc combine + mix, MoE, both all-reduces) in 2048-row parts with the attention parts' all-reduces on a comm
+  stream. Correct in serving and gated, but -5.5% prefill (fused pushes) / -6% (DMA pushes): the ar4 kernels hold
+  the CUs while they wait on the uplink, so they time-share with the GEMMs (4-rank stand-in: stock 5.15 ms, best
+  4.67, ideal 3.68). Shelved, default stock; see notes/prefill-fp8-pipe.md.
+- **Exact block-scaled fp8 tiled GEMM for the Triton projections (2026-10-07, `R9K_FP8_BLOCK_PREFILL`).**
+  Correct, 15-25% slower than vLLM's Triton block GEMM (167 TFLOPS) on the served shapes: two accumulator sets
+  cap the tile at 128 x 128 and the per-128-K promotion costs. Opt-in only.
+
 - **The decode node count as a lever (2026-10-07).** Removing ~240 of the ~1,990 launches a step (routing, the
   MoE sum + shared add + finalize copy) moved the Flash-Next TP4 step 0.14 ms (~1%): in graph replay a tiny
   node's dispatch overlaps the previous node, so the per-node "gap" the profiler shows is the profiler's. What
