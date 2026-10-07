@@ -7,8 +7,9 @@
 2. **Shared-expert fold.** The runner adds the shared expert's output to the routed output after the experts
    return (`MoERunner.forward`, `shared_output + fused_output`). The shared expert runs BEFORE routing, so its
    output is ready when our experts reduce over top-k: `r9k_moe_sum` adds it there, in fp32, with one bf16
-   rounding instead of stock's two, and the runner's forward (rebound by `install()`) skips the add for calls
-   that folded it. 48 adds a step.
+   rounding instead of stock's two, and the runner's forward (rebound by `install()`) never adds it. The split
+   is static: that forward is traced once by torch.compile, so the experts' apply (inside the opaque MoE op)
+   always adds the shared output on an installed runner, with a plain add as the fallback. 48 adds a step.
 
 Both are monkeypatches of vLLM internals, listed in compat/gate.py; R9K_MOE_FOLD=stock leaves vLLM's path.
 """
@@ -97,10 +98,19 @@ def shared_output(experts, M: int, N: int) -> torch.Tensor | None:
     return out
 
 
-def mark(experts, folded: bool) -> None:
-    layer = getattr(experts, "r9k_layer", None)
-    if layer is not None:
-        layer._r9k_shared_folded = folded
+def installed(experts) -> bool:
+    """True when this layer's runner drops the shared add (so the experts MUST add the shared output)."""
+    runner = getattr(getattr(experts, "r9k_layer", None), "_r9k_runner", None)
+    return bool(getattr(runner, "_r9k_fold", False))
+
+
+def shared_any(experts) -> torch.Tensor | None:
+    """The shared-expert slot as is (any shape), for the add fallback when the fused kernel cannot take it."""
+    se = getattr(getattr(getattr(experts, "r9k_layer", None), "_r9k_runner", None), "_shared_experts", None)
+    try:
+        return se._output[se._output_idx] if se is not None else None
+    except (AttributeError, IndexError, TypeError):
+        return None
 
 
 def _forward(self, hidden_states, router_logits, input_ids=None, shared_experts_input=None):
@@ -114,7 +124,9 @@ def _forward(self, hidden_states, router_logits, input_ids=None, shared_experts_
         self.moe_config.hidden_dim_unpadded if self._quant_method.has_unpadded_output else 0)
     shared_output, fused_output = result if isinstance(result, tuple) else (None, result)
     fused_output = cast(torch.Tensor, fused_output)
-    if shared_output is not None and getattr(self.routed_experts, "_r9k_shared_folded", False):
+    # STATIC decision: this forward is traced once by torch.compile, so nothing read here may vary per call.
+    # The experts' apply (inside the opaque MoE op) always adds the shared output itself on a folded runner.
+    if shared_output is not None and getattr(self, "_r9k_fold", False):
         shared_output = None                      # already inside fused_output (r9k_moe_sum)
     if og_hidden_dim_pre_xform is not None:
         fused_output = fused_output[..., :og_hidden_dim_pre_xform]
@@ -150,7 +162,7 @@ def install(model: torch.nn.Module) -> int:
         # a plain attribute: nn.Module.__setattr__ would register the runner as a child of its own child and
         # vLLM's tied-weight scan (named_modules) would recurse forever at load
         object.__setattr__(re_, "_r9k_runner", mod)
-        re_._r9k_shared_folded = False
+        mod._r9k_fold = True
         mod.forward = types.MethodType(_forward, mod)
         n += 1
     if n:

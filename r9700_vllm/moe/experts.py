@@ -207,10 +207,17 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *_legal(CFG_DOWN, W2),
                        num_experts=global_num_experts, MT=MT, prefill=pf_down)
+        folded = fold.installed(self)                     # the runner no longer adds the shared output: we must
         if FUSED_SUM and hasattr(K.lib(), "r9k_moe_sum"):
-            shared = fold.shared_output(self, M, N2)      # the runner's shared-expert output, when the fold is on
+            shared = fold.shared_output(self, M, N2) if folded else None
             K.moe_sum(down.view(M, topk, N2), shared, output)
-            fold.mark(self, shared is not None)
+            if folded and shared is None:
+                so = fold.shared_any(self)
+                if so is not None:
+                    output.add_(so)
         else:
-            fold.mark(self, False)
             ops.moe_sum(down.view(M, topk, N2), output)
+            if folded:
+                so = fold.shared_any(self)
+                if so is not None:
+                    output.add_(so)
