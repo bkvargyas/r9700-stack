@@ -127,6 +127,11 @@ def make_router(stock, routed_experts):
             self._routing_replay_out = getattr(stock, "_routing_replay_out", None)
             self.routed_experts = routed_experts
             self._bufs: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+            # Allocate NOW, at model construction. The first fused call otherwise lands inside vLLM's cudagraph
+            # memory-profiling pass, whose allocations are released afterwards: the buffers' memory was handed
+            # to other tensors and the next capture pass faulted (GPU page fault at the 24-token graph).
+            if torch.cuda.is_available():
+                self._buffers(torch.device("cuda", torch.cuda.current_device()), stock.global_num_experts)
 
         def _buffers(self, device: torch.device, E: int):
             b = self._bufs.get(device)
