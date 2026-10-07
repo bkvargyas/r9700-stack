@@ -40,7 +40,7 @@ PIPE_BLOCKS = int(os.environ.get("R9K_AR_PIPE_BLOCKS", "128"))   # its push kern
 PIPE_SDMA = os.environ.get("R9K_AR_PIPE_SDMA", "0") == "1"       # DMA-engine pushes: no CUs held while bytes move
 
 _LAYERS: dict[int, torch.nn.Module] = {}
-_ST = types.SimpleNamespace(stream=None, ar=None, tried=False)
+_ST = types.SimpleNamespace(stream=None, ar=None, tried=False, sized=False)
 
 
 def parts(M: int) -> list[int] | None:
@@ -92,6 +92,12 @@ def _tail(hidden_states: torch.Tensor, attn_out: torch.Tensor, injection: torch.
     b = parts(M) if ar is not None else None
     if b is not None and not (ar.should(attn_out[b[0]:b[1]]) and attn_out.is_contiguous()
                               and hidden_states.is_contiguous()):
+        b = None
+    if b is not None and not _ST.sized:
+        # vLLM's MoE modular kernel sizes its shared workspace on the profiling run (the first forward, at
+        # max_num_batched_tokens) and locks it; a split profiling run would size it for a part, and a later
+        # unsplit chunk between one part and the full width would not fit. The first full-width call runs unsplit.
+        _ST.sized = True
         b = None
     if b is not None and not injection.is_contiguous():
         injection = injection.contiguous()                   # the attention mix's injection is a column slice
