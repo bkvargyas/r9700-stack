@@ -90,9 +90,11 @@ def _tail(hidden_states: torch.Tensor, attn_out: torch.Tensor, injection: torch.
     M = attn_out.shape[0]
     ar = _ST.ar
     b = parts(M) if ar is not None else None
-    if b is not None and not (ar.should(attn_out[b[0]:b[1]]) and attn_out.is_contiguous() and hidden_states.is_contiguous()
-                              and injection.is_contiguous()):
+    if b is not None and not (ar.should(attn_out[b[0]:b[1]]) and attn_out.is_contiguous()
+                              and hidden_states.is_contiguous()):
         b = None
+    if b is not None and not injection.is_contiguous():
+        injection = injection.contiguous()                   # the attention mix's injection is a column slice
     if b is None:                                            # decode and short prefills: the stock order
         attn_r = ar_main(attn_out)
         hs, bi, inj = mlp_hc.combine_and_mix(hidden_states, attn_r, injection)
