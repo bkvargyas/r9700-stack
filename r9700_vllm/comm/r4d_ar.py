@@ -167,3 +167,9 @@ class R9kCommunicator(CudaCommunicator):
         if ar is not None and ar.should(input_):
             return ar.all_reduce(input_)
         return super().all_reduce(input_)
+
+    def all_gather(self, input_, dim: int = -1):
+        ar = self._r9k_ar
+        if ar is not None and hasattr(ar, "should_ag") and ar.should_ag(input_, dim):
+            return ar.all_gather(input_, dim)
+        return super().all_gather(input_, dim)

@@ -359,6 +359,98 @@ __global__ void __launch_bounds__(1024) r9k_ar_oneshot_nrank_kernel(
 
 extern "C" int r9k_ar_max_ranks() { return R9K_AR_MAX_RANKS; }
 
+// ---------------------------------------------------------------- one-shot N-rank all-gather (TP=4)
+// The push half of the one-shot all-reduce without the reduce: every rank pushes its input into slot `rank` of
+// every peer's scratch, one handshake, then writes the gathered result in vLLM's concat layout for `dim`:
+//   in  = [rows, cols] (cols = the trailing dims from `dim` on, contiguous), out = [rows, N * cols],
+//   out[r, q * cols + c] = in_q[r, c]
+// which is what GroupCoordinator.all_gather produces with all_gather_into_tensor + movedim + reshape, in one
+// launch and without the movedim copy. Own pool (scratch / flags / seq) so the all-reduce protocol is untouched.
+// cols * sizeof(T) must be a multiple of 16; rows * cols words of 16 bytes must fit the slot.
+template <int N>
+__global__ void __launch_bounds__(1024) r9k_ag_oneshot_nrank_kernel(
+    R9kArPeers P, int rank, int* __restrict__ seq, long slot16, const uint4* __restrict__ in,
+    uint4* __restrict__ out, long n16, long cols16, int drain, int acq, int nd) {
+  const int b = blockIdx.x, nb = nd, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  if (b >= nd) return;
+  const int s = s_seq;
+  const long base = (long)(s & 1) * N * slot16;
+  const long per = (n16 + nb - 1) / nb;
+  const long lo = per * b, hi = min(lo + per, n16);
+
+  // 1. push our slice into slot `rank` of every peer, and place it in our own output
+  for (long i = lo + tid; i < hi; i += nt) {
+    const uint4 v = in[i];
+#pragma unroll
+    for (int q = 0; q < N; q++)
+      if (q != rank) P.scratch[q][base + (long)rank * slot16 + i] = v;
+    const long r = i / cols16, c = i - r * cols16;
+    out[r * N * cols16 + (long)rank * cols16 + c] = v;
+  }
+
+  // 2. publish to each peer; 3. wait for every peer's publish to us
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  if (tid < N && tid != rank) {
+    u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
+    if (drain >= 4) __hip_atomic_store(f, (u32)(s + 1), __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    else __hip_atomic_store(f, (u32)(s + 1), __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], s + 1, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 4. the peers' slices from our scratch into their columns of the output
+  const uint4* own = P.scratch[rank] + base;
+  for (long i = lo + tid; i < hi; i += nt) {
+    const long r = i / cols16, c = i - r * cols16;
+#pragma unroll
+    for (int q = 0; q < N; q++)
+      if (q != rank) out[r * N * cols16 + (long)q * cols16 + c] = own[(long)q * slot16 + i];
+  }
+}
+
+// in: rows x cols elements of `esz` bytes each, contiguous; out: rows x (nranks * cols). Grid rules as the
+// all-reduce's (`grid` >= nblocks keeps the per-block sequence counters in step across calls of any size).
+extern "C" int r9k_ag_oneshot_nrank_g(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                    long seq, long slot16, long in, long out, long rows, long cols, int esz,
+                                    long stream, int nblocks, int nthreads, int drain, int acq, int grid) {
+  const long rowbytes = cols * esz;
+  if (rowbytes % 16 || rows <= 0) return -1;
+  const long cols16 = rowbytes / 16, n16 = rows * cols16;
+  if (nblocks <= 0 || nblocks > R9K_AR_MAX_BLOCKS) return -2;
+  if (nranks < 2 || nranks > R9K_AR_MAX_RANKS || rank < 0 || rank >= nranks) return -5;
+  if (n16 > slot16) return -7;
+  if (nthreads <= 0) {
+    const long per = (n16 + nblocks - 1) / nblocks;
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < AR_WAVE ? AR_WAVE : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads < R9K_AR_MAX_RANKS) nthreads = AR_WAVE;
+  if (nthreads > 1024 || nthreads % AR_WAVE) return -3;
+  if ((long)nblocks > n16) nblocks = (int)n16;
+  if (grid < nblocks) grid = nblocks;
+  if (grid > R9K_AR_MAX_BLOCKS) return -2;
+  R9kArPeers P{};
+  for (int q = 0; q < nranks; q++) { P.scratch[q] = (uint4*)scratch_ptrs[q]; P.flags[q] = (u32*)flag_ptrs[q]; }
+  hipStream_t st = (hipStream_t)stream;
+#define AGN_LAUNCH(N)                                                                                      \
+  hipLaunchKernelGGL((r9k_ag_oneshot_nrank_kernel<N>), dim3(grid), dim3(nthreads), 0, st, P, rank,         \
+                     (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, cols16, drain, acq, nblocks)
+  switch (nranks) {
+    case 2: AGN_LAUNCH(2); break;
+    case 4: AGN_LAUNCH(4); break;
+    case 8: AGN_LAUNCH(8); break;
+    default: return -5;
+  }
+#undef AGN_LAUNCH
+  return (int)hipGetLastError();
+}
+
+
 // scratch_ptrs / flag_ptrs: host arrays of `nranks` device pointers (own + opened peer mappings), indexed by rank.
 extern "C" int r9k_ar_oneshot_nrank_g(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
                                     long seq, long slot16, long in, long out, long numel, int dtype,

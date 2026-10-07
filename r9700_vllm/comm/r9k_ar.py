@@ -291,6 +291,22 @@ class R9kAllReduceN:
         self._sp2, self._fp2 = two or (None, None)
         self._seq = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
         self._seq2 = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
+        # all-gather pool (kernels/r9k_ar.hip r9k_ag_oneshot_nrank): its own scratch / flags / sequence counters,
+        # so the all-reduce protocol is untouched. R9K_AG_MAX_KB (128) bounds the per-rank message; larger
+        # gathers (the logits at wide steps) stay on RCCL. R9K_AG=0 keeps RCCL for every all-gather.
+        self._spg = None
+        self.ag_max = kb("R9K_AG_MAX_KB", "128")
+        if os.environ.get("R9K_AG", "1") == "1" and hasattr(L, "r9k_ag_oneshot_nrank_g"):
+            L.r9k_ag_oneshot_nrank_g.restype = ctypes.c_int
+            L.r9k_ag_oneshot_nrank_g.argtypes = [ctypes.POINTER(ctypes.c_long)] * 2 + [ctypes.c_int] * 2 + \
+                [ctypes.c_long] * 6 + [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 5
+            ag = self._share(group, 2 * N * self.ag_max, N * L.r9k_ar_max_blocks() * 4)
+            if ag is not None:
+                self._spg, self._fpg = ag
+                self._seqg = torch.zeros(L.r9k_ar_max_blocks(), dtype=torch.int32, device=self.device)
+                self.slotg = self.ag_max // 16
+            else:
+                logger.warning("r9700: r9k all-gather IPC setup failed; all-gathers stay on RCCL")
         # fixed launch grids, one per (scratch, seq) pair: see R9kAllReduce._grid and kernels/r9k_ar.hip
         self._fixed = os.environ.get("R9K_AR_FIXED_GRID", "1") == "1"
         self.drain, self.acq = 4, 2
@@ -361,6 +377,39 @@ class R9kAllReduceN:
             return max(1, min(max(self.min_nb, min(self.max_nb2, c16 // self.words_per_block2)), max(c16, 1)))
         n16 = nbytes // 16
         return max(1, min(max(self.min_nb, min(self.max_nb, n16 // self.words_per_block)), n16))
+
+    @staticmethod
+    def _ag_shape(x: torch.Tensor, dim: int) -> tuple[int, int]:
+        """(rows, cols) of x seen as [prod(shape[:dim]), prod(shape[dim:])], the gather concatenating cols."""
+        d = dim + x.dim() if dim < 0 else dim
+        rows = 1
+        for n in x.shape[:d]:
+            rows *= n
+        return rows, x.numel() // max(rows, 1)
+
+    def should_ag(self, x: torch.Tensor, dim: int) -> bool:
+        if self.disabled or self._spg is None or not x.is_contiguous() or x.element_size() not in (2, 4) \
+                or x.numel() == 0 or not (-x.dim() <= dim < x.dim()):
+            return False
+        rows, cols = self._ag_shape(x, dim)
+        n = x.numel() * x.element_size()
+        return (cols * x.element_size()) % 16 == 0 and n <= self.ag_max
+
+    def all_gather(self, x: torch.Tensor, dim: int = -1, nb: int | None = None, nt: int = 0) -> torch.Tensor:
+        """vLLM's concat all-gather along `dim` (out.shape[dim] = world * x.shape[dim]) in one launch."""
+        d = dim + x.dim() if dim < 0 else dim
+        rows, cols = self._ag_shape(x, d)
+        shape = list(x.shape)
+        shape[d] *= self.world_size
+        out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        nbytes = x.numel() * x.element_size()
+        rc = self.L.r9k_ag_oneshot_nrank_g(self._spg, self._fpg, self.world_size, self.rank, self._seqg.data_ptr(),
+                                           self.slotg, x.data_ptr(), out.data_ptr(), rows, cols, x.element_size(),
+                                           torch.cuda.current_stream().cuda_stream, nb or self.nblocks(nbytes), nt,
+                                           self.drain, self.acq, self.max_nb if self._fixed else 0)
+        if rc:
+            raise RuntimeError(f"r9k_ag_oneshot_nrank failed ({rc}) shape={tuple(x.shape)} dim={dim}")
+        return out
 
     def all_reduce(self, x: torch.Tensor, nb: int | None = None, nt: int = 0, mode: int | None = None) -> torch.Tensor:
         """mode: None = by size, 1 = force one-shot, 2 = force two-shot (tests/benchmarks)."""
