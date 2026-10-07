@@ -183,6 +183,7 @@ class R9kQwen4ExpForConditionalGeneration(Qwen4ExpForConditionalGeneration):
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.language_model.lm_head, "R9K_TARGET_LMHEAD", "target")
         return loaded
 
@@ -227,6 +228,7 @@ class R9kQwen4ExpForCausalLM(Qwen4ExpForCausalLM):
 
     def load_weights(self, weights):
         loaded = _load_target(self, super().load_weights, weights)
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.lm_head, "R9K_TARGET_LMHEAD", "target")
         return loaded
 
@@ -251,6 +253,7 @@ class R9kQwen4ExpMTP(Qwen4ExpMTP):
 
     def load_weights(self, weights):
         loaded = super().load_weights(mtp_weights(weights, os.environ.get("R9K_MTP_MLP", "mxfp4") == "mxfp4"))
+        _hc.quantize_fp8(self)                         # fp8 hc weights need the loaded checkpoint
         _make_shadow(self, self.lm_head, "R9K_DRAFT_LMHEAD", "MTP draft")
         return loaded
 
