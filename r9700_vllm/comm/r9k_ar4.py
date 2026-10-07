@@ -79,7 +79,9 @@ class R9kAllReduce4:
     # phase indices into the flag / seq arrays
     P1, P2, P3, P4 = 0, 1, 2, 3
 
-    def __init__(self, group, device):
+    def __init__(self, group, device, max_mb: float | None = None):
+        """max_mb: the largest message (bf16 bytes) this instance accepts (default R9K_AR4_MAX_MB); a second,
+        smaller instance serves the pipelined prefill parts on their own stream (comm/pipe.py)."""
         self.disabled = True
         self.world = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -92,7 +94,7 @@ class R9kAllReduce4:
         self.bits = int(os.environ.get("R9K_AR4_BITS", "4"))
         if self.bits not in (4, 6):
             raise RuntimeError(f"R9K_AR4_BITS={self.bits} unsupported (4 or 6)")
-        self.max_bytes = int(float(os.environ.get("R9K_AR4_MAX_MB", "64")) * 2**20)
+        self.max_bytes = int(float(os.environ.get("R9K_AR4_MAX_MB", "64") if max_mb is None else max_mb) * 2**20)
         self.nblocks = min(int(os.environ.get("R9K_AR4_BLOCKS", "128")), L.r9k_ar4_max_blocks())
         self.sdma = os.environ.get("R9K_AR4_SDMA", "0") == "1"
         pairs = _pairs(self.world)
@@ -176,15 +178,20 @@ class R9kAllReduce4:
         base = self.flags if who == self.rank else self.peers[who][1]
         return base + phase * self.max_blocks * 4
 
-    def all_reduce(self, x: torch.Tensor, timing: list | None = None) -> torch.Tensor:
+    def all_reduce(self, x: torch.Tensor, timing: list | None = None, out: torch.Tensor | None = None
+                   ) -> torch.Tensor:
         """timing: if a list is given, a CUDA event is recorded after each launch and appended (eager use only;
-        tests/test_ar4.py PHASES=1 prints the per-phase breakdown)."""
+        tests/test_ar4.py PHASES=1 prints the per-phase breakdown). out: a contiguous tensor of x's shape and dtype
+        to write the result into (a row slice of a larger buffer); runs on the current stream."""
         L, st = self.L, torch.cuda.current_stream().cuda_stream
         n = x.numel()
         G = n // GROUP                 # groups; multiple of 4
         gh, gq = G // 2, G // 4
         h, q = self.half, self.quarter
-        out = torch.empty_like(x)
+        if out is None:
+            out = torch.empty_like(x)
+        else:
+            assert out.shape == x.shape and out.dtype == x.dtype and out.is_contiguous(), (out.shape, x.shape)
         seq = self.seq
         nb = self.nblocks
         bits = self.bits

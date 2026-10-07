@@ -91,6 +91,14 @@ def gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Tensor
 
 def combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
                  norm_weight: torch.Tensor, eps: float, hc_count: int) -> tuple[torch.Tensor, torch.Tensor]:
+    return combine_norm_into(residual, block_output, injection_logits, norm_weight, eps, hc_count)
+
+
+def combine_norm_into(residual: torch.Tensor, block_output: torch.Tensor, injection_logits: torch.Tensor,
+                      norm_weight: torch.Tensor, eps: float, hc_count: int, out: torch.Tensor | None = None,
+                      y: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """combine_norm writing into caller-provided row buffers (comm/pipe.py runs it per row part); the stock
+    fallback ignores them (returns fresh tensors) and the caller copies."""
     N, DIM = residual.shape
     HD = DIM // hc_count
     if N < MIN_ROWS_COMBINE or not _fits(residual, block_output, injection_logits, norm_weight, hd=HD) \
@@ -99,8 +107,11 @@ def combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injection_l
             or not norm_weight.is_contiguous():
         return torch.ops.vllm.qwen4_exp_hc_combine_norm(residual, block_output, injection_logits, norm_weight, eps,
                                                         hc_count)
-    out = residual.new_empty(residual.shape)
-    y = residual.new_empty(residual.shape)
+    if out is None:
+        out = residual.new_empty(residual.shape)
+    if y is None:
+        y = residual.new_empty(residual.shape)
+    assert out.shape == residual.shape and y.shape == residual.shape and out.stride(1) == 1 and y.stride(1) == 1
     rc = lib().r9k_hc_combine_norm(residual.data_ptr(), residual.stride(0), block_output.data_ptr(),
                                    block_output.stride(0), injection_logits.data_ptr(), injection_logits.stride(0),
                                    norm_weight.data_ptr(), 1 if norm_weight.numel() == HD else 0,
