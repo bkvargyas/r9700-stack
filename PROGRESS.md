@@ -1,5 +1,23 @@
 # Progress log
 
+## 2026-10-07 (evening): prefill kernels, the KV cache, and two things that did not pay
+
+- **Fused fp8 hyper-connection up GEMM + gate mix** on the tiled WMMA kernel: 268-298 us vs the 665-674 us bf16
+  pair a layer at 4096 rows; +4% 8k prefill in serving (7,044-7,069 vs 6,769), decode untouched, GSM8K paired
+  p = 0.86 vs the record, HumanEval 160/164. Now default on Flash-Next (`R9K_HC_FP8=r9k`). Bug on the way: the
+  fp8 copies were quantized at construction, before the checkpoint loaded -- single-stream decode looked fine
+  (bf16 below 256 rows) while every batched or long prefill was garbage. Quantize after `load_weights`.
+- **KV cache 279k -> 475k tokens on TP4** from three facts: vLLM's profiling run counts torch.compile transients
+  as activation (3.83 GiB; the model's own peak is 0.6 GiB, `compat/memsnap.py`), the cudagraphs for 384-2048-token
+  chunks cost 1.4 GiB a card for no soak-measured throughput, and 0.98 utilization leaves 1 GB at the soaked peak.
+  Defaults: 0.98 + graphs to 256 (442-475k, the estimate varies by launch); `KVMEM=7.0` pins 475k; 7.5 (509k) ran
+  a clean soak 440 MiB from the top and is the edge, not a setting. A 2048-token chunk: 311k tokens, -8% prefill.
+- **All-reduce pipelining by row parts**: correct, gated, and a net loss (-5.5% / -6% prefill): the ar4 kernels,
+  fused or DMA pushes, hold CUs while they wait on the uplink (4-rank stand-in: stock 5.15 ms, best 4.67, ideal
+  3.68). Shelved. **Exact block-scaled fp8 tiled GEMM**: correct, 15-25% slower than vLLM's Triton. Opt-in.
+- v0.2.6 validation on the release tree passed in full (BetterBench 162.8, three soaks 0 errors, gates, comm
+  tests); the publish is on hold by decision. Full numbers: `notes/prefill-fp8-pipe.md`.
+
 ## 2026-09-18 (overnight session)
 
 ### Findings

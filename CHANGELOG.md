@@ -7,7 +7,32 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+### Changed
+- **Flash-Next TP4 defaults** (`serve/flashnext.sh`, 2026-10-07): the fp8 hyper-connection up GEMM with the
+  gate mix fused (`R9K_HC_FP8=r9k`, below), memory utilization 0.98 and cudagraphs only for prefill chunks up to
+  256 tokens. KV cache 279,564 -> 442-475k tokens (+59-70%), 8k prefill 6,769 -> 6,852-7,069 tok/s, decode step
+  and concurrency unchanged (16.4 ms, 199 tok/s, 888-905 tok/s at 16). vLLM's profiling run was counting
+  torch.compile transients as activation (3.83 GiB against a measured 0.6 GiB model peak, `compat/memsnap.py`),
+  and the graphs for 384-2048-token chunks cost 1.4 GiB a card for no measured throughput. Soaked: 25 minutes,
+  684 requests, 0 errors, 31.8 of 32.6 GB at the peak; strict sanity 0 bad of 3,940 at concurrency 17 / 32 and
+  on long prompts. `KVMEM=7.0` pins the budget at 475k tokens (0.95 GiB free at the peak) when the
+  launch-to-launch estimate matters; `UTIL=0.94 CGSIZES=1,...,2048 R9K_HC_FP8=stock` restores the old defaults.
+
 ### Added
+- fp8 prefill GEMMs on the LDS-tiled WMMA kernel (`r9k_moe_4bit_prefill` nv=3, `kernels/fp8.py`): e4m3 weights
+  in the fragment order, one scale a column, 163-182 TFLOPS at 4096 rows (1.3-1.9x hipBLASLt bf16); the dense
+  fp8 linear modes take it from 64 rows. The fused hyper-connection up GEMM + sigmoid-gated mean
+  (`r9k_fp8_prefill_mix`, weight rows interleaved 16 columns x 4 streams): 268-298 us against the 665-674 us
+  bf16 pair at 4096 rows, exact against the stock formula on the same gate; the hc weights are quantized after
+  load (`hc.quantize_fp8`). An exact block-scaled variant (`r9k_fp8_prefill_block`, `R9K_FP8_BLOCK_PREFILL=r9k`)
+  is correct but 15-25% slower than vLLM's Triton block GEMM on the served shapes: opt-in.
+- Prefill all-reduce pipelining by row parts (`comm/pipe.py`, `R9K_AR_PIPE=r9k`, default stock): the layer tail
+  (hc combine + mix, MoE, both all-reduces) in 2048-row parts with the attention parts' all-reduces on a comm
+  stream (a second ar4 / 2-rank instance; `R9K_AR_PIPE_BLOCKS`, `R9K_AR_PIPE_SDMA`). Correct and gated, but the
+  all-reduce kernels time-share the CUs with the GEMMs on this topology: 8k prefill -5.5% (fused pushes) / -6%
+  (DMA pushes). Shelved in the tree; `notes/prefill-fp8-pipe.md`.
+- `R9K_MEMSNAP=1` (`compat/memsnap.py`, with `EAGER=1`): per-layer / per-part peak memory of the profiling run
+  and an allocator snapshot.
 - Decode-step fusions on Flash-Next TP4 (`notes/decode-nodes.md`): one-launch MoE routing (`r9k_moe_route`:
   softmax top-k + align tables, replacing four stock launches a layer), the top-k sum with the shared expert's
   output folded in and the modular kernel's output alias on ROCm (`r9k_moe_sum`, `moe/fold.py`), and a one-shot
