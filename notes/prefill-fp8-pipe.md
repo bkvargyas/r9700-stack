@@ -65,9 +65,37 @@ no longer reduces, the MoE runner skips its final all-reduce, and the tail is on
 order (same kernels, captured as before) at decode widths. Expected: ~1.5 ms x 49 = ~70 ms of 602 per chunk;
 with 8 cards the all-reduce share grows and the same structure hides half of it.
 
-Status: built, unit test written (`tests/test_ar_pipe.py`, 4 ranks), not yet run -- cards 0-3 are in the
-v0.2.6 validation. Queued on the test box (`~/after-val.sh`): the pipe test, then the serving A/B
-(`~/ab-f8.sh`: base / hc fp8 / pipe / both / base, probe + decode step each).
+### What the hardware said (16:00-17:30 UTC)
+
+`tests/test_ar_pipe.py` on four ranks: the part-wise all-reduce is correct (same 4-bit wire error as the whole
+message, ranks agree), but the stand-in timing is sobering: one 21 MB ar4 1.23 ms, the compute stand-in 2.45 ms,
+the stock tail 5.15 ms, pipelined 4.93 (P=2) / 5.19 (P=4) against an ideal 3.68. The fused-push all-reduce
+kernels (128 workgroups spinning on handshakes) time-share the CUs with the GEMM instead of running beside it.
+
+Serving (Flash-Next TP4, MTP-3, 210 W, `~/tp4tune.sh`, ms/step | decode tok/s | conc 8 | conc 16 | 8k prefill):
+
+| config | ms/step | dec | c8 | c16 | prefill 8k |
+|---|---:|---:|---:|---:|---:|
+| base (v0.2.6 defaults), two runs | 16.41 / 16.43 | 199.6 / 199.4 | 592.6 / 591.2 | 898.5 / 894.7 | 6769 / 6761 |
+| hc fp8 mix (`R9K_HC_FP8=r9k`), two probes | 16.44 | 198.6 | 575.8 / 612.9 | 905.2 / 900.8 | **7044 / 7009** |
+| all-reduce pipeline (`R9K_AR_PIPE=r9k`), two probes | 16.58 | 197.0 | 578.1 / 609.5 | 896.0 / 891.4 | 6403 / 6355 |
+
+The hc fp8 mix: +3.9% at 8k prefill, decode untouched, strict sanity clean at conc 8 / 17 and on long prompts.
+Three serving bugs on the way: (1) the fp8 weight copies were quantised at `install_mix` time, i.e. at model
+construction before the checkpoint is loaded -- single-stream decode (bf16 below 256 rows) looked fine while every
+batched or long prefill was garbage (sanity 140 bad of 160 at conc 8; the probe's concurrency halved because the
+drafter stopped accepting). Fixed: `hc.quantize_fp8(model)` from the three `load_weights`. (2) the pipe op
+returned the mix's injection as a column slice of its [M, 336] buffer; the compiled graph asserts the fake impl's
+(contiguous) strides. (3) vLLM sizes and LOCKS the MoE modular kernel's workspace on the profiling run; a split
+profiling run sized it for one part and the first unsplit chunk between part and chunk width crashed the engine
+(`Workspace is locked but allocation ... requires 13.55 MB, current size is 10.00 MB`): the first full-width
+call now runs unsplit.
+
+The pipeline itself is correct in serving but a net loss (-5.5% at 8k, +1% on the decode step from the moved
+all-reduces and the injection copy): no overlap on this topology with the fused-push kernels, plus the split's
+own overhead. Next: the comm instance with fewer push workgroups or DMA-engine pushes (`R9K_AR_PIPE_BLOCKS`,
+`R9K_AR_PIPE_SDMA`; the sweep is in the test). If DMA pushes overlap, the structure is worth keeping for 8 cards;
+if not, the pipeline is shelved and the all-reduce stays what it is: bandwidth.
 
 ## Where things are
 
