@@ -71,20 +71,29 @@ __device__ __forceinline__ void route_row(const uint16_t* __restrict__ row, int 
     mx = fmaxf(mx, p[i]);
   }
   mx = wave_max(mx);
+  // Robust to anything a dummy or warm-up step can feed us (NaN, +-inf, an all-equal row): a real entry that is
+  // not a finite probability counts as 0, a padded lane (e >= E) is -1 = "taken", and the selection below always
+  // lands on a real index because the compare starts from -2. Stock's kernel never indexes out of range on such
+  // rows either; a NaN row here used to leave the index at its sentinel and write past the count table.
   float s = 0.f;
 #pragma unroll
   for (int i = 0; i < EPL; ++i) {
-    p[i] = (lane + WAVE * i) < E ? expf(p[i] - mx) : 0.f;
-    s += p[i];
+    if ((lane + WAVE * i) < E) {
+      float v = expf(p[i] - mx);
+      p[i] = (v == v && v <= 3.4e38f) ? v : 0.f;
+      s += p[i];
+    } else {
+      p[i] = -1.f;
+    }
   }
   s = wave_sum(s);
-  const float inv = 1.f / s;
+  const float inv = s > 0.f ? 1.f / s : 0.f;
 #pragma unroll
-  for (int i = 0; i < EPL; ++i) p[i] *= inv;        // p = e / sum, as one multiply by the reciprocal
+  for (int i = 0; i < EPL; ++i) if (p[i] >= 0.f) p[i] *= inv;     // p = e / sum, as one multiply by the reciprocal
   float wsel = 0.f;   // lane k holds selection k
-  int isel = -1;
+  int isel = 0;
   for (int k = 0; k < topk; ++k) {
-    float bv = -1.f; int bi = 0x7fffffff;
+    float bv = -2.f; int bi = 0x7fffffff;
 #pragma unroll
     for (int i = 0; i < EPL; ++i) {
       const int e = lane + WAVE * i;
@@ -97,8 +106,9 @@ __device__ __forceinline__ void route_row(const uint16_t* __restrict__ row, int 
   }
   if (renorm) {
     const float tot = wave_sum(lane < topk ? wsel : 0.f);
-    wsel /= tot;
+    wsel = tot > 0.f ? wsel / tot : 0.f;
   }
+  if (isel < 0 || isel >= E) isel = 0;                              // cannot happen; keeps the table writes in range
   if (lane < topk) {
     w_out[lane] = wsel;
     id_out[lane] = isel;

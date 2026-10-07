@@ -37,7 +37,7 @@ def check_tables(sorted_ids, expert_ids, ntpp, ids, blk, numel):
             if x != numel:
                 assert flat[x] == e[b], f"row {x} (expert {flat[x]}) in a block of expert {e[b]}"
     # block-padded count per expert == ntpp
-    cnt = torch.bincount(ids.reshape(-1).to(torch.int64), minlength=E).tolist()
+    cnt = torch.bincount(ids.reshape(-1).to(torch.int64), minlength=max(E, int(ids.max()) + 1)).tolist()
     assert n == sum((c + blk - 1) // blk * blk for c in cnt), "ntpp != sum of padded counts"
 
 
@@ -81,6 +81,27 @@ for M in (1, 3, 4, 8, 16, 37, 64, 128, 256):
             print(f"M={M:3d} renorm={int(renorm)} scale={scale}: ids rows differing (near-ties) {diff_rows}, "
                   f"weight max|d| {maxd:.2e}, ntpp {ntpp.item()} blk {blk}: OK")
 
+# degenerate rows (what a dummy / warm-up step can feed the router): NaN, +-inf, all-equal, and E not a
+# multiple of 32 (padded lanes). Ids must stay valid and distinct, tables valid, no out-of-range writes.
+for Ed in (512, 100, 48):
+    M = 24
+    x = (torch.randn(M, Ed, device=dev) * 2).to(torch.bfloat16)
+    x[0] = float("nan"); x[1, :5] = float("nan"); x[2] = float("inf"); x[3] = float("-inf"); x[4] = 0.0
+    x[5] = 1.0; x[6, ::2] = float("inf"); x[7] = -3e38
+    tk = min(TOPK, Ed)
+    numel = M * tk; blk = KM.MOE_BLOCK * KM.pick_mt(numel, Ed); cap = route.capacity(numel, Ed, blk)
+    guard = 64
+    s_ = torch.full((cap + guard,), -9, dtype=torch.int32, device=dev)
+    e_ = torch.full((cap // blk + guard,), -9, dtype=torch.int32, device=dev)
+    n_ = torch.zeros(1, dtype=torch.int32, device=dev)
+    w, ids = route.moe_route(x, tk, True, blk, s_[:cap], e_[:cap // blk], n_)
+    torch.cuda.synchronize()
+    assert int(ids.min()) >= 0 and int(ids.max()) < Ed, f"E={Ed}: id out of range"
+    assert all(len(set(ids[r].tolist())) == tk for r in range(M)), f"E={Ed}: duplicate ids in a row"
+    assert bool((s_[cap:] == -9).all()) and bool((e_[cap // blk:] == -9).all()), f"E={Ed}: wrote past the tables"
+    assert bool(torch.isfinite(w).all()), f"E={Ed}: non-finite weight"
+    check_tables(s_[:cap], e_[:cap // blk], n_, ids, blk, numel)
+    print(f"degenerate rows, E={Ed}: ids valid, tables valid, weights finite: OK")
 # the kernel refuses what it cannot do
 cap = route.capacity(10, E, 16)
 bufs = (torch.empty(cap, dtype=torch.int32, device=dev), torch.empty(cap // 16, dtype=torch.int32, device=dev),
