@@ -179,6 +179,12 @@ and the only honest lever left.
 
 ## Already tried, measured, and rejected — don't redo these
 
+- **The decode node count as a lever (2026-10-07).** Removing ~240 of the ~1,990 launches a step (routing, the
+  MoE sum + shared add + finalize copy) moved the Flash-Next TP4 step 0.14 ms (~1%): in graph replay a tiny
+  node's dispatch overlaps the previous node, so the per-node "gap" the profiler shows is the profiler's. What
+  did move it was the P2P all-gather (GPU time, not launches). `notes/decode-nodes.md`. The remaining lever of
+  that kind is fewer, fatter kernels (the GEMM families fused with their neighbours), a different project.
+
 - `CGMODE=FULL`: TTFT 159 ms vs 104. Custom attention backend cannot be fully captured.
 - `HSA_ENABLE_MWAITX=0`, `HWQ=4`, dropping the chat template: none moved TTFT by more than ~1 ms.
 - `NBT=8192` (bigger prefill chunks): no gain at 9k, engine crash at 20.7k.

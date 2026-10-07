@@ -8,6 +8,14 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 ## [Unreleased]
 
 ### Added
+- Decode-step fusions on Flash-Next TP4 (`notes/decode-nodes.md`): one-launch MoE routing (`r9k_moe_route`:
+  softmax top-k + align tables, replacing four stock launches a layer), the top-k sum with the shared expert's
+  output folded in and the modular kernel's output alias on ROCm (`r9k_moe_sum`, `moe/fold.py`), and a one-shot
+  P2P all-gather for decode-sized gathers at TP > 2 (`r9k_ag_oneshot_nrank`, 7.8 us vs RCCL 57 at [4, 640]).
+  The all-gather alone: step 16.70 -> 16.40 ms, decode 196 -> 200 tok/s; everything on 16.25 ms. GSM8K and
+  HumanEval unchanged (paired p = 1.00). Only the all-gather is on by default (`R9K_AG=0` reverts, `R9K_AG_MAX_KB`
+  128); the routing and the fold are off (`R9K_MOE_ROUTE=r9k`, `R9K_MOE_FOLD=r9k`, `R9K_FUSED_SUM`): 0.15 ms a
+  step was not worth their surface on the production path.
 - `notes/mes-timeouts.md`: the RDNA4 `MES(1) failed to respond to msg=INVALIDATE_TLBS` timeouts under KVM
   passthrough, the host crash they caused once, the experiment matrix (three firmware versions, power, page-table
   mode, RAS: no effect) and the workaround now on both of our boxes, `amdgpu.mes_log_enable=1 amdgpu.gpu_recovery=0`

@@ -11,7 +11,10 @@
    is static: that forward is traced once by torch.compile, so the experts' apply (inside the opaque MoE op)
    always adds the shared output on an installed runner, with a plain add as the fallback. 48 adds a step.
 
-Both are monkeypatches of vLLM internals, listed in compat/gate.py; R9K_MOE_FOLD=stock leaves vLLM's path.
+Both are monkeypatches of vLLM internals, listed in compat/gate.py. OFF by default (R9K_MOE_FOLD=r9k turns it on):
+measured 2026-10-07 the two launches it removes a layer are worth ~0.1 ms of a 16.7 ms step on Flash-Next TP4, which
+does not buy two patches of vLLM's runner. Correct (the GSM8K / HumanEval gate passed with it on); see
+notes/decode-nodes.md.
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ from ..compat import gate
 
 logger = init_logger("vllm." + __name__)
 
-ENABLED = os.environ.get("R9K_MOE_FOLD", "r9k") == "r9k"
+ENABLED = os.environ.get("R9K_MOE_FOLD", "stock") == "r9k"
 
 
 # ------------------------------------------------------------------------------------------ 1. output alias

@@ -9,8 +9,12 @@ produces are handed to ``R9700Mxfp4Experts.apply`` through the ``RoutedExperts``
 experts skip their own align. Rows above ``MAX_ROWS`` (prefill chunks) take the stock path unchanged.
 
 Numerics: fp32 softmax and top-k on the bf16 logits as stock does; ids agree except on near-ties of the
-probabilities, weights differ at the fp32 ulp level (row sums in wave-tree order). ``R9K_MOE_ROUTE=stock`` keeps
-vLLM's router.
+probabilities, weights differ at the fp32 ulp level (row sums in wave-tree order).
+
+OFF by default (``R9K_MOE_ROUTE=r9k`` turns it on): measured 2026-10-07 on Flash-Next TP4 it is worth ~0.1 ms of a
+16.7 ms step -- in graph replay the three launches it removes were overlapped with the previous node anyway -- and
+the stock router is the better-trodden path. Kept because it is correct (GSM8K / HumanEval gate passed with it on)
+and because a future fatter-kernel MoE step would start from it. ``notes/decode-nodes.md``.
 """
 from __future__ import annotations
 
@@ -180,7 +184,7 @@ def take(layer, topk_ids: torch.Tensor, blk: int, numel: int):
 def install(model: torch.nn.Module) -> int:
     """Replace the router of every MoE runner under `model` that routes by plain softmax top-k.
     R9K_MOE_ROUTE=stock skips."""
-    if os.environ.get("R9K_MOE_ROUTE", "r9k") != "r9k" or not available():
+    if os.environ.get("R9K_MOE_ROUTE", "stock") != "r9k" or not available():
         return 0
     register()
     n = 0

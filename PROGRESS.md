@@ -1662,3 +1662,23 @@ and the 27B TP2 on the new chain C pair, together: probes alone vs together agre
 and 95.60% with output identical to the 1.1.1 runs on 100% of questions, HumanEval 158 and 160, mixed load 106 long
 prompts at 3,579 tok/s beside a 16-client soak of 47 requests. BMC: 783-1,804 W at the wall under load. Chain C pair
 runs 15 C hotter (max 67 C) with fans at twice the speed. 0 MES / errors / faults. Section in notes/radiance-test-run.md.
+
+
+## 2026-10-07: decode node count -- three fusions, ~1% from launches, 2.6% with the P2P all-gather
+
+Brian: "Is there any more tuning we can do on our kernel?" -> "Go ahead and work on it." Took item 2 of the list,
+the decode node count on Flash-Next TP4. Built, unit-tested and A/B'd three things (notes/decode-nodes.md has the
+method, the bugs and the numbers): one-launch MoE routing (softmax top-k + align tables, `r9k_moe_route`), a fused
+top-k sum with the shared expert folded in plus the modular kernel's output alias (`r9k_moe_sum`, moe/fold.py),
+and a one-shot P2P all-gather for the MTP head's decode-sized gathers (`r9k_ag_oneshot_nrank`). Step time (512-token
+essay, MTP-3, 210 W): stock 16.70 / 16.70 / 16.67 ms; routing 16.56; +fold 16.56 x3 (control 16.68); +all-gather
+16.28 / 16.27 / 16.25 (control 16.58); the all-gather ALONE 16.40 with decode 196 -> 200 tok/s, c16 897 -> 904. Quality gate on everything on:
+GSM8K 95.60% vs the v0.2.4 record 95.68% (paired 14 vs 13, p = 1.00), HumanEval 160/164, strict sanity 0 of 1,020
+after. The lesson is the number: in graph replay a tiny node's dispatch overlaps the previous node, so the 240
+launches removed were worth ~0.14 ms, not the ~1.6 us each the 2026-09-28 profile implied; only the all-gather,
+which removes GPU time (RCCL 47-127 us -> 6-13 us), moved the step. Four bugs on the way, each invisible to the
+unit tests: NaN rows in vLLM's warm-up steps faulting an index-deriving kernel, a module cycle from storing a parent
+on its child, `SharedExperts.output` consuming its slot, and a per-call flag read in a torch.compile-traced forward
+(baked in at trace time -> double add). Defaults: all-gather ON (R9K_AG=1), routing and fold OFF (R9K_MOE_ROUTE=r9k / R9K_MOE_FOLD=r9k turn them on):
+0.15 ms does not buy a replaced router and two vLLM-runner patches on the production path. Nothing tagged,
+production copy untouched; the next tag owes the full validation on the all-gather (soak, BetterBench).
