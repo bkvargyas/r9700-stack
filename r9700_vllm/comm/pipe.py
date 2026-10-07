@@ -96,7 +96,9 @@ def _tail(hidden_states: torch.Tensor, attn_out: torch.Tensor, injection: torch.
     if b is None:                                            # decode and short prefills: the stock order
         attn_r = ar_main(attn_out)
         hs, bi, inj = mlp_hc.combine_and_mix(hidden_states, attn_r, injection)
-        return hs, ar_main(mlp(bi)), inj
+        # the compiled graph checks the op's outputs against the fake impl's (contiguous) strides: the mix's
+        # injection is a column slice of its [M, 336] buffer (row stride 336), so copy it out
+        return hs.contiguous(), ar_main(mlp(bi)).contiguous(), inj.contiguous()
 
     cs, main = _ST.stream, torch.cuda.current_stream()
     P = len(b) - 1
@@ -141,7 +143,7 @@ def _tail(hidden_states: torch.Tensor, attn_out: torch.Tensor, injection: torch.
             ev_m.append(e2)
     for e2 in ev_m:
         main.wait_event(e2)
-    return hs_out, mlp_out, torch.cat(inj_parts, 0)
+    return hs_out, mlp_out, torch.cat(inj_parts, 0).contiguous()
 
 
 def _tail_fake(hidden_states, attn_out, injection, lid):
