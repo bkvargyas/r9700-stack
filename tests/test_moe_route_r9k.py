@@ -52,7 +52,7 @@ for M in (1, 3, 4, 8, 16, 37, 64, 128, 256):
             sorted_ids = torch.empty(cap, dtype=torch.int32, device=dev)
             expert_ids = torch.empty(cap // blk, dtype=torch.int32, device=dev)
             ntpp = torch.zeros(1, dtype=torch.int32, device=dev)
-            w, ids = route.moe_route(x, TOPK, renorm, blk, sorted_ids, expert_ids, ntpp)
+            w, ids = route.moe_route(x, TOPK, renorm, blk, sorted_ids, expert_ids, ntpp, torch.zeros(route.scratch_ints(E), dtype=torch.int32, device=dev))
             torch.cuda.synchronize()
             w0, ids0, _ = fused_topk(hidden, x, TOPK, renorm)
             s0, e0, n0 = moe_align_block_size(ids0, blk, E)
@@ -94,7 +94,7 @@ for Ed in (512, 100, 48):
     s_ = torch.full((cap + guard,), -9, dtype=torch.int32, device=dev)
     e_ = torch.full((cap // blk + guard,), -9, dtype=torch.int32, device=dev)
     n_ = torch.zeros(1, dtype=torch.int32, device=dev)
-    w, ids = route.moe_route(x, tk, True, blk, s_[:cap], e_[:cap // blk], n_)
+    w, ids = route.moe_route(x, tk, True, blk, s_[:cap], e_[:cap // blk], n_, torch.zeros(route.scratch_ints(Ed), dtype=torch.int32, device=dev))
     torch.cuda.synchronize()
     assert int(ids.min()) >= 0 and int(ids.max()) < Ed, f"E={Ed}: id out of range"
     assert all(len(set(ids[r].tolist())) == tk for r in range(M)), f"E={Ed}: duplicate ids in a row"
@@ -107,7 +107,7 @@ cap = route.capacity(10, E, 16)
 bufs = (torch.empty(cap, dtype=torch.int32, device=dev), torch.empty(cap // 16, dtype=torch.int32, device=dev),
         torch.zeros(1, dtype=torch.int32, device=dev))
 try:
-    route.moe_route(torch.randn(1, E, device=dev).to(torch.bfloat16), 17, True, 16, *bufs)
+    route.moe_route(torch.randn(1, E, device=dev).to(torch.bfloat16), 17, True, 16, *bufs, torch.zeros(route.scratch_ints(E), dtype=torch.int32, device=dev))
     print("FAIL: topk 17 accepted"); fails += 1
 except RuntimeError:
     print("topk > 16 refused: OK")

@@ -40,7 +40,7 @@ def lib():
         if not hasattr(L, "r9k_moe_route"):
             raise RuntimeError("libr9k.so has no r9k_moe_route (rebuild kernels/)")
         L.r9k_moe_route.restype = ctypes.c_int
-        L.r9k_moe_route.argtypes = [ctypes.c_long, ctypes.c_int] + [ctypes.c_long] * 5 + [ctypes.c_int] * 5 \
+        L.r9k_moe_route.argtypes = [ctypes.c_long, ctypes.c_int] + [ctypes.c_long] * 6 + [ctypes.c_int] * 5 \
             + [ctypes.c_long]
         L.r9k_moe_route_max_experts.restype = ctypes.c_int
         L.r9k_moe_route_max_topk.restype = ctypes.c_int
@@ -62,15 +62,21 @@ def capacity(numel: int, num_experts: int, blk: int) -> int:
     return (cap + blk - 1) // blk * blk
 
 
+def scratch_ints(E: int) -> int:
+    """int32 count of the kernel's scratch (counts[E], cursor[E], arrive): zero it once at allocation."""
+    return 2 * E + 1
+
+
 def moe_route(logits: torch.Tensor, topk: int, renorm: bool, blk: int, sorted_ids: torch.Tensor,
-              expert_ids: torch.Tensor, ntpp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+              expert_ids: torch.Tensor, ntpp: torch.Tensor, scratch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """logits [M, E] bf16 -> (weights fp32 [M, topk], ids int32 [M, topk]); fills the first capacity(M*topk)
-    entries of sorted_ids / expert_ids and ntpp[0]."""
+    entries of sorted_ids / expert_ids and ntpp[0]. scratch: scratch_ints(E) int32, zero before the first call
+    (the kernel leaves it zero)."""
     M, E = logits.shape
     w = torch.empty((M, topk), dtype=torch.float32, device=logits.device)
     ids = torch.empty((M, topk), dtype=torch.int32, device=logits.device)
     rc = lib().r9k_moe_route(logits.data_ptr(), logits.stride(0), w.data_ptr(), ids.data_ptr(),
-                             sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+                             sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(), scratch.data_ptr(),
                              M, E, topk, 1 if renorm else 0, blk, torch.cuda.current_stream().cuda_stream)
     if rc:
         raise RuntimeError(f"r9k_moe_route failed ({rc}) M={M} E={E} topk={topk} blk={blk}")
@@ -78,7 +84,7 @@ def moe_route(logits: torch.Tensor, topk: int, renorm: bool, blk: int, sorted_id
 
 
 def _moe_route_fake(logits: torch.Tensor, topk: int, renorm: bool, blk: int, sorted_ids: torch.Tensor,
-                    expert_ids: torch.Tensor, ntpp: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+                    expert_ids: torch.Tensor, ntpp: torch.Tensor, scratch: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     M = logits.shape[0]
     return (logits.new_empty((M, topk), dtype=torch.float32), logits.new_empty((M, topk), dtype=torch.int32))
 
@@ -87,7 +93,7 @@ def register() -> None:
     global _DONE
     if _DONE:
         return
-    direct_register_custom_op("moe_route", moe_route, mutates_args=["sorted_ids", "expert_ids", "ntpp"],
+    direct_register_custom_op("moe_route", moe_route, mutates_args=["sorted_ids", "expert_ids", "ntpp", "scratch"],
                               fake_impl=_moe_route_fake, target_lib=_LIB)
     _DONE = True
 
@@ -126,7 +132,7 @@ def make_router(stock, routed_experts):
             self.capture_fn = getattr(stock, "capture_fn", None)
             self._routing_replay_out = getattr(stock, "_routing_replay_out", None)
             self.routed_experts = routed_experts
-            self._bufs: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+            self._bufs: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
             # Allocate NOW, at model construction. The first fused call otherwise lands inside vLLM's cudagraph
             # memory-profiling pass, whose allocations are released afterwards: the buffers' memory was handed
             # to other tensors and the next capture pass faulted (GPU page fault at the 24-token graph).
@@ -141,7 +147,8 @@ def make_router(stock, routed_experts):
                           for m in range(1, MAX_ROWS + 1))
                 b = (torch.empty(cap, dtype=torch.int32, device=device),
                      torch.empty(cap // 16, dtype=torch.int32, device=device),
-                     torch.zeros(1, dtype=torch.int32, device=device))
+                     torch.zeros(1, dtype=torch.int32, device=device),
+                     torch.zeros(scratch_ints(E), dtype=torch.int32, device=device))
                 self._bufs[device] = b
             return b
 
@@ -153,9 +160,9 @@ def make_router(stock, routed_experts):
             M = router_logits.shape[0]
             numel = M * self.top_k
             blk = KM.MOE_BLOCK * KM.pick_mt(numel, E)
-            sorted_ids, expert_ids, ntpp = self._buffers(router_logits.device, E)
+            sorted_ids, expert_ids, ntpp, scratch = self._buffers(router_logits.device, E)
             w, ids = torch.ops.r9700.moe_route(router_logits, self.top_k, self.renormalize, blk, sorted_ids,
-                                               expert_ids, ntpp)
+                                               expert_ids, ntpp, scratch)
             self.routed_experts._r9k_tables = Tables(ids, sorted_ids, expert_ids, ntpp, blk, numel)
             return w, ids
 
