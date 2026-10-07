@@ -162,3 +162,9 @@ all-reduce kernels, fused or DMA, do not run beside the GEMMs. What would change
 holds no CUs while the bytes move (a DMA-only push with a host-side or SDMA-side completion), or a topology where
 the message is short enough that the split's overhead is the smaller term. For eight cards the message grows and
 the split's overhead does not, so the structure is worth keeping in the tree.
+
+Combined soak of the recommended pair (`~/kv-final.sh`, 20:02-20:40 UTC, 0.98 + capture sizes <= 256, hc fp8):
+this launch sized the cache at **475,343 tokens** (the same pair gave 442,575 at 18:50: vLLM's compile-time
+"activation" estimate varies by launch, so utilisation is a loose knob and the explicit budget the precise one);
+25-minute soak 684 ok, 0 errors, 6666 prompt tok/s; VRAM peak 31,766 MiB of 32,624 (858 MiB free); probe dec
+199.0 / c16 888 / 8k prefill 6852.
