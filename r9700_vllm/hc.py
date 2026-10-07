@@ -297,12 +297,14 @@ def quantize_fp8(model: torch.nn.Module) -> int:
         up = mod.input_mix_weight_up
         if down.weight.shape[1] % 32 or up.weight.shape[1] % 32 or up.weight.shape[0] % 64:
             continue
-        d = F8.quantize_rows_fp8(down.weight.data)
+        # the down copy only when its path is on (3.4 MB a module, 330 MB a rank of KV cache otherwise)
+        d = F8.quantize_rows_fp8(down.weight.data) if FP8_DOWN else None
         u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
-        mod._r9k_hc_fp8 = (d.wq, d.ws, u.wq, u.ws)       # plain tuple: not a parameter, not a child module
+        mod._r9k_hc_fp8 = (d.wq if d else None, d.ws if d else None, u.wq, u.ws)   # plain tuple, not a parameter
         n += 1
     if n:
-        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load)", n)
+        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load; up%s, %.0f MB a rank)",
+                    n, " + down" if FP8_DOWN else "", n * (3.3 + (3.4 if FP8_DOWN else 0)))
     return n
 
 
