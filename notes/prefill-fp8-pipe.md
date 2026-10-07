@@ -140,3 +140,15 @@ a few hundred MB: the serving activations are small, and the 2048-token chunk ch
 (it is not the chunk's activations) while costing 8% of prefill. Trimming the graphs to 256 tokens is free in the
 soak's prompt throughput (6677 vs 6726 tok/s) and worth +94k tokens on top of 0.98. Next: an explicit budget
 (`KVMEM`, --kv-cache-memory) of 7.0 and 7.5 GiB a rank with the trim (~460k / ~495k tokens), to find the edge.
+
+Explicit budgets with the trim (`~/kv-exp2.sh`, 19:20-19:53 UTC):
+
+| config | KV tokens | soak | VRAM peak / card (MiB of 32,624) | free at peak | probe (dec / c16 / 8k prefill) |
+|---|---:|---|---:|---:|---|
+| trim + `KVMEM=7.0` | 474,928 | 15 min, 395 ok, 0 err, 6680 prompt tok/s | 31,672 | 952 MiB | 199.2 / 887 / 6847 |
+| trim + `KVMEM=7.5` | 508,940 | 10 min, 308 ok, 0 err, 6558 prompt tok/s | 32,184 | 440 MiB | 198.9 / 883 / 6814 |
+
+Sanity 0 bad at conc 17 / 32 on both. Recommendation for the fn4 defaults: utilisation 0.98 + capture sizes
+<= 256 (442k tokens, 1.3 GB free at the soak peak; a 25-minute soak is still owed on exactly that pair, the
+0.98 and the trim were soaked separately for 25 and 10 minutes); `KVMEM=7.0` (475k, 0.95 GiB free) as the
+documented opt-in for the longest contexts; 7.5 is the measured edge, not a setting.
