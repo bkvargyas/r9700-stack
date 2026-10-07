@@ -125,3 +125,18 @@ unchanged (dec 199.7, c16 910, prefill 7069), 25-min soak with VRAM sampling + c
 capture sizes <= 256 + explicit `--kv-cache-memory` (KVMEM 6.5 / 7.5 GiB a rank, ~440k / ~500k tokens) queued
 with soaks; a 2048-token chunk for comparison. fp8 KV cache (2x) assessed as its own item (QSA / decode /
 drafter fp8 read paths, ~a day, then the long-context gate).
+
+### KV cache runs (Flash-Next TP4, hc fp8 on, `~/kv-exp.sh`, 18:18-19:23 UTC)
+
+| config | KV tokens | vLLM's "peak activation" / graphs (GiB) | soak | VRAM peak / card (MiB of 32,624) | probe (dec / c16 / 8k prefill) |
+|---|---:|---|---|---:|---|
+| 0.94 (base) | 279,564 | 3.83 / 3.2 | validation soak 627 ok | 30,001 | 199.6 / 898 / 6769 |
+| 0.98 | 348,834 | 3.83 / 3.19 | 25 min, 650 ok, 0 err | 30,500 | 199.7 / 910 / 7069 |
+| 0.98 + capture sizes <= 256 | **442,575** | 2.45 / 1.82 | 10 min, 270 ok, 0 err, 6677 prompt tok/s | 31,301 | 198.8 / 887 / 6810 |
+| 0.94 + 2048-token chunk | 311,503 | 3.63 / 3.2 | 5 min, 151 ok | 28,552 | 197.8 / 898 / 6480 |
+
+Sanity 0 bad at conc 17 (680) and conc 32 (960) on every row. The VRAM peak is weights + graphs + KV to within
+a few hundred MB: the serving activations are small, and the 2048-token chunk changed vLLM's estimate by 0.2 GiB
+(it is not the chunk's activations) while costing 8% of prefill. Trimming the graphs to 256 tokens is free in the
+soak's prompt throughput (6677 vs 6726 tok/s) and worth +94k tokens on top of 0.98. Next: an explicit budget
+(`KVMEM`, --kv-cache-memory) of 7.0 and 7.5 GiB a rank with the trim (~460k / ~495k tokens), to find the edge.
