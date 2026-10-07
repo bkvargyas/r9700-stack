@@ -235,11 +235,21 @@ _HYB_LAYERS: dict = {}      # registration index -> (layer, stock apply_weights 
 _DISPATCH_DONE = False
 
 
+# Above the decode cap: stock's Triton block GEMM, or (R9K_FP8_BLOCK_PREFILL=r9k) our LDS-tiled exact block-scaled
+# kernel on the same operands (kernels/fp8.py gemm_fp8_block_tiled; per-token-group-128 activations from
+# quant_group128_fp8). Same math as stock up to summation order.
+_PREFILL_R9K = os.environ.get("R9K_FP8_BLOCK_PREFILL", "stock") == "r9k"
+
+
 def _fp8_block_dispatch(x: torch.Tensor, lid: int) -> torch.Tensor:
     layer, stock_apply, maxm = _HYB_LAYERS[lid]
     if x.shape[0] <= maxm:
         from .. import ops
         return ops.fp8_block_linear(x, *layer._r9k_fp8b)
+    if _PREFILL_R9K:
+        from ..kernels import fp8 as F8
+        x2 = x if x.dtype == torch.bfloat16 and x.stride(1) == 1 else x.to(torch.bfloat16).contiguous()
+        return F8.gemm_fp8_block_tiled(*F8.quant_group128_fp8(x2), *layer._r9k_fp8b)
     return stock_apply(layer, x, None)
 
 

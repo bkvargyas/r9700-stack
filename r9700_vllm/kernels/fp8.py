@@ -27,6 +27,9 @@ def _L():
         if hasattr(L, "r9k_fp8_prefill_mix"):
             L.r9k_fp8_prefill_mix.restype = ctypes.c_int
             L.r9k_fp8_prefill_mix.argtypes = [ctypes.c_long] * 10 + [ctypes.c_int] * 5 + [ctypes.c_long]
+        if hasattr(L, "r9k_fp8_prefill_block"):
+            L.r9k_fp8_prefill_block.restype = ctypes.c_int
+            L.r9k_fp8_prefill_block.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 7 + [ctypes.c_long]
         _BOUND = True
     return L
 
@@ -116,6 +119,7 @@ def gemm_fp8_block(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: t
 PREFILL_CFG = int(os.environ.get("R9K_FP8_PREFILL_CFG", "9"))
 PREFILL_MIN_M = int(os.environ.get("R9K_FP8_PREFILL_MINM", "64"))   # below: the split-K decode kernel
 MIX_CFG = int(os.environ.get("R9K_FP8_MIX_CFG", "9"))               # TN == 4 cfgs only: 1, 9, 16, 17, 19
+BLOCK_CFG = int(os.environ.get("R9K_FP8_BLOCK_CFG", "10"))          # TM*TN <= 8 cfgs only (two accumulator sets)
 _TILE: dict[tuple[int, int], int] = {}
 for _kv in os.environ.get("R9K_FP8_PREFILL_CFGS", "").split(";"):
     if "=" in _kv:
@@ -123,13 +127,38 @@ for _kv in os.environ.get("R9K_FP8_PREFILL_CFGS", "").split(";"):
         _TILE[tuple(int(v) for v in _nk.split(","))] = int(_c)
 
 
-def tile_cfg(N: int, K: int, M: int, mix: bool = False) -> int:
+def tile_cfg(N: int, K: int, M: int, mix: bool = False, block: bool = False) -> int:
     c = _TILE.get((N, K))
     if c is not None:
         return c
     if M < 512:
-        return 17 if (mix or M < 256) else 10                       # 64 x 128 (4 waves) / 128 x 128 (8 waves)
-    return MIX_CFG if mix else PREFILL_CFG
+        return 17 if (mix or block or M < 256) else 10              # 64 x 128 (4 waves) / 128 x 128 (8 waves)
+    return MIX_CFG if mix else (BLOCK_CFG if block else PREFILL_CFG)
+
+
+def gemm_fp8_block_tiled(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int,
+                         out: torch.Tensor | None = None, cfg: int | None = None, block: int = 128) -> torch.Tensor:
+    """Exact block-scaled fp8 GEMM at prefill widths (r9k_fp8_prefill_block): a_q [M, K] e4m3, a_s [M, K/block]
+    fp32 (quant_group128_fp8), wq in permute_fp8 order with bs [ceil(N/block), K/block] fp32 -- stock's
+    compressed-tensors block-fp8 operands as they are. K % block == 0."""
+    from . import moe as KM
+    from ..ops import _identity_tables
+    M = a_q.shape[0]
+    cfg = tile_cfg(N, K, M, block=True) if cfg is None else cfg
+    if out is None:
+        out = torch.empty((M, N), dtype=torch.bfloat16, device=a_q.device)
+    if M == 0:
+        return out
+    assert a_s.shape == (M, K // block) and a_s.dtype == torch.float32 and a_s.is_contiguous(), a_s.shape
+    assert bs.shape[1] == K // block and bs.dtype == torch.float32 and bs.is_contiguous(), bs.shape
+    blk = KM.prefill_block(cfg)
+    (sid, eid, ntpp), _ = _identity_tables(a_q, M, blk // KM.MOE_BLOCK)
+    rc = _L().r9k_fp8_prefill_block(a_q.data_ptr(), a_s.data_ptr(), wq.data_ptr(), bs.data_ptr(), out.data_ptr(),
+                                    sid.data_ptr(), eid.data_ptr(), ntpp.data_ptr(), eid.numel(), M, K, N,
+                                    block, block, cfg, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_fp8_prefill_block failed ({rc}) M={M} N={N} K={K} cfg={cfg}")
+    return out
 
 
 def hc4_interleave(w_up: torch.Tensor) -> torch.Tensor:

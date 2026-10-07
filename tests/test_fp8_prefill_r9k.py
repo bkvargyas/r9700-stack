@@ -55,6 +55,73 @@ for M, N, K in ((4096, 336, 10240), (4096, 10240, 320), (4096, 2560, 2560), (409
     run(M, N, K)
 
 
+def us(fn, reps=20):
+    for _ in range(3):
+        fn()
+    torch.cuda.synchronize()
+    t = time.perf_counter()
+    for _ in range(reps):
+        fn()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t) / reps * 1e6
+
+
+# exact block-scaled fp8 (stock's 128 x 128 block weights, per-token-group-128 activations) against the
+# dequantised reference and the split-K decode block kernel on the same operands; bench against vLLM's Triton kernel
+def block_quant(w, blk=128):
+    N, K = w.shape
+    Np = (N + blk - 1) // blk * blk
+    wp = torch.zeros((Np, K), device=w.device, dtype=torch.float32)
+    wp[:N] = w.float()
+    b = wp.reshape(Np // blk, blk, K // blk, blk)
+    sc = (b.abs().amax(dim=(1, 3)).clamp_min(1e-12) / F8.FP8_MAX).float()              # [Np/blk, K/blk]
+    q = (b / sc[:, None, :, None]).to(torch.float8_e4m3fn).reshape(Np, K)[:N]
+    return q.contiguous(), sc.contiguous()
+
+
+try:
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import w8a8_triton_block_scaled_mm as _triton_mm
+except Exception as e:                                                   # noqa: BLE001
+    _triton_mm = None
+    print("  (no Triton block GEMM to compare:", str(e)[:60], ")")
+# Flash-Next's block-fp8 projections: TP4 (3584 / 4096 x 2560, 2560 x 1536), TP2 (6656 / 8192 x 2560, 2560 x 3072)
+for M, N, K in ((4096, 3584, 2560), (4096, 4096, 2560), (4096, 2560, 1536), (4096, 6656, 2560), (4096, 8192, 2560),
+                (4096, 2560, 3072), (333, 3584, 2560), (4096, 336, 2560)):
+    x = (torch.randn(M, K, device=dev) * 0.7).to(torch.bfloat16)
+    w = (torch.randn(N, K, device=dev) * 0.05).to(torch.bfloat16)
+    wq8, bs = block_quant(w)
+    wq = F8.permute_fp8(wq8.view(torch.uint8))
+    xq, xs = F8.quant_group128_fp8(x)
+    out = F8.gemm_fp8_block_tiled(xq, xs, wq, bs, N, K)
+    torch.cuda.synchronize()
+    xd = xq.float() * xs.repeat_interleave(128, 1)
+    wd = wq8.float() * bs.repeat_interleave(128, 0)[:N].repeat_interleave(128, 1)
+    ref = xd @ wd.T
+    fails += 0 if check(f"fp8 block tiled M={M:4d} N={N:5d} K={K:5d}", out, ref) else 1
+    d = F8.gemm_fp8_block(xq, xs, wq, bs, N, K)
+    rel = ((out.float() - d.float()).norm() / d.float().norm()).item()
+    print(f"  {'   vs decode block kernel':52s} rel {rel:.3e} {'ok' if rel < 5e-3 else '<-- FAIL'}")
+    fails += 0 if rel < 5e-3 else 1
+    if M == 4096:
+        best = None
+        for cfg in (10, 13, 17, 11, 14, 15, 18, 19, 2, 3, 4, 6):
+            try:
+                t = us(lambda: F8.gemm_fp8_block_tiled(xq, xs, wq, bs, N, K, out, cfg=cfg))
+            except RuntimeError:
+                continue
+            if best is None or t < best[0]:
+                best = (t, cfg)
+        line = f"  {'   bench':52s} tiled {best[0]:6.0f} us cfg {best[1]:2d} ({2 * M * N * K / best[0] / 1e6:5.1f} TFLOPS)"
+        if _triton_mm is not None:
+            try:
+                tt = us(lambda: _triton_mm(xq, wq8, xs, bs, [128, 128], torch.bfloat16))
+                line += f"   Triton {tt:6.0f} us"
+            except Exception as e:                                       # noqa: BLE001
+                line += f"   Triton: {str(e)[:50]}"
+        line += f"   (group quant of x {us(lambda: F8.quant_group128_fp8(x)):4.0f} us)"
+        print(line)
+
+
 # the fused up GEMM + gate mix against (a) the stock formula on the same fp8 gate and (b) the unfused fp8 path
 def gate_mix_ref(xn, gate, hc=4):
     M, DIM = xn.shape
@@ -84,17 +151,6 @@ for M in (4096, 333, 256):
     # against bf16 hipBLASLt + the formula (the path it replaces): fp8 operands differ, so only loosely
     ref_bf16 = gate_mix_ref(xn, torch.nn.functional.linear(lora, w_up))
     check(f"   (fp8 mix vs the bf16 path, informational)", out, ref_bf16, 1.0)
-
-
-def us(fn, reps=20):
-    for _ in range(3):
-        fn()
-    torch.cuda.synchronize()
-    t = time.perf_counter()
-    for _ in range(reps):
-        fn()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t) / reps * 1e6
 
 
 print("\n  bench (M=4096): tiled fp8 (incl. nothing else) vs hipBLASLt bf16 F.linear")
