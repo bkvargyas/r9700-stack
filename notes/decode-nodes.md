@@ -78,7 +78,7 @@ test could not see:
 | + all-gather (everything on), three runs | 16.28, 16.27, 16.25 | 198 / 549-561 / 892-930 / 6,822-6,854 |
 | everything on but the all-gather (control on the same tree) | 16.58 | 195 / 546 / 889 / 6,847 |
 | everything on, hybrid routing kernel (two runs) | 16.25, 16.25 | 198 / 560 / 892 / 6,793-6,874 |
-| **all-gather alone**, routing and fold on stock (two runs) | 16.40, TBD_AGONLY2 | 200 / 570 / 904 / 6,798 |
+| **all-gather alone**, routing and fold on stock (two runs) | 16.40, 16.41 | 200 / 570-578 / 900-904 / 6,798-6,819 |
 
 Strict sanity (conc 1 x 20, conc 17 x 40) clean on every configuration. The quality gate on the full
 configuration (everything on, `r9knodes-fn4`): GSM8K 1,319 no-think conc 1 **95.60%** (1,261) against the v0.2.4
