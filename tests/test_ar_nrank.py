@@ -89,14 +89,17 @@ def main():
                     check(f"mode{mode} {dtype} n={n} nb={nb}",
                           ar.all_reduce(inp(rank, it, n, dtype, dev), nb=nb, mode=mode),
                           ref(world, it, n, dtype, dev))
-    # back-to-back calls with no host sync in between (the double buffer is what keeps them apart)
-    for mode, n in ((1, 2560 * 16), (2, 2560 * 64)):
+    # back-to-back calls with no host sync in between (the double buffer is what keeps them apart). Sizes from
+    # the caps: the one-shot cap is 16 KiB by default (R9K_ARN_1S_KB) -- a fixed 2560 x 16 bf16 message was -7.
+    n1 = min(2560 * 16, ar.max1 // 2 // 2 // 8 * 8)          # bf16 elements, under the one-shot slot, x8 aligned
+    n2 = min(2560 * 64, ar.max_bytes // 2 // 2 // 8 * 8)
+    for mode, n in ((1, n1), (2, n2)):
         xs = [inp(rank, 5000 + i, n, torch.bfloat16, dev) for i in range(40)]
         outs = [ar.all_reduce(x, mode=mode) for x in xs]
         for i, o in enumerate(outs):
             check(f"burst mode{mode} {i}", o, ref(world, 5000 + i, n, torch.bfloat16, dev))
-    # graph replay: one-shot -> two-shot -> one-shot chained
-    x = torch.empty(2560 * 16, dtype=torch.bfloat16, device=dev)
+    # graph replay: one-shot -> two-shot -> one-shot chained (a one-shot-sized message)
+    x = torch.empty(n1, dtype=torch.bfloat16, device=dev)
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(s):
