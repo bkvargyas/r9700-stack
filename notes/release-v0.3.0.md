@@ -57,8 +57,20 @@ been failing with the kernel's -7 since the cap changed; the chain's grep hid it
 `b6e1c18`). Single-GPU gates, all ALL OK / PASS: atiled_4bit, fold_mxfp4, prefill_4bit, tuned_cfgs, moe_mxfp4,
 nvfp4, cache_moe, gemm_fp8, gdn_merge, moe_route_r9k, moe_sum_r9k, fp8_prefill_r9k. 0 MES timeouts on the boot.
 
-Two BetterBench-only runs for the record (the defaults again, and the defaults with the full cudagraph list) ran
-after the chain; their numbers are appended below when in.
+Two BetterBench-only runs after the chain (03:10-03:50 UTC), on the release tree:
+
+| | defaults, run 2 | defaults + the full cudagraph list (`CGSIZES=1,...,2048`) |
+|---|--:|--:|
+| KV cache | 475,343 tokens | 348,834 |
+| combined decode (median) | 162.3 | 163.9 |
+| step p50 / update p99 | 16.4 / 17.1 ms | 16.4 / 17.1 |
+| concurrency 1 / 8 (aggregate tok/s) | 151.6 / 507.7 | 152.9 / 505.2 |
+| TTFT p99 at 8 streams | 340 ms | 275 ms |
+| prefill 2k / 8k / 32k (tok/s) | 5,101 / 7,129 / 7,245 | 5,833 / 7,220 / 7,221 |
+
+So the band on the new defaults is 160.6-162.3 combined (v0.2.5 code: 160.9-162.8), the fp8 mix is +4.5% at
+8k / 32k in every run, and the graph trim is a clean trade: +94-126k KV tokens against -12% on 2k-token prompts
+and a higher TTFT tail under concurrency. Both are one knob in `serve/flashnext.sh`.
 
 ## Also in this tag
 
