@@ -39,7 +39,18 @@ all-gather / 2-rank race tests, the unit gates. A note on the record's provenanc
 defaults -- the fp8 mix never ran there and that BetterBench (156.8 combined, 2k prefill 5,023) is v0.2.5 code
 with the trimmed graphs. The run below mounts the release tree (checked on the container). Record:
 
-VALIDATION_RECORD
+| configuration | probe (dec tok/s / c8 / c16 / 8k prefill) | soak, 16 clients, 25 min | strict sanity | VRAM |
+|---|---|---|---|---|
+| Flash-Next TP4, new defaults (KV 442,575 tokens) | BetterBench: combined 160.6, step p50 16.4 ms, conc 1 / 8 = 154.9 / 486.7 tok/s, prefill 2k / 8k / 32k = 5,178 / 7,182 / 7,246 | 628 ok, 0 errors, 6,722 prompt tok/s | 0 bad of 320 (long prompts), 1,700 (conc 17), 1,440 (24), 1,920 (32) | 31,301 MiB of 32,624, flat |
+| 27B two cards (KV 367,494) | 212.8 / 578 / 672 / 3,951 | 314 ok, 0 errors, 3,139 prompt tok/s | 0 bad of 320, 900, 720, 960 | 29.3 GB, flat |
+| Flash-Next two cards, experts in host RAM (KV 133,306) | 118.7 / 183 / 150 / 2,608 | 225 ok, 0 errors, 2,339 prompt tok/s | 0 bad of 320, 900, 720, 960 | flat |
+
+Against the previous record (v0.2.5 code, 2026-10-07 morning): the four-card BetterBench 162.8 -> 160.6 is within
+the band (160.9 / 162.8 on identical code), 8k / 32k prefill +3.9% / +4.6%, 2k prefill -9% (the graph trim:
+`CGSIZES=1,...,2048` restores 5,684 at the cost of ~1.4 GiB of KV cache a card); the 27B is unchanged; the
+two-card Flash-Next probe sits in its link-bound band.
+
+TESTS_AND_GATES
 
 ## Also in this tag
 
