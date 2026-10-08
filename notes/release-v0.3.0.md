@@ -33,7 +33,11 @@ documented as rejected.
 
 The release validation chain on the final tree (`~/validate-030.sh` -> `~/val030.log`): fn4 full BetterBench +
 soak + sanity, 27B two cards soak + sanity, Flash-Next two cards soak + sanity, the 4-rank all-reduce /
-all-gather / 2-rank race tests, the unit gates. Record:
+all-gather / 2-rank race tests, the unit gates. A note on the record's provenance: the chain's first run
+(23:24-00:28 UTC) and the 2026-10-07 "v0.2.6" validation launched the serve scripts without `REPO=`, so
+`serve/serve.sh` mounted the production copy (`~/r9700-build/repo`, the v0.2.5 plugin) under the new serve
+defaults -- the fp8 mix never ran there and that BetterBench (156.8 combined, 2k prefill 5,023) is v0.2.5 code
+with the trimmed graphs. The run below mounts the release tree (checked on the container). Record:
 
 VALIDATION_RECORD
 
