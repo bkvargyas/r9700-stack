@@ -50,7 +50,15 @@ the band (160.9 / 162.8 on identical code), 8k / 32k prefill +3.9% / +4.6%, 2k p
 `CGSIZES=1,...,2048` restores 5,684 at the cost of ~1.4 GiB of KV cache a card); the 27B is unchanged; the
 two-card Flash-Next probe sits in its link-bound band.
 
-TESTS_AND_GATES
+Tests on the release tree: the 4-rank all-gather (`test_ag_nrank`, incl. graph replay) PASS, the 2-rank race
+(`test_ar_race`, 1,500 replays, exact and compressed) ALL OK, the 4-rank all-reduce (`test_ar_nrank`) PASS after
+a fix to the test itself (its burst and graph messages were sized at 80 KB against a 16 KiB one-shot cap and had
+been failing with the kernel's -7 since the cap changed; the chain's grep hid it behind the race test's ALL OK --
+`b6e1c18`). Single-GPU gates, all ALL OK / PASS: atiled_4bit, fold_mxfp4, prefill_4bit, tuned_cfgs, moe_mxfp4,
+nvfp4, cache_moe, gemm_fp8, gdn_merge, moe_route_r9k, moe_sum_r9k, fp8_prefill_r9k. 0 MES timeouts on the boot.
+
+Two BetterBench-only runs for the record (the defaults again, and the defaults with the full cudagraph list) ran
+after the chain; their numbers are appended below when in.
 
 ## Also in this tag
 
