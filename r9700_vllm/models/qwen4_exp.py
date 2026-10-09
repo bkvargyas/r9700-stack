@@ -106,22 +106,34 @@ def mtp_weights(weights, mtp_mxfp4: bool):
 
 @contextlib.contextmanager
 def construction_scope():
-    """Stock construction with the int6 PLE embedding class (int6 checkpoints only) and exact pinning."""
+    """Stock construction with the int6 PLE embedding class (int6 checkpoints only) and exact pinning.
+
+    The PLE layer instantiates its table through a name in its own module: `PLEVocabParallelEmbedding` up to the
+    2026-09 vLLM, `Qwen4ExpPLEDeviceEmbedding` / `Qwen4ExpPLEPinnedHostEmbedding` (chosen by engram_config) from
+    2026-10. Whichever is there is swapped for the int6 class (built on the device base: our table is a UVA view
+    of pinned host rows either way) for the duration of the construction, then restored."""
     from ..ple.int6 import checkpoint_ple_format, make_int6_embedding_cls
     from ..utils.hostmem import exact_pinning
-    stock_cls = getattr(_ple_layer, "PLEVocabParallelEmbedding", None)
-    swap = stock_cls is not None and checkpoint_ple_format() == "int6"
-    if checkpoint_ple_format() == "int6" and stock_cls is None:
-        raise RuntimeError("r9700: vLLM's ple_layer no longer exposes PLEVocabParallelEmbedding; int6 PLE needs "
-                           "a new construction hook for this vLLM version")
+    names = [n for n in ("Qwen4ExpPLEDeviceEmbedding", "Qwen4ExpPLEPinnedHostEmbedding", "PLEVocabParallelEmbedding")
+             if getattr(_ple_layer, n, None) is not None]
+    swap = bool(names) and checkpoint_ple_format() == "int6"
+    if checkpoint_ple_format() == "int6" and not names:
+        raise RuntimeError("r9700: vLLM's ple_layer exposes none of the PLE embedding classes this hook knows "
+                           "(PLEVocabParallelEmbedding, Qwen4ExpPLEDeviceEmbedding); int6 PLE needs a new "
+                           "construction hook for this vLLM version")
+    saved = {n: getattr(_ple_layer, n) for n in names}
     if swap:
-        _ple_layer.PLEVocabParallelEmbedding = make_int6_embedding_cls(stock_cls)
+        base = saved.get("Qwen4ExpPLEDeviceEmbedding") or saved.get("PLEVocabParallelEmbedding")
+        cls = make_int6_embedding_cls(base)
+        for n in names:
+            setattr(_ple_layer, n, cls)
     try:
         with exact_pinning():
             yield
     finally:
         if swap:
-            _ple_layer.PLEVocabParallelEmbedding = stock_cls
+            for n, c in saved.items():
+                setattr(_ple_layer, n, c)
 
 
 def _head_fmt(env: str) -> str | None:

@@ -13,7 +13,7 @@ logger = init_logger("vllm." + __name__)
 
 TESTED = {
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
-    "mtp_allowlist": (("dee37d891", "e97573215"), "vllm-project/vllm#55292"),
+    "mtp_allowlist": (("dee37d891", "e97573215", "8cbd5d030"), "vllm-project/vllm#55292 (closed unmerged 2026-10)"),
     # the modular MoE kernel copies its workspace into the layer output on ROCm unless aiter is on (moe/fold.py)
     "moe_output_alias": (("e97573215",), "vllm: FusedMoEKernelModularImpl._fused_experts output alias on ROCm"),
     # the runner adds the shared expert after the experts return; ours folds it into the top-k sum (moe/fold.py)

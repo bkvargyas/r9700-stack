@@ -12,6 +12,7 @@ Upstream candidate: dequantize in `_build_context_kv_buffers` when qkv_proj is q
 from __future__ import annotations
 
 import os
+import re
 
 import torch
 
@@ -162,7 +163,50 @@ def _finish(model) -> None:
                              else "fp8 GEMM (exact bytes)")
 
 
+_LAYER_RE = re.compile(r"(?<![A-Za-z0-9_.])layers\.(\d+)")
+
+
+def alias_draft_exclusions(vllm_config) -> int:
+    """The drafter's checkpoint lists the modules its fp8 config must not quantize by their checkpoint-local names
+    (`layers.0.attention_conv.kernel_projection`), while vLLM builds the drafter's layers at global indices after
+    the target's (`layers.64...`). From the 2026-10 vLLM the DFlash2 grouped-conv projections receive the draft
+    quant config (they ran unquantized before), and upstream's alias helper patches `exclude_modules` only, which
+    the fp8 config does not use (`ignored_layers`, exact match): the bf16 projections were loaded into fp8
+    parameters and the drafter's acceptance fell from 4.3 to 1.0 tokens a step. Add the global aliases (both
+    prefix forms the exact matcher may see) to the draft hf config before construction; harmless where the
+    helper already works. Upstream candidate: `_add_global_draft_layer_exclusions` over `ignored_layers` too."""
+    try:
+        hf = vllm_config.speculative_config.draft_model_config.hf_config
+        qc = getattr(hf, "quantization_config", None)
+        key = next((k for k in ("modules_to_not_convert", "ignored_layers", "exclude_modules")
+                    if isinstance(qc, dict) and isinstance(qc.get(k), list)), None)
+        if key is None:
+            return 0
+        start = int(vllm_config.model_config.hf_text_config.num_hidden_layers)
+        n = int(getattr(hf, "num_hidden_layers", 0))
+    except Exception:                                        # noqa: BLE001
+        return 0
+    names = qc[key]
+    added = 0
+    for entry in list(names):
+        m = _LAYER_RE.search(entry)
+        if m is None or int(m.group(1)) >= n:
+            continue
+        g = _LAYER_RE.sub(lambda mm: f"layers.{int(mm.group(1)) + start}", entry, count=1)
+        for cand in (g, "model." + g):
+            if cand not in names:
+                names.append(cand)
+                added += 1
+    if added:
+        logger.info_once("r9700: DFlash drafter: %d global-name aliases added to %s (layer offset %d)", added, key, start)
+    return added
+
+
 class R9kDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
+    def __init__(self, *, vllm_config, prefix: str = ""):
+        alias_draft_exclusions(vllm_config)
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
     def load_weights(self, weights):
         out = super().load_weights(weights)
         _finish(self)
@@ -170,6 +214,10 @@ class R9kDFlashQwen3ForCausalLM(DFlashQwen3ForCausalLM):
 
 
 class R9kDFlash2Qwen3ForCausalLM(DFlash2Qwen3ForCausalLM):
+    def __init__(self, *, vllm_config, prefix: str = ""):
+        alias_draft_exclusions(vllm_config)
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+
     def load_weights(self, weights):
         out = super().load_weights(weights)
         _finish(self)

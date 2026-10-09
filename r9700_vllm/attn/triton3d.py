@@ -225,7 +225,7 @@ class R9kTriton3DBackend(TritonAttentionBackend):
         return R9kTriton3DImpl
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(kv_cache_spec=None):     # the 2026-10 vLLM passes the spec
         return [16]           # the paged kernels are compiled for block 16; the 3D path is fine with it
 
     @classmethod
