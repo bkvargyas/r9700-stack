@@ -45,7 +45,7 @@ less (21.6 vs 22.0-22.6 GiB a card at TP4): with 0.98 x 31.86 - 21.6 - 2.38 = 7.
 formula gave ~475k tokens and the new one 411,881, i.e. vLLM's sizing now reserves more (presumably the graph
 memory that used to overflow the budget -- the honest accounting we measured by hand on 2026-10-07). Not a
 plugin matter; `KVMEM=` still pins the budget explicitly. Single-stream decode is 5% faster on the new nightly
-at TP4 and 2-4% on the 27B; the 8-stream probe at TP4 read 451 against a 560-613 band once, to be repeated.
+at TP4 and 2-4% on the 27B; the 8-stream probe at TP4 read 451 once and 585 on the repeat (209.0 / 585 / 906 / 6,883), i.e. inside the old band.
 
 Tooling on the test box: `~/try031b.sh LABEL 27b|fn2|fn4 [knobs]` launches one config on the new-nightly image
 (`PORT` / `NAME` env for parallel runs), prints the plugin's lines, the probe, sanity at concurrency and on long
