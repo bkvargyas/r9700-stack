@@ -260,3 +260,31 @@ directory `~/radiance-compose` with `*-nokey.yaml`, `flashnext-nospec.yaml`, `fl
 `flashnext-notier.yaml`; the containers under `/srv/models/rad`; the repo clone `~/radiance`. Results: GSM8K in
 `~/.r9keval/radiance-{27b,fn}.json` on the test box (compare with `bench/eval.py compare`), BetterBench logs
 `~/radtest-{27b,fn}.bb.log` there, the run logs `radtest*.log` on the mgmt VM.
+
+## 1.3.0: Flash-Next TP4 and the 27B TP2 through the full checklist, against our v0.3.0 (2026-10-09)
+
+Brian: "pull the latest radiance and test against our current build". 1.3.0 (published 2026-10-08, five releases
+past 1.2.0: an adaptive draft window, a new MoE decode GEMM form, opt-in MoE prefill forms, static YaRN, a
+three-rank wht6 wire, HF repo ids) on the test box, same compose files (`~/radiance-compose-tp3`, image in `.env`),
+sequentially: Flash-Next TP4 on HIP 0-3 (:8010), then the 27B TP2 on HIP 4,5 (:8011), 210 W / -42 mV, our
+clients from the v0.3.0 tree (`~/radtest130.sh` -> `~/radtest130.log`). Our column is the v0.3.0 record (BetterBench
+on the same box and prompts the night before).
+
+| | Flash-Next TP4: radiance 1.3.0 | ours v0.3.0 | 27B TP2: radiance 1.3.0 | ours v0.3.0 |
+|---|--:|--:|--:|--:|
+| probe: decode / 8 conc / 16 conc / 8k prefill | 265 / 798 / 836 / 5,367 (1.2.0: 264 / 740 / 786 / 5,197) | 199 / 560-613 / 888-905 / 6,850-7,070 | 143 / 454 / 668 / 3,394 (1.2.0: 147 / 430 / 657 / 3,405) | 213 / 578 / 672 / 3,951 |
+| strict sanity (long prompts; conc N+1; conc 2N) | 0 bad of 160 / 900 / 960, 0 of 360 after the soak | 0 of 5,380 | 0 of 160 / 1,700 / 1,920, 0 of 680 after | 0 of 2,900 |
+| GSM8K 1,319, no thinking, conc 1 | 95.83% (1,264) = 1.1.1 / 1.2.0 | 95.45-95.60% | 95.91% (1,265) | 94.69% (v0.2.4 record) |
+| HumanEval 164 | 158 | 160 | 159 | 160 |
+| BetterBench combined decode / update p99 | **221.9** / 12.9 ms | 160.6-162.3 / 17.1 ms | 130.7 / 31.8 ms | ~200 (2026-10-02: 197.5 single-stream) |
+| concurrency 1 / 2 / 4 / 8 (aggregate tok/s) | **196 / 309 / 402 / 537** | 152-155 / 234-238 / 349-352 / 487-508 | 121 / 219 / 342 / 475 | 174 / 280 / 413 / 519 |
+| prefill 2k / 8k / 16k / 32k / 64k (tok/s) | 4,870 / 5,270 / 5,224 / 5,281 / 5,291 | 5,101-5,178 / **7,129-7,182** / **7,127** / **7,245** / (32k max) | 3,025 / 3,332 / 3,317 / 3,256 / 3,055 | **4,190 / 4,191 / 4,072 / 3,837** |
+| soak, 16 clients, 25 min | 456 ok, 0 errors, 3,994 prompt tok/s | 628 ok, 0 errors, 6,722 | 262 ok, 0 errors, 2,567 | 314 ok, 0 errors, 3,139 |
+
+Reading it: on four cards radiance's decode step is 12.1 ms against our 16.4 with the same draft acceptance,
+so it decodes 37% faster single-stream and leads at every concurrency, while our prefill is 35% faster from 8k
+up and radiance runs 64k contexts here. On the 27B it is the other way round everywhere: our decode is ~50%
+faster, our prefill 25-40%. Quality is equal within noise on both. The concurrency sanity failures of 1.1.1 are
+gone in 1.3.0 as they were in 1.2.0. The "server error lines" counts in the log are the word "default" matching
+`fault`; the logs have no errors. Evals `~/.r9keval/radiance130-{fn-tp4,27b-tp2}.json`, BetterBench logs
+`~/rad130-*.bb.log` on the test box.
