@@ -7,7 +7,14 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+- **Runs on the 2026-10-09 vLLM ROCm 10 nightly** (`8cbd5d03`, 0.31.1rc1, 360 commits past the September pin)
+  with the same kernels (`notes/vllm-upgrade-2026-10.md`): the int6 PLE table on vLLM's new PLE embedding
+  classes (`allocate_embedding_weight`), the attention backend's block-size query signature, and a workaround
+  for an upstream bug that quantizes the DFlash2 drafter's grouped-conv projections despite the checkpoint's
+  exclusions (acceptance 4.3 -> 1.0 tokens a step; `models/dflash.py alias_draft_exclusions`). Probes on the
+  new nightly: 27B 216 tok/s (4.48 tok/step), Flash-Next TP4 209 tok/s, prefill unchanged, sanity clean. The
+  v0.31.0 *release* image is ROCm 7.2.3 and is not a target. `bench/humaneval.py` takes `EVAL_BASE`.
 
 ## [0.3.0] - 2026-10-08
 

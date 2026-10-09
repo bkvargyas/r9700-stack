@@ -218,7 +218,15 @@ and the only honest lever left.
 
 ## Deferred / next up (2026-09-22)
 
-### vLLM upgrade — deferred, two blockers to clear first
+### vLLM upgrade — done once (2026-10-09), the recipe that worked
+
+`notes/vllm-upgrade-2026-10.md`. In short: pull the `nightly-rocm100-<sha>` image (never the `v0.x` release
+images: those are ROCm 7), build `r9700/vllm:dev-<sha>` with `docker/Dockerfile` (the bare nightly has no plugin),
+run `overlay/emulated-switch/patch-hostcall.sh` with `IMG=` / `OUT=` for it, `IMG=... ~/gates4.sh`, then serve
+with `IMG=... PATCHED=...`. Three plugin fixes were needed for 360 commits of drift; the validation chain's
+launches must pass `REPO=` or serve.sh mounts the production copy. The original blockers, for the record:
+
+#### (2026-09-22) deferred, two blockers to clear first
 
 Brian asked to move to a newer vLLM and re-verify the plugin (the project's whole claim is that this is a
 no-op). Held off because two things need deciding first, and both are worse to discover mid-pull:

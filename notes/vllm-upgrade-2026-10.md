@@ -38,7 +38,14 @@ were not exercised on this vLLM and keep their tested lists (the gate warns if t
 | unit gates in the image | all pass | all pass (prefill_4bit, moe_mxfp4, gemm_fp8, gdn_merge, fp8_prefill_r9k, moe_route_r9k, moe_sum_r9k) |
 | 27B TP2: dec / c8 / c16 / 8k prefill, tok per step | 207.6-212.8 / 585 / 647-672 / 3,946, 4.32 | **216.0 / 524 / 639 / 3,906, 4.48**; sanity 0 bad |
 | Flash-Next TP2, experts in host RAM | 118.7 / 183 / 150 / 2,608, 3.22 | 117.1 / 154 / 154 / 2,626, 3.08; sanity 0 bad; **KV 84,898 vs 133,306 tokens** (under investigation: consumed 25.13 GiB, activation 2.25, graphs 1.43) |
-| Flash-Next TP4 | 199 / 560-613 / 888-905 / 6,850-7,070 | FN4_NEW |
+| Flash-Next TP4 (0.98, graphs to 256, hc fp8) | 199 / 560-613 / 888-905 / 6,850-7,070, 3.16; KV 442-475k | **209.3** / 451 / 917 / 6,854, 3.22; sanity 0 bad; **KV 411,881** (consumed 21.6 GiB, activation 2.38, graphs 1.66) |
+
+The KV cache is sized smaller by the new vLLM on both Flash-Next configurations although its weights take
+less (21.6 vs 22.0-22.6 GiB a card at TP4): with 0.98 x 31.86 - 21.6 - 2.38 = 7.2 GiB nominally free the old
+formula gave ~475k tokens and the new one 411,881, i.e. vLLM's sizing now reserves more (presumably the graph
+memory that used to overflow the budget -- the honest accounting we measured by hand on 2026-10-07). Not a
+plugin matter; `KVMEM=` still pins the budget explicitly. Single-stream decode is 5% faster on the new nightly
+at TP4 and 2-4% on the 27B; the 8-stream probe at TP4 read 451 against a 560-613 band once, to be repeated.
 
 Tooling on the test box: `~/try031b.sh LABEL 27b|fn2|fn4 [knobs]` launches one config on the new-nightly image
 (`PORT` / `NAME` env for parallel runs), prints the plugin's lines, the probe, sanity at concurrency and on long
