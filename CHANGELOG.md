@@ -22,7 +22,7 @@ Release notes with the validation record: [notes/release-v0.3.1.md](notes/releas
   per-token-group-128 quant runs inside the GEMM's A-load, operands bit-identical to the two-launch path; 96
   launches fewer a step. 16.42 -> 16.06; with the fp8 hc decode **15.01 ms/step (-8.6%, single-stream decode
   199 -> 217 tok/s**, 8/16 concurrent and prefill unchanged). Both are the four-card defaults; at TP2 the fp8 hc
-  decode stays off (its down copy costs 30k KV tokens there for +10% single-stream only). Measured and rejected: a 32 KB one-shot all-reduce cap (+0.35 ms), split-K across blocks for
+  decode stays off (its down copy costs 0.43 GiB of KV a card there, 27k tokens, for +10% single-stream only). Measured and rejected: a 32 KB one-shot all-reduce cap (+0.35 ms), split-K across blocks for
   the hc down kernel (`R9K_HC_FP8_DECODE_KB`, slower). Tests: `tests/test_hc_f8.py`, `tests/test_fp8_qa.py`.
 
 

@@ -11,8 +11,8 @@ quality, same KV cache, same prefill.** The code of v0.3.0 plus the decode-step 
     up+gated-mean GEMMs at decode widths (up to 16 tokens) read the fp8 fragment-order copies the prefill mix path
     already holds, half the bytes of the bf16 kernels that were the step's largest stream (1.29 GB a step), with
     bf16 WMMA against the unquantized activations. 16.42 -> 15.33 ms a step. `=0` restores the bf16 kernels. At
-    TP2 (experts in host RAM) it stays off: the fp8 down copy costs 30k KV tokens there (133,306 -> 103,517) for
-    +10% single-stream decode and nothing at 8 streams; `R9K_HC_FP8_DECODE=1` opts in.
+    TP2 (experts in host RAM) it stays off: the fp8 down copy costs 0.43 GiB of KV a card there (166,818 -> 140,008
+    tokens, warm cache) for +10% single-stream decode and nothing at 8 streams; `R9K_HC_FP8_DECODE=1` opts in.
   - **fused activation quant in the dense fp8 block GEMM** (`R9K_FP8_QA=1`, `r9k_gemm_fp8_block_qa`): the
     per-token-group-128 quant runs inside the GEMM's A-load with bit-identical operands; 96 launches fewer a step.
     15.33 -> 15.01 ms. `=0` splits it again.
@@ -70,8 +70,10 @@ tok/s, VRAM 32,573 -> 29,341 MiB. Strict sanity: 0 bad of 320 after long prompts
 9 / 12 / 16 clients. Server errors 0.
 
 **Flash-Next TP2 (experts in host RAM).** Probe: 124.3 tok/s single-stream (3.22 tokens a step; v0.3.0 118.7),
-164 / 158 at 8 / 16 streams, 2,610 prompt tok/s at 8k, KV 103,517 tokens -- this chain ran with the fp8 hc decode
-ON at TP2; with it off (the shipped TP2 default) the same tree gives KV 133,306 (v0.3.0's number), 113.4 tok/s
+164 / 158 at 8 / 16 streams, 2,610 prompt tok/s at 8k, KV 103,517 tokens. Soak 16 clients, 1,579 s: 251 ok,
+0 rejections, 0 errors, 2,295 prompt tok/s, VRAM 30,375 -> 30,863 MiB. Strict sanity: 0 bad of 320 after long
+prompts, 0 of 900 / 720 / 960 at 9 / 12 / 16 clients. Server errors 0. This chain ran with the fp8 hc decode ON
+at TP2; with it off (the shipped TP2 default) the same tree gives KV 133,306 (v0.3.0's number), 113.4 tok/s
 single-stream, 184 / 165 at 8 / 16 streams, 2,597 at 8k, so the default stays off there. Warm-cache launches,
 on / off / on: KV 140,008 / 166,818 / 140,008 tokens (2.26 / 2.69 GiB): the fp8 decode path costs 0.43 GiB a card
 at TP2, where the hyper-connection weights are not sharded four ways. (KV figures from a launch with a cold
@@ -81,9 +83,7 @@ compile transients as activation; compare warm with warm.)
 **Flash-Next TP2 on the shipped defaults** (fp8 hc decode off, fused quant on): KV 166,818 tokens; probe 120.1
 tok/s single-stream, 184 / 157 at 8 / 16 streams, 2,583 at 8k. Soak 16 clients, 1,572 s: 248 ok, 0 rejections,
 0 errors, 2,415 prompt tok/s. Strict sanity: 0 bad of 320 after long prompts, 0 of 540 / 720 / 960 at 9 / 12 / 16
-clients. Server errors 0. Soak 16 clients, 1,579 s:
-251 ok, 0 rejections, 0 errors, 2,295 prompt tok/s, VRAM 30,375 -> 30,863 MiB. Strict sanity: 0 bad of 320 after
-long prompts, 0 of 900 / 720 / 960 at 9 / 12 / 16 clients. Server errors 0.
+clients. Server errors 0.
 
 **Comm tests.** 4-rank all-gather and all-reduce (one-shot + two-shot, graph replay interleaved) bit-exact, 2-rank race test ALL OK.
 
