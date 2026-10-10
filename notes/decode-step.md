@@ -135,3 +135,39 @@ handshake for an intra-switch one and a remote read whose ordering against a thi
 without those tags; a lossy wire (fp8 / int8) saves under 1 us of the 1.6 us of data. The all-reduce is within
 ~1 us of its floor here; the lever left is the handshake COUNT (two per layer, inherent to row-parallel TP) and the
 node overhead, i.e. fusing the all-reduce into its neighbours, which is the same fatter-kernel project as the rest.
+
+## Round 3 (2026-10-10, Brian: "Go with option 2"): the fp8 hc kernels at every width, and the bf16 copies
+
+The v0.3.1 kernels cover 16 tokens; at 8 and 16 streams (32-64 tokens a step) the step still streamed the bf16
+hyper-connection weights, and the bf16 copies stayed resident for 17-255 rows. `kernels/r9k_hc_f8.hip` now takes
+any M in token tiles of 16 (`R9K_HC_F8_MT` tiles per block, default 2: the converted weight fragment serves both;
+more tiles per block lost to registers and the per-k-step x loads), `R9K_HC_FP8_DECODE_MAXM` sets the widest row
+count on them, `R9K_HC_FREE_BF16=1` drops the bf16 up / down weights after quantisation once every row count has
+an fp8 path (needs `R9K_HC_FP8_DOWN=1` for the tiled path above FP8_MIN_M). Exact at every M (`tests/test_hc_f8.py`).
+
+Graph-timed on card 4 (L3-resident weight, so the bf16 side is flattered), down / up+mix, us:
+
+| rows | fp8 WMMA (2 tiles) | bf16 hipBLASLt (+ hc_silu) | tiled fp8 W8A8 (quant + GEMM) |
+|---:|---:|---:|---:|
+| 32 | 12 / 13 | 12 / 8 | - |
+| 64 | 20 / 20 | 16-22 / 9 | 81 / 12 |
+| 128 | 30 / 38 | 22-27 / 15 | 107 / 41 |
+| 255 | 56 / 70 | 34-37 / 27 | 110 / 25 |
+
+Serving A/B, fn4 defaults (v0.3.1) on the same tree (`~/tp4tune/k5b-*`; a cold compile cache on every run, so the
+KV figures compare with each other but not with warm records):
+
+| config | decode | 8 streams | 16 streams | 8k prefill | 390-token prefill | KV tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| v0.3.1 defaults (k5b-base) | 219.4 | 550 | 904 | 6,785 | 1,660 | 419,347 |
+| fp8 kernels to 255 rows (k5b-maxm255) | 218.4 | **581** | **916** | 6,787 | 1,658 | 419,762 |
+| + bf16 copies freed, tiled fp8 down above 255 (k5b-free) | 219.4 | 582 | **935** | 6,729 | 1,691 | **489,446** |
+| v0.3.1 defaults again, warm cache (k5b-base2) | 219.8 | 560 | 907 | 6,883 | 1,759 | 452,115 |
+
+The wider kernels alone: +5.6% at 8 streams, +1.4% at 16, nothing else moves. Freeing the bf16 copies on top:
++70k KV tokens cold-against-cold (+17%), 16 streams +3.4%, 8k prefill -0.8% (the tiled fp8 down GEMM's activation
+quant above 255 rows, as `notes/prefill-fp8-pipe.md` measured), short prompts unchanged.
+
+A first pass of this A/B ran on a serving tree that had never received the v0.3.1 launcher defaults (both new
+paths off: 198 tok/s single-stream, "quantised ... up, 320 MB a rank" in the log) and measured nothing about the
+kernels; `feedback`: sync serve/ with the code, read the quantise log line before trusting an A/B.

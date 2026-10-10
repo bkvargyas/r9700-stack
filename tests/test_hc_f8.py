@@ -54,9 +54,9 @@ Wu = F8.quantize_rows_fp8(F8.hc4_interleave(w_up))
 wd_f = dequant(Wd)
 wu_f = torch.empty((HD * HC_, LR), device=dev)
 wu_f[F8.hc4_perm(HD * HC_, dev)] = dequant(Wu)          # back to the natural row order
-for M in (1, 2, 4, 8, 13, 16):
+for M in (1, 2, 4, 8, 13, 16, 17, 32, 48, 64, 100, 128, 200, 255, 300):
     xn = torch.randn(M, K, device=dev).to(torch.bfloat16)
-    for split, kb in ((16, 1), (8, 1), (4, 1), (32, 1), (16, 2), (16, 4), (8, 8)):
+    for split, kb in (((16, 1), (8, 1), (4, 1), (32, 1), (16, 2), (16, 4), (8, 8)) if M <= 16 else ((16, 1), (8, 1))):
         HC.FP8_DECODE_SPLIT, HC.FP8_DECODE_KB = split, kb
         out = HC.down_f8(xn, Wd.wq, Wd.ws, E, LR, float(HC_))
         out2 = HC.down_f8(xn, Wd.wq, Wd.ws, E, LR, float(HC_))      # the counters must come back reset
@@ -98,17 +98,34 @@ def us(fn, n=50, reps=20):
     return (time.perf_counter() - t) / reps / n * 1e6
 
 
-for M in (4, 8):
+try:                                   # registers torch.ops.vllm.qwen4_exp_hc_silu for the stock / tiled paths
+    import vllm.models.qwen4_exp.amd.hyperconnection  # noqa: F401
+    HC_SILU_OK = hasattr(torch.ops.vllm, "qwen4_exp_hc_silu")
+except Exception:                      # noqa: BLE001
+    HC_SILU_OK = False
+for M in (4, 8, 32, 64, 128, 255):
     print(f"\n  graph-timed bench at M={M} (one hc module; a layer has two, a step 97):")
     xn = torch.randn(M, K, device=dev).to(torch.bfloat16)
     lora = (torch.randn(M, LR, device=dev) * 0.5).to(torch.bfloat16)
-    for split, kb in ((8, 1), (16, 1), (32, 1), (16, 2), (32, 2), (16, 4)):
+    for split, kb in (((8, 1), (16, 1), (32, 1), (16, 2), (32, 2), (16, 4)) if M <= 16 else ((8, 1), (16, 1))):
         HC.FP8_DECODE_SPLIT, HC.FP8_DECODE_KB = split, kb
         print(f"  down fp8 split {split:2d} kb {kb}: {us(lambda: HC.down_f8(xn, Wd.wq, Wd.ws, E, LR, 4.0)):6.2f} us")
     HC.FP8_DECODE_SPLIT, HC.FP8_DECODE_KB = 16, 1
-    print(f"  down bf16 (r9k_router_gemm, split {HC.MIX_SPLIT}): "
-          f"{us(lambda: R.router_gemm(xn, w_down, True, HC.MIX_SPLIT, LR, 4.0, 8)):6.2f} us")
+    if M <= 8:
+        print(f"  down bf16 (r9k_router_gemm, split {HC.MIX_SPLIT}): "
+              f"{us(lambda: R.router_gemm(xn, w_down, True, HC.MIX_SPLIT, LR, 4.0, 8)):6.2f} us")
+        print(f"  up+mix bf16 (r9k_hc_up_mix): {us(lambda: HC.up_mix(lora, w_up, xn, HC_)):6.2f} us")
+    print(f"  down bf16 F.linear (hipBLASLt, no silu): {us(lambda: torch.nn.functional.linear(xn, w_down)):6.2f} us")
     print(f"  up+mix fp8: {us(lambda: HC.up_mix_f8(lora, Wu.wq, Wu.ws, xn, HD)):6.2f} us")
-    print(f"  up+mix bf16 (r9k_hc_up_mix): {us(lambda: HC.up_mix(lora, w_up, xn, HC_)):6.2f} us")
+    print(f"  up bf16 F.linear (no mix): {us(lambda: torch.nn.functional.linear(lora, w_up)):6.2f} us")
+    if M >= 32 and HC.FP8 and HC_SILU_OK:   # the tiled W8A8 prefill path (per-row quant + tiled WMMA GEMM) here
+        HC.FP8_MIN_M, HC.FP8_DOWN, HC.FP8_DECODE_MAXM = 17, True, 16
+        print(f"  down tiled fp8 W8A8 (quant + gemm + silu): "
+              f"{us(lambda: HC.down_silu(xn, w_down, LR, 4, Wd.wq, Wd.ws)):6.2f} us")
+        print(f"  up+mix tiled fp8 W8A8 (quant + gemm_fp8_mix): "
+              f"{us(lambda: HC.up_mix(lora, w_up, xn, HC_, None, Wu.wq, Wu.ws)):6.2f} us")
+        print(f"  down bf16 F.linear + hc_silu (stock path): "
+              f"{us(lambda: HC.down_silu(xn, w_down, LR, 4)):6.2f} us")
+        HC.FP8_MIN_M, HC.FP8_DOWN, HC.FP8_DECODE_MAXM = 256, False, 16
 print("test_hc_f8:", "FAIL" if fails else "PASS")
 sys.exit(1 if fails else 0)

@@ -181,6 +181,10 @@ def up_mix_f8(lora: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, xn: torch.
     return out
 
 
+FP8_DECODE_MAXM = int(os.environ.get("R9K_HC_FP8_DECODE_MAXM", "16"))   # widest row count on the WMMA kernels
+# R9K_HC_FREE_BF16=1: once every row count has an fp8 path (decode kernels to FP8_MIN_M - 1, FP8_DOWN and the mix
+# GEMM above), drop the bf16 up / down weights after quantisation: ~13.5 MB a module, 1.3 GB a rank of KV cache.
+FREE_BF16 = os.environ.get("R9K_HC_FREE_BF16", "0") == "1"
 FP8_DECODE_SPLIT = int(os.environ.get("R9K_HC_FP8_DECODE_SPLIT", "16"))
 FP8_DECODE_KB = int(os.environ.get("R9K_HC_FP8_DECODE_KB", "1"))     # blocks per tile along K (split-K in scratch)
 _SCRATCH: dict = {}
@@ -199,22 +203,28 @@ def _down_scratch(device, N: int, kb: int) -> tuple[int, int]:
 
 
 def down_silu(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int,
-              wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
+              wq: torch.Tensor | None = None, ws: torch.Tensor | None = None, n_out: int = 0) -> torch.Tensor:
     """[M, N] bf16 = xn [M, K] . w [N, K]^T with hc_silu(., hc) applied to the first lora_rank columns (the merged
     down + injection GEMM); stock's F.linear + hc_silu above MIX_MAX_M rows, the fp8 tiled GEMM from FP8_MIN_M
     rows when the fp8 weight (wq, ws) is given, the fp8 decode kernel at M <= 16 with R9K_HC_FP8_DECODE=1."""
     from . import router as R
-    if FP8_DECODE and wq is not None and xn.shape[0] <= 16 and xn.stride(1) == 1 and xn.stride(0) % 8 == 0 \
-            and w.shape[1] % (16 * FP8_DECODE_SPLIT * FP8_DECODE_KB) == 0 and w.shape[0] % 16 == 0 \
-            and hasattr(lib(), "r9k_hc_down_f8"):
-        return down_f8(xn, wq, ws, w.shape[0], lora_rank, hc_count)
+    N, K = (int(w.shape[0]), int(w.shape[1])) if w.numel() else (n_out, xn.shape[1])   # the bf16 weight may be freed
+    if FP8_DECODE and wq is not None and xn.shape[0] <= FP8_DECODE_MAXM and xn.stride(1) == 1 and xn.stride(0) % 8 == 0 \
+            and K % (16 * FP8_DECODE_SPLIT * FP8_DECODE_KB) == 0 and N % 16 == 0 and hasattr(lib(), "r9k_hc_down_f8"):
+        return down_f8(xn, wq, ws, N, lora_rank, hc_count)
+    if wq is not None and FP8_DOWN and xn.shape[0] >= FP8_MIN_M:
+        return _down_tail(_fp8_gemm(xn, wq, ws, N, K), lora_rank, hc_count)
+    if not w.numel():
+        raise RuntimeError(f"r9700 hc down: bf16 weight freed but no fp8 path for M={xn.shape[0]} (N={N}, K={K})")
     out = R.router_gemm(xn, w, True, MIX_SPLIT, lora_rank, float(hc_count), MIX_MAX_M) if mix_available() else None
     if out is None:
-        if wq is not None and FP8_DOWN and xn.shape[0] >= FP8_MIN_M:
-            out = _fp8_gemm(xn, wq, ws, w.shape[0], w.shape[1])
-        else:
-            out = torch.nn.functional.linear(xn, w)
-        out[:, :lora_rank] = torch.ops.vllm.qwen4_exp_hc_silu(out[:, :lora_rank], hc_count)
+        out = torch.nn.functional.linear(xn, w)
+        out = _down_tail(out, lora_rank, hc_count)
+    return out
+
+
+def _down_tail(out: torch.Tensor, lora_rank: int, hc_count: int) -> torch.Tensor:
+    out[:, :lora_rank] = torch.ops.vllm.qwen4_exp_hc_silu(out[:, :lora_rank], hc_count)
     return out
 
 
@@ -226,10 +236,16 @@ def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: i
     M, LR = lora.shape
     DIM = xn.shape[1]
     HD = DIM // hc_count
-    if FP8_DECODE and wq is not None and M <= 16 and hc_count == 4 and LR % 16 == 0 and HD % 16 == 0 \
+    if FP8_DECODE and wq is not None and M <= FP8_DECODE_MAXM and hc_count == 4 and LR % 16 == 0 and HD % 16 == 0 \
             and lora.stride(1) == 1 and lora.stride(0) % 8 == 0 and xn.stride(1) == 1 and xn.stride(0) % 8 == 0 \
             and hasattr(lib(), "r9k_hc_up_mix_f8"):
         return up_mix_f8(lora, wq, ws, xn, HD)
+    if not w_up.numel():
+        if wq is not None and M >= FP8_MIN_M:
+            from .kernels import fp8 as F8, moe as KM
+            q, s_ = KM.quant_rows_fp8(lora)
+            return F8.gemm_fp8_mix(q, s_, F8.Fp8Weight(wq, ws, DIM, LR), xn)
+        raise RuntimeError(f"r9700 hc up: bf16 weight freed but no fp8 path for M={M}")
     ok = (mix_available() and 1 <= M <= MIX_MAX_M and hc_count == 4 and LR % (8 * lpr) == 0 and 16 <= LR <= 512
           and HD % 2 == 0 and w_up.shape == (DIM, LR) and lora.dtype == w_up.dtype == xn.dtype == torch.bfloat16
           and lora.stride(1) == 1 and w_up.stride(1) == 1 and xn.stride(1) == 1
@@ -251,8 +267,8 @@ def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: i
 
 
 def _down_silu_fake(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int,
-                    wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
-    return xn.new_empty((xn.shape[0], w.shape[0]))
+                    wq: torch.Tensor | None = None, ws: torch.Tensor | None = None, n_out: int = 0) -> torch.Tensor:
+    return xn.new_empty((xn.shape[0], w.shape[0] if w.numel() else n_out))
 
 
 def _up_mix_fake(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: int,
@@ -286,11 +302,12 @@ def op_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injectio
 def _mix_tail(self, xn: torch.Tensor):
     lr, hc = self.lora_rank, self.hc_count
     dq, ds, uq, us = getattr(self, "_r9k_hc_fp8", (None, None, None, None))
+    n_down = getattr(self, "_r9k_hc_ndown", 0)
     if self.use_combine:
-        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down_block_inject.weight, lr, hc, dq, ds)
+        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down_block_inject.weight, lr, hc, dq, ds, n_down)
         injection = buf[:, lr:lr + hc]
     else:
-        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down.weight, lr, hc, dq, ds)
+        buf = torch.ops.r9700.hc_down_silu(xn, self.input_mix_weight_down.weight, lr, hc, dq, ds, n_down)
         injection = None
     block_input = torch.ops.r9700.hc_up_mix(buf[:, :lr], self.input_mix_weight_up.weight, xn, hc, None, uq, us)
     return block_input, injection
@@ -350,7 +367,7 @@ def quantize_fp8(model: torch.nn.Module) -> int:
     if not FP8:
         return 0
     from .kernels import fp8 as F8
-    n = 0
+    n = freed = 0
     for mod in model.modules():
         if not getattr(mod, "_r9k_mix", False):
             continue
@@ -362,12 +379,32 @@ def quantize_fp8(model: torch.nn.Module) -> int:
         d = F8.quantize_rows_fp8(down.weight.data) if (FP8_DOWN or FP8_DECODE) else None
         u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
         mod._r9k_hc_fp8 = (d.wq if d else None, d.ws if d else None, u.wq, u.ws)   # plain tuple, not a parameter
+        mod._r9k_hc_ndown = int(down.weight.shape[0])
+        if _free_bf16_ok() and d is not None:
+            # every row count now has an fp8 path: the bf16 up / down copies are never read again
+            for lin in (down, up):
+                lin.weight.data = lin.weight.data.new_empty((0,))
+            freed += 1
         n += 1
     if n:
-        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load; up%s, %.0f MB a rank%s)",
+        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load; up%s, %.0f MB a rank%s%s)",
                     n, " + down" if (FP8_DOWN or FP8_DECODE) else "", n * (3.3 + (3.4 if (FP8_DOWN or FP8_DECODE) else 0)),
-                    "; decode on fp8" if FP8_DECODE else "")
+                    f"; decode on fp8 to {FP8_DECODE_MAXM} rows" if FP8_DECODE else "",
+                    f"; bf16 copies freed on {freed} ({freed * 13.5:.0f} MB)" if freed else "")
+    if freed:
+        torch.cuda.empty_cache()
     return n
+
+
+def _free_bf16_ok() -> bool:
+    """The bf16 hc weights can go only when no row count can fall back to them."""
+    if not (FREE_BF16 and FP8 and FP8_DECODE and FP8_DOWN):
+        return False
+    if FP8_DECODE_MAXM < FP8_MIN_M - 1 or FP8_DECODE_KB != 1:
+        logger.warning_once("r9700: R9K_HC_FREE_BF16 ignored: the fp8 decode kernels stop at %d rows, the mix path "
+                            "starts at %d (set R9K_HC_FP8_DECODE_MAXM=%d)", FP8_DECODE_MAXM, FP8_MIN_M, FP8_MIN_M - 1)
+        return False
+    return True
 
 
 def install() -> bool:

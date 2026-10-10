@@ -7,7 +7,12 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Added (off by default until the gate and the validation; `notes/decode-step.md` round 3)
+- The fp8 hyper-connection kernels take any row count (token tiles of 16, `R9K_HC_F8_MT` tiles per block);
+  `R9K_HC_FP8_DECODE_MAXM` sets the widest row count on them (default 16, the v0.3.1 behaviour).
+  `R9K_HC_FREE_BF16=1` (with `R9K_HC_FP8_DOWN=1`) drops the bf16 up / down weights after quantisation. Measured
+  at TP4 with `MAXM=255`: 8 streams +5.6%, 16 streams +1.4%; with the copies freed +70k KV tokens (+17%), 16
+  streams +3.4%, 8k prefill -0.8%.
 
 ## [0.3.1] - 2026-10-10
 
