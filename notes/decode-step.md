@@ -183,7 +183,7 @@ kernels; `feedback`: sync serve/ with the code, read the quantise log line befor
 
 | | GSM8K 1,319 | HumanEval | strict sanity |
 |---|---:|---:|---|
-| v0.3.1 defaults | 95.83% (1,264) | HE_BASE | 0 bad of 1,040 |
+| v0.3.1 defaults | 95.83% (1,264) | 159 / 164 | 0 bad of 1,040 |
 | option 2 | 95.75% (1,263) | **162 / 164** | 0 bad of 1,040 |
 
 Paired: base-only-right 11, candidate-only-right 10, McNemar p = 1.00; outputs identical on 18.5% (the fp8 weights
