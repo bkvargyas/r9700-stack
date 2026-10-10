@@ -24,8 +24,13 @@ WORDS = ("In distributed systems the tension between consistency, availability, 
 def post(content, max_tokens, temperature=0):
     b = {"model": "Qwen3.8", "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
          "temperature": temperature, "chat_template_kwargs": {"enable_thinking": False}}
-    r = json.loads(urllib.request.urlopen(urllib.request.Request(B + "/v1/chat/completions", json.dumps(b).encode(),
-                                          {"Content-Type": "application/json"}), timeout=900).read())
+    try:
+        r = json.loads(urllib.request.urlopen(urllib.request.Request(B + "/v1/chat/completions", json.dumps(b).encode(),
+                                              {"Content-Type": "application/json"}), timeout=900).read())
+    except urllib.error.HTTPError as e:                      # say WHY the server refused (the body carries it)
+        body = e.read().decode(errors="replace")[:400]
+        print(f"HTTP {e.code} on a {len(content)}-char prompt, max_tokens {max_tokens}: {body}", flush=True)
+        raise
     return r["choices"][0]["message"]["content"] or "", r["usage"]
 
 def pre(kind, chars):
