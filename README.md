@@ -22,18 +22,18 @@ everything loads at runtime through vLLM's own extension points, so vLLM and ROC
 
 Flash-Next, 4x R9700, TP4, MTP-3 speculative decoding. The reference is the fastest known alternative stack on
 the same box, checkpoint and power cap (full 20-pass BetterBench, v0.2.0 at 225 W; current code, 210 W, in the
-right-hand column from the 2026-10-07 runs):
+right-hand column from the 2026-10-09/10 runs):
 
-| | this stack vs reference (BetterBench, v0.2.0, 225 W) | now (2026-10-07, 210 W, probe) |
+| | this stack vs reference (BetterBench, v0.2.0, 225 W) | now (2026-10-10, 210 W, probe) |
 |---|--:|--:|
-| single-stream decode | **159 tok/s** vs 134 (+19%) | 199 tok/s |
-| decode step p50 | **16.8 ms** vs 20.4 | 16.4 ms |
+| single-stream decode | **159 tok/s** vs 134 (+19%) | **217 tok/s** (was 199 on 10-07) |
+| decode step p50 | **16.8 ms** vs 20.4 | **15.0 ms** (was 16.4) |
 | time to first token p50 | **94 ms** vs 145 | |
 | prefill 2k / 8k / 16k / 32k tok/s | **6,408 / 7,365 / 7,451 / 7,182** vs 5,279 / 5,711 / 5,977 / 6,106 | 8k: 6,850-7,070 |
-| aggregate tok/s at 1 / 2 / 4 / 8 / 16 | **151 / 231 / 350 / 478 / 635** vs 126 / 197 / 303 / 427 / 542 | 8 streams: 560-610, 16: 890-905 |
+| aggregate tok/s at 1 / 2 / 4 / 8 / 16 | **151 / 231 / 350 / 478 / 635** vs 126 / 197 / 303 / 427 / 542 | 8 streams: 550-570, 16: 890-905 |
 | KV cache | | **475k tokens** (was 279k) |
-| GSM8K (1,319 questions, paired vs the previous numerics) | 97.0% vs 96.8% with the fusions off, p = 0.58 | 95.5% vs 95.6%, p = 0.86 |
-| HumanEval | | 160 / 164 |
+| GSM8K (1,319 questions, paired vs the previous numerics) | 97.0% vs 96.8% with the fusions off, p = 0.58 | 95.83% vs 95.75%, p = 1.00 |
+| HumanEval | | 161 / 164 |
 
 Two cards: 27B-NVFP4 197.5 tok/s single-stream, 23.5 ms step, 174 / 280 / 413 / 519 tok/s at 1 / 2 / 4 / 8,
 first token 47 ms; Flash-Next with experts in host RAM 97 tok/s single-stream, link-bound near 115 tok/s

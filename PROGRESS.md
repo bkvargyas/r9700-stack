@@ -1700,3 +1700,21 @@ on its child, `SharedExperts.output` consuming its slot, and a per-call flag rea
 (baked in at trace time -> double add). Defaults: all-gather ON (R9K_AG=1), routing and fold OFF (R9K_MOE_ROUTE=r9k / R9K_MOE_FOLD=r9k turn them on):
 0.15 ms does not buy a replaced router and two vLLM-runner patches on the production path. Nothing tagged,
 production copy untouched; the next tag owes the full validation on the all-gather (soak, BetterBench).
+
+
+## 2026-10-09/10: decode step 16.42 -> 15.01 ms (-8.6%), single-stream 199 -> 217 tok/s
+
+Brian: "ok, lets see if we can get our step time down then" (radiance 1.3.0 at 12.1 ms). notes/decode-step.md has
+the method and every run. Two things moved it, both exact in unit tests: (1) the hyper-connection down + up GEMMs
+at decode widths on the fp8 fragment-order copies the prefill mix path already holds (kernels/r9k_hc_f8.hip: bf16
+WMMA against the bf16 activations, W8A16, loads software-pipelined; the bf16 pair had been the step's largest
+stream at 1.29 GB) -- 16.42 -> 15.33; (2) the per-token fp8 quant fused into the dense block GEMM's A-load
+(r9k_gemm_fp8_block_qa, operands bit-identical, 96 launches fewer) -- 16.06 alone, 15.01 with (1). Measured and
+rejected: a 32 KB one-shot all-reduce cap (16.77), split-K across blocks for the hc down kernel (slower at every
+setting), a scalar fp8 kernel before the WMMA one (15.64). The base repeated five times at 16.42-16.44. Gate at
+conc 1 on the same tree: GSM8K 95.83% vs 95.75% (paired 8 vs 7, p = 1.00, outputs identical on 25.5%), HumanEval
+161 vs 160, strict sanity 0 of 1,040 each. Both are the fn4 defaults now (R9K_HC_FP8_DECODE=0 / R9K_FP8_QA=0 off).
+Also measured: a tiny node in a replayed graph costs ~3 us and forked branches do overlap, but the earlier finding
+stands -- route + fold reran at -0.13 ms. rocprofv3 under vLLM writes nothing (workers SIGKILLed before the tool
+finalizes); the torch profiler GPU-only (PROFACT=CUDA) still stretches the step to 23 ms, so the unprofiled split
+of the remaining 2.9 ms to radiance stays an estimate. Nothing tagged; production copy untouched.

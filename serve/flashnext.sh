@@ -45,8 +45,14 @@ exec env \
   R9K_HC_FP8=${R9K_HC_FP8-r9k} `    # the hyper-connection up GEMM + sigmoid-gated mean fused in fp8 from 256 rows
                                     # (268 vs 674 us a layer at 4096): +4% prefill, decode untouched; GSM8K paired
                                     # p=0.86, HumanEval 160/164. =stock for the bf16 pair` \
+  R9K_HC_FP8_DECODE=${R9K_HC_FP8_DECODE-1} `  # the hyper-connection down + up GEMMs at decode widths (<= 16 tokens)
+                                              # on the same fp8 copies (bf16 WMMA, W8A16): 16.42 -> 15.33 ms/step at
+                                              # TP4, 2026-10-09; GSM8K paired with the fused quant below, HumanEval
+                                              # 161/164 (notes/decode-step.md). =0 for the bf16 decode kernels` \
   R9K_FP8_BLOCK=${R9K_FP8_BLOCK-block} `   # block-fp8 projections on our split-K GEMM at decode widths, stock's
                                            # Triton kernel above M=64 (R9K_FP8_BLOCK_MAXM); 2026-09-24: +6% decode` \
+  R9K_FP8_QA=${R9K_FP8_QA-1} `             # ... with the per-token fp8 quant fused into that GEMM (same operands bit
+                                           # for bit, 96 launches fewer a step): 15.33 -> 15.01 ms/step. =0 splits it` \
   R9K_DRAFT_LMHEAD=${R9K_DRAFT_LMHEAD-mxfp4} `   # MTP draft head at 4 bits: draft-only, cannot change outputs` \
   R9K_TARGET_LMHEAD=${R9K_TARGET_LMHEAD-mxfp4} ` # target head at 4 bits (as Rob's w4a16): ~0.5 ms/step. Paired evals
                                                  # 2026-09-24, conc=1: 300 short 96.0 -> 97.0% p=0.51; 800 CoT

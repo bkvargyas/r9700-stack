@@ -7,6 +7,8 @@ graph (Dynamo cannot trace ctypes calls) and be captured into CUDA/HIP graphs.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -28,10 +30,18 @@ def _fp8_linear_fake(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int
     return x.new_empty((x.shape[0], N))
 
 
+# R9K_FP8_QA=1: at decode widths (M <= 16) the activation quant is fused into the block GEMM (one launch per
+# linear instead of two; same operands bit for bit).
+_FP8_QA = os.environ.get("R9K_FP8_QA", "0") == "1"
+
+
 def _fp8_block_linear(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int) -> torch.Tensor:
     from .kernels import fp8 as F8
+    M = x.shape[0]
+    if _FP8_QA and 0 < M <= 16 and K % 128 == 0 and hasattr(F8._L(), "r9k_gemm_fp8_block_qa"):
+        return F8.gemm_fp8_block_qa(x, wq, bs, N, K, None, *F8.pick_cfg("fp8block", N, K, M))
     q, s = F8.quant_group128_fp8(x)
-    return F8.gemm_fp8_block(q, s, wq, bs, N, K, None, *F8.pick_cfg("fp8block", N, K, x.shape[0]))
+    return F8.gemm_fp8_block(q, s, wq, bs, N, K, None, *F8.pick_cfg("fp8block", N, K, M))
 
 
 _MX_TABLES: dict[tuple, tuple] = {}

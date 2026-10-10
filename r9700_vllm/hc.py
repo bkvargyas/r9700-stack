@@ -46,6 +46,10 @@ FP8_MIN_M = int(os.environ.get("R9K_HC_FP8_MINM", "256"))
 # The down GEMM alone does not pay: its per-token quant of xn (84 MB read, 42 written: 212 us at 4096 rows)
 # costs more than the fp8 GEMM saves (334 -> 172 us). Off until the combine-norm kernel emits the fp8 copy.
 FP8_DOWN = FP8 and os.environ.get("R9K_HC_FP8_DOWN", "0") == "1"
+# Decode widths (M <= 16) on the same fp8 copies (kernels/r9k_hc_f8.hip): half the bytes of the bf16 skinny kernels,
+# which stream 1.29 GB a step at TP4 (3.1 ms of a 16.4 ms step, 2026-10-09 profile). Changes decode numerics
+# (fp8 weights, bf16 activations): opt-in until the paired GSM8K gate has passed with it.
+FP8_DECODE = FP8 and os.environ.get("R9K_HC_FP8_DECODE", "0") == "1"
 
 
 def lib():
@@ -56,6 +60,11 @@ def lib():
         if hasattr(L, "r9k_hc_up_mix"):
             L.r9k_hc_up_mix.restype = ctypes.c_int
             L.r9k_hc_up_mix.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 5 + [ctypes.c_long]
+        if hasattr(L, "r9k_hc_down_f8"):
+            L.r9k_hc_down_f8.restype = ctypes.c_int
+            L.r9k_hc_down_f8.argtypes = [ctypes.c_long] * 6 + [ctypes.c_int] * 5 + [ctypes.c_float, ctypes.c_int] + [ctypes.c_long] * 3
+            L.r9k_hc_up_mix_f8.restype = ctypes.c_int
+            L.r9k_hc_up_mix_f8.argtypes = [ctypes.c_long] * 8 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_hc_combine_norm.restype = ctypes.c_int
         L.r9k_hc_combine_norm.argtypes = [ctypes.c_long] * 7 + [ctypes.c_int] + [ctypes.c_long] * 4 + [ctypes.c_int] * 3 + \
             [ctypes.c_float, ctypes.c_long]
@@ -145,12 +154,60 @@ def _fp8_gemm(x: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, K: in
     return F8.gemm_fp8_tiled(q, s, F8.Fp8Weight(wq, ws, N, K))
 
 
+def down_f8(xn: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, N: int, lora_rank: int, hc_count: int
+            ) -> torch.Tensor:
+    """Decode: [M, N] bf16 on the fp8 fragment-order weight, hc_silu on the first lora_rank columns (M <= 16)."""
+    M, K = xn.shape
+    out = xn.new_empty((M, N))
+    kb = FP8_DECODE_KB
+    sc, ct = _down_scratch(xn.device, N, kb) if kb > 1 else (0, 0)
+    rc = lib().r9k_hc_down_f8(xn.data_ptr(), xn.stride(0), wq.data_ptr(), ws.data_ptr(), out.data_ptr(),
+                              out.stride(0), M, N, K, FP8_DECODE_SPLIT, int(lora_rank), float(hc_count), kb, sc, ct,
+                              torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_hc_down_f8 failed ({rc}) M={M} N={N} K={K}")
+    return out
+
+
+def up_mix_f8(lora: torch.Tensor, wq: torch.Tensor, ws: torch.Tensor, xn: torch.Tensor, HD: int) -> torch.Tensor:
+    """Decode: the up GEMM + sigmoid-gated mean on the interleaved fp8 up weight (M <= 16, HC == 4)."""
+    M, LR = lora.shape
+    out = xn.new_empty((M, HD))
+    rc = lib().r9k_hc_up_mix_f8(lora.data_ptr(), lora.stride(0), wq.data_ptr(), ws.data_ptr(), xn.data_ptr(),
+                                xn.stride(0), out.data_ptr(), out.stride(0), M, LR, HD,
+                                torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_hc_up_mix_f8 failed ({rc}) M={M} LR={LR} HD={HD}")
+    return out
+
+
+FP8_DECODE_SPLIT = int(os.environ.get("R9K_HC_FP8_DECODE_SPLIT", "16"))
+FP8_DECODE_KB = int(os.environ.get("R9K_HC_FP8_DECODE_KB", "1"))     # blocks per tile along K (split-K in scratch)
+_SCRATCH: dict = {}
+
+
+def _down_scratch(device, N: int, kb: int) -> tuple[int, int]:
+    """Per-(device, N) split-K partials [kb, 16, N] fp32 + per-tile arrival counters; the kernel leaves both ready
+    for the next launch, so one set serves every call on the stream (decode is single-stream)."""
+    key = (device.index, N, kb)
+    t = _SCRATCH.get(key)
+    if t is None:
+        t = (torch.zeros((8, 16, N), dtype=torch.float32, device=device),
+             torch.zeros((N // 16,), dtype=torch.int32, device=device))
+        _SCRATCH[key] = t
+    return t[0].data_ptr(), t[1].data_ptr()
+
+
 def down_silu(xn: torch.Tensor, w: torch.Tensor, lora_rank: int, hc_count: int,
               wq: torch.Tensor | None = None, ws: torch.Tensor | None = None) -> torch.Tensor:
     """[M, N] bf16 = xn [M, K] . w [N, K]^T with hc_silu(., hc) applied to the first lora_rank columns (the merged
     down + injection GEMM); stock's F.linear + hc_silu above MIX_MAX_M rows, the fp8 tiled GEMM from FP8_MIN_M
-    rows when the fp8 weight (wq, ws) is given."""
+    rows when the fp8 weight (wq, ws) is given, the fp8 decode kernel at M <= 16 with R9K_HC_FP8_DECODE=1."""
     from . import router as R
+    if FP8_DECODE and wq is not None and xn.shape[0] <= 16 and xn.stride(1) == 1 and xn.stride(0) % 8 == 0 \
+            and w.shape[1] % (16 * FP8_DECODE_SPLIT * FP8_DECODE_KB) == 0 and w.shape[0] % 16 == 0 \
+            and hasattr(lib(), "r9k_hc_down_f8"):
+        return down_f8(xn, wq, ws, w.shape[0], lora_rank, hc_count)
     out = R.router_gemm(xn, w, True, MIX_SPLIT, lora_rank, float(hc_count), MIX_MAX_M) if mix_available() else None
     if out is None:
         if wq is not None and FP8_DOWN and xn.shape[0] >= FP8_MIN_M:
@@ -169,6 +226,10 @@ def up_mix(lora: torch.Tensor, w_up: torch.Tensor, xn: torch.Tensor, hc_count: i
     M, LR = lora.shape
     DIM = xn.shape[1]
     HD = DIM // hc_count
+    if FP8_DECODE and wq is not None and M <= 16 and hc_count == 4 and LR % 16 == 0 and HD % 16 == 0 \
+            and lora.stride(1) == 1 and lora.stride(0) % 8 == 0 and xn.stride(1) == 1 and xn.stride(0) % 8 == 0 \
+            and hasattr(lib(), "r9k_hc_up_mix_f8"):
+        return up_mix_f8(lora, wq, ws, xn, HD)
     ok = (mix_available() and 1 <= M <= MIX_MAX_M and hc_count == 4 and LR % (8 * lpr) == 0 and 16 <= LR <= 512
           and HD % 2 == 0 and w_up.shape == (DIM, LR) and lora.dtype == w_up.dtype == xn.dtype == torch.bfloat16
           and lora.stride(1) == 1 and w_up.stride(1) == 1 and xn.stride(1) == 1
@@ -297,14 +358,15 @@ def quantize_fp8(model: torch.nn.Module) -> int:
         up = mod.input_mix_weight_up
         if down.weight.shape[1] % 32 or up.weight.shape[1] % 32 or up.weight.shape[0] % 64:
             continue
-        # the down copy only when its path is on (3.4 MB a module, 330 MB a rank of KV cache otherwise)
-        d = F8.quantize_rows_fp8(down.weight.data) if FP8_DOWN else None
+        # the down copy only when a path uses it (3.4 MB a module, 330 MB a rank of KV cache otherwise)
+        d = F8.quantize_rows_fp8(down.weight.data) if (FP8_DOWN or FP8_DECODE) else None
         u = F8.quantize_rows_fp8(F8.hc4_interleave(up.weight.data))   # 16 columns x 4 streams per 64 rows
         mod._r9k_hc_fp8 = (d.wq if d else None, d.ws if d else None, u.wq, u.ws)   # plain tuple, not a parameter
         n += 1
     if n:
-        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load; up%s, %.0f MB a rank)",
-                    n, " + down" if FP8_DOWN else "", n * (3.3 + (3.4 if FP8_DOWN else 0)))
+        logger.info("r9700: hyper-connection fp8 weights quantised on %d modules (after load; up%s, %.0f MB a rank%s)",
+                    n, " + down" if (FP8_DOWN or FP8_DECODE) else "", n * (3.3 + (3.4 if (FP8_DOWN or FP8_DECODE) else 0)),
+                    "; decode on fp8" if FP8_DECODE else "")
     return n
 
 

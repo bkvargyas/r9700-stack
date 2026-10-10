@@ -212,6 +212,106 @@ __global__ void r9k_gemm_fp8_block_kernel(const unsigned char* __restrict__ A, c
   }
 }
 
+// Block-scaled variant with the activation quant fused in (decode widths, M <= 16, one M-tile): A is bf16, each lane
+// keeps its row's 128-group (8 k-steps x 8 values) in registers, the group's absmax meets its other half with one
+// shuffle, the fragments are built with the hardware fp8 convert (RNE, as r9k_quant_group128_fp8), and the
+// per-row scale rides in registers to the fold instead of through As. Same math as quant_group128 + block GEMM
+// (the two operands are bit-identical); one launch instead of two per linear.
+typedef uint16_t v8u16_ __attribute__((ext_vector_type(8)));
+
+template <int NPW>
+__global__ void r9k_gemm_fp8_block_qa_kernel(const uint16_t* __restrict__ X, int lda,
+                                             const v2i* __restrict__ Wp, const float* __restrict__ Bs,
+                                             __hip_bfloat16* __restrict__ C, int M, int K, int N, int ldc, int WV, int SK) {
+  extern __shared__ float red[];
+  const int tid = threadIdx.x, wave = tid / WAVE32, lane = tid % WAVE32;
+  const int col_local = wave / SK, ksplit = wave % SK;
+  const int nt0 = (blockIdx.x * WV + col_local) * NPW;
+  const int Ks = K / SK, kbase = ksplit * Ks;
+  const int nlane = lane & 15, mhalf = (lane >> 4) * 8;
+  const int ksteps = K / 16, kgroups = K / 128;
+  const int arow = nlane < M - 1 ? nlane : M - 1;
+  const uint16_t* xr = X + (size_t)arow * lda + mhalf;
+
+  v8f acc[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) acc[j] = (v8f)(0.f);
+  const int ntmax = N / 16 - 1;
+  int wtile[NPW];
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int t = nt0 + j;
+    wtile[j] = t < ntmax ? t : ntmax;
+  }
+
+  for (int kg0 = kbase; kg0 < kbase + Ks; kg0 += 128) {
+    const int g = kg0 / 128;
+    // this lane's 64 activations of the group: row arow, k = kg0 + s*16 + mhalf + 0..7
+    float xv[8][8];
+    float amax = 0.f;
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      const v8u16_ v = *reinterpret_cast<const v8u16_*>(xr + kg0 + s * 16);
+#pragma unroll
+      for (int b = 0; b < 8; b++) {
+        xv[s][b] = __uint_as_float((unsigned)v[b] << 16);
+        amax = fmaxf(amax, fabsf(xv[s][b]));
+      }
+    }
+    amax = fmaxf(amax, __shfl_xor(amax, 16, WAVE32));          // the row's other k-half
+    amax = fmaxf(amax, 1e-12f);
+    const float inv = 448.f / amax, scale = amax / 448.f;      // as r9k_quant_group128_fp8
+    v8f tmp[NPW];
+#pragma unroll
+    for (int j = 0; j < NPW; j++) tmp[j] = (v8f)(0.f);
+#pragma unroll
+    for (int s = 0; s < 8; s++) {
+      v2i af;
+      int w = __builtin_amdgcn_cvt_pk_fp8_f32(xv[s][0] * inv, xv[s][1] * inv, 0, false);
+      w = __builtin_amdgcn_cvt_pk_fp8_f32(xv[s][2] * inv, xv[s][3] * inv, w, true);
+      af[0] = w;
+      w = __builtin_amdgcn_cvt_pk_fp8_f32(xv[s][4] * inv, xv[s][5] * inv, 0, false);
+      w = __builtin_amdgcn_cvt_pk_fp8_f32(xv[s][6] * inv, xv[s][7] * inv, w, true);
+      af[1] = w;
+      const int kstep = (kg0 + s * 16) / 16;
+#pragma unroll
+      for (int j = 0; j < NPW; j++) {
+        const v2i wf = Wp[((size_t)wtile[j] * ksteps + kstep) * WAVE32 + lane];
+        tmp[j] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(af, wf, tmp[j]);
+      }
+    }
+    // the accumulator rows this lane owns are mhalf + e; their scales sit in lanes (mhalf + e) & 15
+    float sc_e[8];
+#pragma unroll
+    for (int e = 0; e < 8; e++) sc_e[e] = __shfl(scale, (mhalf + e) & 15, WAVE32);
+#pragma unroll
+    for (int j = 0; j < NPW; j++) {
+      const float bs = Bs[(size_t)((wtile[j] * 16) / 128) * kgroups + g];
+#pragma unroll
+      for (int e = 0; e < 8; e++) acc[j][e] += tmp[j][e] * bs * sc_e[e];
+    }
+  }
+
+  const int ncols = WV * NPW;
+  __syncthreads();
+#pragma unroll
+  for (int j = 0; j < NPW; j++) {
+    const int slot = ((col_local * NPW + j) * SK + ksplit) * 256;
+#pragma unroll
+    for (int q = 0; q < 8; q++) red[slot + lane * 8 + q] = acc[j][q];
+  }
+  __syncthreads();
+  for (int t = tid; t < ncols * 256; t += blockDim.x) {
+    const int col = t >> 8, off = t & 255;
+    const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
+    const int m = ((off >> 7) << 3) + (off & 7);
+    if (n >= N || m >= M) continue;
+    float v = 0.f;
+    for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
+    C[(size_t)m * ldc + n] = (__hip_bfloat16)v;
+  }
+}
+
 // Per-token-group (128) dynamic fp8 quant: x [M][K] bf16 -> q [M][K] e4m3, s [M][K/128] fp32. One wave per group.
 __global__ void r9k_quant_group128_fp8_kernel(const __hip_bfloat16* __restrict__ x, unsigned char* __restrict__ q,
                                               float* __restrict__ s, int M, int K, int ld) {
@@ -269,6 +369,32 @@ extern "C" int r9k_gemm_fp8_block(long a, long as, long wq, long bs, long c, int
   }
 #undef LBM
 #undef LB
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// x [M, K] bf16 (row stride lda elements, 16-byte aligned rows), M <= 16; the rest as r9k_gemm_fp8_block with MT = 1.
+extern "C" int r9k_gemm_fp8_block_qa(long x, int lda, long wq, long bs, long c, int M, int K, int N, int ldc, int WV,
+                                     int SK, int NPW, long stream) {
+  if (M <= 0) return 0;
+  if (M > 16) return -7;
+  if (N % 16) return -1;
+  if (K % (128 * SK)) return -2;
+  if (WV * SK * WAVE32 > 1024) return -3;
+  if (lda % 8) return -8;
+  const int ncols = WV * NPW;
+  const size_t smem = (size_t)ncols * SK * 256 * sizeof(float);
+  if (smem > 64 * 1024) return -4;
+  dim3 grid((N / 16 + ncols - 1) / ncols, 1), block(WV * SK * WAVE32);
+  hipStream_t st = (hipStream_t)stream;
+#define LQ(NP) hipLaunchKernelGGL((r9k_gemm_fp8_block_qa_kernel<NP>), grid, block, smem, st, (const uint16_t*)x, lda, \
+                                  (const v2i*)wq, (const float*)bs, (__hip_bfloat16*)c, M, K, N, ldc, WV, SK)
+  switch (NPW) {
+    case 1: LQ(1); break;
+    case 2: LQ(2); break;
+    case 4: LQ(4); break;
+    default: return -5;
+  }
+#undef LQ
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
 

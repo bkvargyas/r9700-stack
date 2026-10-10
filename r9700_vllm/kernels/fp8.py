@@ -24,6 +24,10 @@ def _L():
         L.r9k_gemm_fp8_block.argtypes = [ctypes.c_long] * 5 + [ctypes.c_int] * 8 + [ctypes.c_long]
         L.r9k_quant_group128_fp8.restype = ctypes.c_int
         L.r9k_quant_group128_fp8.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long]
+        if hasattr(L, "r9k_gemm_fp8_block_qa"):
+            L.r9k_gemm_fp8_block_qa.restype = ctypes.c_int
+            L.r9k_gemm_fp8_block_qa.argtypes = [ctypes.c_long, ctypes.c_int] + [ctypes.c_long] * 3 + [ctypes.c_int] * 7 \
+                + [ctypes.c_long]
         if hasattr(L, "r9k_fp8_prefill_mix"):
             L.r9k_fp8_prefill_mix.restype = ctypes.c_int
             L.r9k_fp8_prefill_mix.argtypes = [ctypes.c_long] * 10 + [ctypes.c_int] * 5 + [ctypes.c_long]
@@ -110,6 +114,23 @@ def gemm_fp8_block(a_q: torch.Tensor, a_s: torch.Tensor, wq: torch.Tensor, bs: t
                                  M, K, N, out.stride(0), WV, SK, NPW, MT, _stream())
     if rc:
         raise RuntimeError(f"r9k_gemm_fp8_block failed ({rc}) M={M} N={N} K={K}")
+    return out
+
+
+def gemm_fp8_block_qa(x: torch.Tensor, wq: torch.Tensor, bs: torch.Tensor, N: int, K: int,
+                      out: torch.Tensor | None = None, WV: int = 4, SK: int = 4, NPW: int = 2):
+    """Block-scaled fp8 GEMM with the per-token-group-128 activation quant fused in (M <= 16): x bf16 [M, K]
+    straight in, one launch. Bit-identical operands to quant_group128_fp8 + gemm_fp8_block."""
+    M = x.shape[0]
+    assert x.dtype == torch.bfloat16 and x.stride(1) == 1 and M <= 16
+    if out is None:
+        out = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+    while SK > 1 and K % (128 * SK):
+        SK //= 2
+    rc = _L().r9k_gemm_fp8_block_qa(x.data_ptr(), x.stride(0), wq.data_ptr(), bs.data_ptr(), out.data_ptr(),
+                                    M, K, N, out.stride(0), WV, SK, NPW, _stream())
+    if rc:
+        raise RuntimeError(f"r9k_gemm_fp8_block_qa failed ({rc}) M={M} N={N} K={K}")
     return out
 
 

@@ -7,6 +7,18 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+### Performance (decode step, Flash-Next TP4; `notes/decode-step.md`)
+- **fp8 hyper-connection decode GEMMs** (`kernels/r9k_hc_f8.hip`, `R9K_HC_FP8_DECODE=1`): the down+hc_silu and
+  up+gated-mean kernels at decode widths (M <= 16) read the fp8 fragment-order copies the prefill mix path already
+  holds (half the bytes of the bf16 kernels; the hc weights were the step's largest stream at 1.29 GB), bf16 WMMA
+  on the activations (W8A16, products exact), per-row scale once. 16.42 -> 15.33 ms/step.
+- **Fused activation quant in the dense fp8 block GEMM** (`r9k_gemm_fp8_block_qa`, `R9K_FP8_QA=1`, M <= 16): the
+  per-token-group-128 quant runs inside the GEMM's A-load, operands bit-identical to the two-launch path; 96
+  launches fewer a step. 16.42 -> 16.06; with the fp8 hc decode **15.01 ms/step (-8.6%, single-stream decode
+  199 -> 217 tok/s**, 8/16 concurrent and prefill unchanged). Measured and rejected: a 32 KB one-shot all-reduce cap (+0.35 ms), split-K across blocks for
+  the hc down kernel (`R9K_HC_FP8_DECODE_KB`, slower). Tests: `tests/test_hc_f8.py`, `tests/test_fp8_qa.py`.
+
+
 ### Fixed
 - **Runs on the 2026-10-09 vLLM ROCm 10 nightly** (`8cbd5d03`, 0.31.1rc1, 360 commits past the September pin)
   with the same kernels (`notes/vllm-upgrade-2026-10.md`): the int6 PLE table on vLLM's new PLE embedding
