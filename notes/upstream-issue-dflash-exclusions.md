@@ -1,4 +1,4 @@
-# Upstream issue text for vllm-project/vllm (final, 2026-10-10) -- posting blocked: the gh token here is a fine-grained PAT without issue rights on other repos
+# Upstream issue text for vllm-project/vllm -- posted 2026-10-10 as https://github.com/vllm-project/vllm/issues/61003
 
 Title: [Bug] DFlash draft model: fp8 `ignored_layers` are not aliased to global layer indices, so excluded bf16 projections are loaded into fp8 parameters (acceptance drops from 4.3 to 1.0)
 

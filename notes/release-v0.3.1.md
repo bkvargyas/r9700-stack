@@ -18,8 +18,8 @@ quality, same KV cache, same prefill.** The code of v0.3.0 plus the decode-step 
     15.33 -> 15.01 ms. `=0` splits it again.
 - The plugin also runs on the 2026-10-09 vLLM ROCm 10 nightly (`nightly-rocm100-8cbd5d03`, vLLM 0.31.1rc1) with
   the same kernels; the image pin in `docker/Dockerfile` and the overlay stay on the validated September nightly.
-  That nightly has an upstream bug in the DFlash draft model's fp8 exclusions (`notes/upstream-issue-dflash-exclusions.md`)
-  which the plugin works around.
+  That nightly has an upstream bug in the DFlash draft model's fp8 exclusions ([vllm#61003](https://github.com/vllm-project/vllm/issues/61003),
+  `notes/upstream-issue-dflash-exclusions.md`) which the plugin works around.
 - Measured and left off: a 32 KB one-shot all-reduce cap (+0.35 ms a step), split-K across blocks for the hc
   down kernel, the fused routing + fold (-0.13 ms, two vLLM-runner patches). The decode all-reduce itself is at
   its protocol floor on this PCIe topology (fence and block-count sweeps in `notes/decode-step.md`).
