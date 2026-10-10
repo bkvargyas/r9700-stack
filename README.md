@@ -12,7 +12,8 @@ everything loads at runtime through vLLM's own extension points, so vLLM and ROC
 - **Qwen3.8-27B-NVFP4 on two cards** decodes at parity with that stack (197 tok/s single-stream) with nothing
   third-party loaded at runtime; the two-card Flash-Next runs with its experts streamed from host RAM.
 - **KV cache**: one state page per request for the Gated DeltaNet layers (+64% on the 27B), and on four cards
-  the profiling and cudagraph accounting fixed: Flash-Next TP4 went from 279k to 475k tokens this week.
+  the profiling and cudagraph accounting fixed and the hyper-connection bf16 copies freed: Flash-Next TP4 went
+  from 279k to 516k tokens in ten days (two cards with the experts in host RAM: 133k to 221k).
 - **Quality is gated, not assumed**: every change to a default ships only after the full 1,319-question GSM8K
   set, paired per question against the previous numerics (McNemar), plus HumanEval, strict sanity under
   overload and a mixed-length soak. No default has moved quality by a detectable amount.
@@ -24,16 +25,16 @@ Flash-Next, 4x R9700, TP4, MTP-3 speculative decoding. The reference is the fast
 the same box, checkpoint and power cap (full 20-pass BetterBench, v0.2.0 at 225 W; current code, 210 W, in the
 right-hand column from the 2026-10-09/10 runs):
 
-| | this stack vs reference (BetterBench, v0.2.0, 225 W) | now (2026-10-10, 210 W, probe) |
+| | this stack vs reference (BetterBench, v0.2.0, 225 W) | now (v0.3.2, 2026-10-10, 210 W, probe) |
 |---|--:|--:|
-| single-stream decode | **159 tok/s** vs 134 (+19%) | **217 tok/s** (was 199 on 10-07) |
+| single-stream decode | **159 tok/s** vs 134 (+19%) | **219 tok/s** (was 199 on 10-07) |
 | decode step p50 | **16.8 ms** vs 20.4 | **15.0 ms** (was 16.4) |
 | time to first token p50 | **94 ms** vs 145 | |
 | prefill 2k / 8k / 16k / 32k tok/s | **6,408 / 7,365 / 7,451 / 7,182** vs 5,279 / 5,711 / 5,977 / 6,106 | 8k: 6,850-7,070 |
-| aggregate tok/s at 1 / 2 / 4 / 8 / 16 | **151 / 231 / 350 / 478 / 635** vs 126 / 197 / 303 / 427 / 542 | 8 streams: 550-570, 16: 890-905 |
-| KV cache | | **475k tokens** (was 279k) |
-| GSM8K (1,319 questions, paired vs the previous numerics) | 97.0% vs 96.8% with the fusions off, p = 0.58 | 95.83% vs 95.75%, p = 1.00 |
-| HumanEval | | 161 / 164 |
+| aggregate tok/s at 1 / 2 / 4 / 8 / 16 | **151 / 231 / 350 / 478 / 635** vs 126 / 197 / 303 / 427 / 542 | 8 streams: 582-589, 16: 933-935 |
+| KV cache | | **516k tokens** (was 279k on 10-01, 452k in v0.3.1) |
+| GSM8K (1,319 questions, paired vs the previous numerics) | 97.0% vs 96.8% with the fusions off, p = 0.58 | 95.75% vs 95.83%, p = 1.00 |
+| HumanEval | | 162 / 164 |
 
 Two cards: 27B-NVFP4 197.5 tok/s single-stream, 23.5 ms step, 174 / 280 / 413 / 519 tok/s at 1 / 2 / 4 / 8,
 first token 47 ms; Flash-Next with experts in host RAM 97 tok/s single-stream, link-bound near 115 tok/s
@@ -54,9 +55,9 @@ The serve scripts carry the measured defaults and document each knob next to it;
 kernel back to vLLM's. Tests are in `tests/`, the benchmark and gate tools in `bench/`, the release checklist
 in [notes/picking-up.md](notes/picking-up.md).
 
-**Current release: [v0.3.1](notes/release-v0.3.1.md)** (2026-10-10): the fp8 hyper-connection decode GEMMs and the
-fused activation quant as the four-card defaults (decode step 16.4 -> 15.0 ms, 199 -> 217 tok/s single-stream),
-validated on every configuration; [CHANGELOG.md](CHANGELOG.md) has the full list.
+**Current release: [v0.3.2](notes/release-v0.3.2.md)** (2026-10-10): the hyper-connection weights on fp8 at every
+width and their bf16 copies freed (KV cache +14% on four cards, +33% on two; 8 streams +6%, 16 streams +3%), on top
+of v0.3.1's decode step 16.4 -> 15.0 ms; validated on every configuration; [CHANGELOG.md](CHANGELOG.md) has the full list.
 
 ## Notes for operators
 

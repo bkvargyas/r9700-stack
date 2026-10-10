@@ -7,6 +7,12 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.2] - 2026-10-10
+
+Release notes with the validation record: [notes/release-v0.3.2.md](notes/release-v0.3.2.md).
+
 ### Changed (`notes/decode-step.md` round 3; gate: GSM8K 95.75 vs 95.83 paired p = 1.00, HumanEval 162/164)
 - The fp8 hyper-connection kernels take any row count (token tiles of 16, `R9K_HC_F8_MT` tiles per block);
   `R9K_HC_FP8_DECODE_MAXM` sets the widest row count on them (now 255 by default, was 16). `R9K_HC_FREE_BF16=1`

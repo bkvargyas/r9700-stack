@@ -44,4 +44,30 @@ difference.
 
 ## Validation record (`~/validate-032.sh` on the release tree, 2026-10-10, `~/validate-032.log`)
 
-TBD.
+**Flash-Next TP4.** Probe on launch: 218.8 tok/s single-stream (3.19 tokens a step), 589 / 933 at 8 / 16 streams,
+6,753 prompt tok/s at 8k, KV cache 515,577 tokens. Full 20-pass BetterBench (`r9700-fn4-v032-210w`): combined
+decode 176.8 tok/s (v0.3.1: 177.0), update p99 15.7 ms; concurrency 1 / 2 / 4 / 8: **172.3 / 261.1 / 403.1 /
+514.1** aggregate tok/s (v0.3.1: 168.1 / 266.7 / 392.0 / 495.0); prefill 5,189 / 7,076 / 7,388 / 7,137 tok/s at
+2k / 8k / 16k / 32k (v0.3.1: 5,210 / 7,176 / 7,522 / 7,243: the tiled fp8 down GEMM's activation quant, -1 to -2%).
+Mixed-length soak, 16 clients, 1,507 s: 792 requests ok (v0.3.1: 664), 0 rejections, 0 errors, 6,414 prompt tok/s,
+134.6 output tok/s, VRAM flat at 31,951-31,987 of 32,624 MiB a card throughout (v0.3.1: 31,866-31,902; the extra
+is the KV cache). Strict sanity: 0 bad of 320 after long prompts (the v0.3.1 chain's one-off HTTP 400 did not
+recur), 0 of 1,700 / 1,440 / 1,920 at 17 / 24 / 32 clients. Server errors 0; the two MES timeouts in dmesg are
+the 2026-10-09 ones.
+
+**27B-NVFP4 TP2** (unchanged code path). Probe: 210.6 tok/s single-stream (4.30 tokens a step), 582 / 657 at
+8 / 16 streams, 3,948 prompt tok/s at 8k, KV 367,494 tokens. Soak 16 clients, 1,559 s: 292 ok, 0 errors, 10
+refused by the server for exceeding the 32,768-token context (this run's prompts reached 32,333 tokens), 3,147
+prompt tok/s, VRAM 32,428 -> 32,496 MiB. Strict sanity: 0 bad of 320 after long prompts, 0 of 900 at 9 clients,
+0 of 720 / 960 at 12 / 16 clients. Server errors 0.
+
+**Flash-Next TP2 (experts in host RAM; the fp8 decode path and the freed copies are new here).** Probe: 122.5
+tok/s single-stream (3.13 tokens a step), 177 / 163 at 8 / 16 streams, 2,587 prompt tok/s at 8k, **KV 221,184
+tokens (v0.3.1: 166,818)**. Soak 16 clients, 1,557 s: 244 ok, 0 rejections, 0 errors, 2,420 prompt tok/s, VRAM flat at 31,407-31,429 MiB. Strict sanity: 0 bad of 320 after long prompts, 0 of 900 / 720 / 960 at 9 / 12 / 16 clients. Server errors 0.
+
+**Comm tests.** 4-rank all-gather and all-reduce (one-shot + two-shot, graph replay interleaved) bit-exact, 2-rank race test ALL OK.
+
+**Kernel gates (single GPU, in the image):** atiled_4bit, fold_mxfp4, prefill_4bit, tuned_cfgs, moe_mxfp4, nvfp4,
+cache_moe, gemm_fp8, gdn_merge ALL OK; moe_route_r9k, moe_sum_r9k, fp8_prefill_r9k PASS; on a copy of the same tree
+(card 4): test_hc_f8 (exact to 300 rows), test_fp8_qa, test_hc_mix_r9k, test_router_r9k PASS. Chain finished
+22:43 UTC; everything green.
