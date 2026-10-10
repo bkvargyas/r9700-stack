@@ -140,7 +140,9 @@ def main():
             for mode, cap in ((1, ar.max1), (2, ar.max_bytes)):
                 per = {}
                 if nbytes <= cap:
-                    for nb in ((1, 2, 4, 8, 16) if mode == 1 else (4, 8, 16, 32, 64, 128, 256)):
+                    nbs = [int(v) for v in os.environ["NBS"].split(",")] if os.environ.get("NBS") else \
+                        ((1, 2, 4, 8, 16) if mode == 1 else (4, 8, 16, 32, 64, 128, 256))
+                    for nb in nbs:
                         if nb <= ar.L.r9k_ar_max_blocks():
                             per[nb] = graph_time(lambda: ar.all_reduce(x, nb=nb, mode=mode), reps=20 if tok >= 1024 else 50)
                 res[mode] = per

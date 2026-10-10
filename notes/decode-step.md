@@ -108,3 +108,30 @@ bit-identical to the two-launch path (its operands are the same bytes), so its s
   bf16), fused-quant block GEMMs 1.36 (from 1.90), MoE GEMMs 2.78, two-shot all-reduce 1.27, GDN verify 0.53,
   topk 0.37, router 0.30; 12.0 ms of kernel time in all.
 - The all-reduce (98 x 12.8 us) and the ~1,700-kernel serial chain are what separate 15.0 ms from radiance's 12.1.
+
+## The all-reduce (2026-10-10, Brian: "Let's work on the all-reduce now")
+
+101 two-shot all-reduces a step (48 layers x 2, plus the MTP layer's), 20 KB each at MTP-3 (4 tokens x 2560 bf16),
+12.8 us each in the step. Measured on four ranks in HIP graphs (`tests/test_ar_nrank.py`, `~/arnsweep.log`):
+
+| message | RCCL | one-shot | two-shot |
+|---|---:|---:|---:|
+| 5 KB (1 token) | 60 us | **6.8** | 11.4 |
+| 20 KB (4 tokens) | 73 | 13.4 (over the 16 KB cap) | **11.4** |
+| 80 KB (16 tokens) | 70 | 37 | 24.4 |
+
+The two-shot costs the same at 5 KB and 20 KB: at decode sizes its time is protocol, not bytes. The fence sweep
+(`R9K_AR_FENCE` drain,acq = 4,2 default / 4,0 / 2,2 / 2,0 / 0,0 / 3,1) moved the 20 KB two-shot by nothing
+(11.3-11.5 us; 3,1 is 12.0): the release store and acquire poll are free. The block count is free too
+(`~/arnnb.log`: 1-12 blocks all 11-13 us at 20 KB; the serving policy's 2 blocks are 11). What remains per call: ~3 us of graph
+node (the per-kernel cost measured above), two handshakes at ~2.9 us each (a flag has to cross switch A, the root
+complex and switch B: ~1.5-2 us one way, then the poll sees it), ~1.6 us of data, ~1 us of reduce + copy. The
+one-shot has one handshake but pushes 60 KB a rank, 80 KB a direction across the switches at ~12 GB/s = 6.6 us,
+which is why it loses above 16 KB.
+
+Nothing cheaper is on offer on this topology without changing what is on the wire: a tag-in-data (NCCL "LL")
+format removes the flag but not the latency and costs 1.33-2x the bytes; a pair-first hierarchy trades a cross
+handshake for an intra-switch one and a remote read whose ordering against a third device's flag is not sound
+without those tags; a lossy wire (fp8 / int8) saves under 1 us of the 1.6 us of data. The all-reduce is within
+~1 us of its floor here; the lever left is the handshake COUNT (two per layer, inherent to row-parallel TP) and the
+node overhead, i.e. fusing the all-reduce into its neighbours, which is the same fatter-kernel project as the rest.
