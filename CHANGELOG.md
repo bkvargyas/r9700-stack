@@ -7,12 +7,13 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-### Added (off by default until the gate and the validation; `notes/decode-step.md` round 3)
+### Changed (`notes/decode-step.md` round 3; gate: GSM8K 95.75 vs 95.83 paired p = 1.00, HumanEval 162/164)
 - The fp8 hyper-connection kernels take any row count (token tiles of 16, `R9K_HC_F8_MT` tiles per block);
-  `R9K_HC_FP8_DECODE_MAXM` sets the widest row count on them (default 16, the v0.3.1 behaviour).
-  `R9K_HC_FREE_BF16=1` (with `R9K_HC_FP8_DOWN=1`) drops the bf16 up / down weights after quantisation. Measured
-  at TP4 with `MAXM=255`: 8 streams +5.6%, 16 streams +1.4%; with the copies freed +70k KV tokens (+17%), 16
-  streams +3.4%, 8k prefill -0.8%.
+  `R9K_HC_FP8_DECODE_MAXM` sets the widest row count on them (now 255 by default, was 16). `R9K_HC_FREE_BF16=1`
+  (with `R9K_HC_FP8_DOWN=1`, both now default) drops the bf16 up / down weights after quantisation: **KV cache
+  452k -> 516k tokens at TP4 (+14%), 167k -> 221k at TP2 (+33%)**, 8 streams +5.6% and 16 streams +3.4% at TP4,
+  8k prefill -0.8% (the tiled fp8 down GEMM's activation quant), single-stream unchanged; the fp8 decode path is
+  on at TP2 as well now (the freed pair outweighs its down copy). `R9K_HC_FREE_BF16=0` restores v0.3.1.
 
 ## [0.3.1] - 2026-10-10
 

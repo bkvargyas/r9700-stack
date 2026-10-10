@@ -166,8 +166,26 @@ KV figures compare with each other but not with warm records):
 
 The wider kernels alone: +5.6% at 8 streams, +1.4% at 16, nothing else moves. Freeing the bf16 copies on top:
 +70k KV tokens cold-against-cold (+17%), 16 streams +3.4%, 8k prefill -0.8% (the tiled fp8 down GEMM's activation
-quant above 255 rows, as `notes/prefill-fp8-pipe.md` measured), short prompts unchanged.
+quant above 255 rows, as `notes/prefill-fp8-pipe.md` measured), short prompts unchanged. Warm against warm
+(`~/k6.log`, base / free / base / free): **452,115 / 515,577 / 452,115 / 515,577 tokens** (+63k, +14%); the log
+line reads "bf16 copies freed on 97 (1310 MB)" plus the MTP layer's 3 (40 MB).
+
+Two cards with the experts in host RAM (TP2, `~/k6.log`, warm against warm, the fp8 decode path on with it):
+KV **166,818 -> 221,184 tokens (+33%)** -- here the freed bf16 pair outweighs the fp8 down copy that kept the
+decode path off at TP2 in v0.3.1 -- single-stream 120.1 -> 122.5 tok/s, 8 streams 185 -> 174 and 16 streams
+153 -> 163 (the TP2 probe's 8/16-stream numbers swing +-6% between runs of one config), 8k prefill unchanged.
 
 A first pass of this A/B ran on a serving tree that had never received the v0.3.1 launcher defaults (both new
 paths off: 198 tok/s single-stream, "quantised ... up, 320 MB a rank" in the log) and measured nothing about the
 kernels; `feedback`: sync serve/ with the code, read the quantise log line before trusting an A/B.
+
+### Gate (2026-10-10, `~/gate2-run.log`): candidate = both knobs on (`MAXM=255`, `FP8_DOWN=1`, `FREE_BF16=1`), base = v0.3.1 defaults, same tree, conc 1
+
+| | GSM8K 1,319 | HumanEval | strict sanity |
+|---|---:|---:|---|
+| v0.3.1 defaults | 95.83% (1,264) | HE_BASE | 0 bad of 1,040 |
+| option 2 | 95.75% (1,263) | **162 / 164** | 0 bad of 1,040 |
+
+Paired: base-only-right 11, candidate-only-right 10, McNemar p = 1.00; outputs identical on 18.5% (the fp8 weights
+now reach every row count, so most answers differ in bf16 bits somewhere). No detectable difference. Both knobs and
+the 255-row cap become the `serve/flashnext.sh` defaults at TP2 and TP4 (`R9K_HC_FREE_BF16=0` keeps the bf16 pair).

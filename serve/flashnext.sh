@@ -45,12 +45,17 @@ exec env \
   R9K_HC_FP8=${R9K_HC_FP8-r9k} `    # the hyper-connection up GEMM + sigmoid-gated mean fused in fp8 from 256 rows
                                     # (268 vs 674 us a layer at 4096): +4% prefill, decode untouched; GSM8K paired
                                     # p=0.86, HumanEval 160/164. =stock for the bf16 pair` \
-  R9K_HC_FP8_DECODE=${R9K_HC_FP8_DECODE-$([ "${TP:-2}" = 4 ] && echo 1 || echo 0)} `  # TP4: the hyper-connection
-                                              # down + up GEMMs at decode widths (<= 16 tokens) on the same fp8 copies
-                                              # (bf16 WMMA, W8A16): 16.42 -> 15.33 ms/step, 2026-10-09; GSM8K paired
-                                              # with the fused quant below, HumanEval 161/164 (notes/decode-step.md).
-                                              # Off at TP2: the fp8 down copy there costs 30k KV tokens (133k -> 103k)
-                                              # for +10% single-stream and nothing at 8 streams. =0 / =1 overrides` \
+  R9K_HC_FP8_DECODE=${R9K_HC_FP8_DECODE-1} `  # the hyper-connection down + up GEMMs on the fp8 copies (bf16 WMMA,
+                                              # W8A16) up to R9K_HC_FP8_DECODE_MAXM rows: 16.42 -> 15.33 ms/step at
+                                              # TP4 (2026-10-09, 16 rows); to 255 rows +5.6% at 8 streams (10-10).
+                                              # GSM8K paired, HumanEval 161/164 (notes/decode-step.md). =0 for bf16` \
+  R9K_HC_FP8_DECODE_MAXM=${R9K_HC_FP8_DECODE_MAXM-255} `  # widest row count on those kernels; above it the tiled
+                                              # fp8 GEMMs (R9K_HC_FP8_MINM=256)` \
+  R9K_HC_FP8_DOWN=${R9K_HC_FP8_DOWN-1} `      # the hc down GEMM on the tiled fp8 path above 255 rows (-0.8% at 8k
+                                              # prefill: its activation quant) so that the bf16 weights can go` \
+  R9K_HC_FREE_BF16=${R9K_HC_FREE_BF16-1} `    # drop the bf16 hyper-connection weights after quantisation: 1.3 GB a
+                                              # card of KV cache (TP4 452k -> 516k tokens, TP2 167k -> 221k); +3% at
+                                              # 16 streams. =0 keeps them (and the hipBLASLt bf16 path above 16 rows)` \
   R9K_FP8_BLOCK=${R9K_FP8_BLOCK-block} `   # block-fp8 projections on our split-K GEMM at decode widths, stock's
                                            # Triton kernel above M=64 (R9K_FP8_BLOCK_MAXM); 2026-09-24: +6% decode` \
   R9K_FP8_QA=${R9K_FP8_QA-1} `             # ... with the per-token fp8 quant fused into that GEMM (same operands bit
