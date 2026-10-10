@@ -1,4 +1,4 @@
-# Draft upstream issue (vllm-project/vllm), 2026-10-10 -- not yet posted; see notes/vllm-upgrade-2026-10.md for the investigation
+# Upstream issue text for vllm-project/vllm (final, 2026-10-10) -- posting blocked: the gh token here is a fine-grained PAT without issue rights on other repos
 
 Title: [Bug] DFlash draft model: fp8 `ignored_layers` are not aliased to global layer indices, so excluded bf16 projections are loaded into fp8 parameters (acceptance drops from 4.3 to 1.0)
 
@@ -8,13 +8,18 @@ vLLM 0.31.1rc1.dev173+g8cbd5d030 (nightly ROCm 10 image `vllm/vllm-openai-rocm:n
 
 ### Description
 
-`Qwen3.8-27B-DFlash2-FP8` (DFlash2 drafter, fp8 checkpoint) lists the modules its quantization must skip under `quantization_config.modules_to_not_convert` by checkpoint-local names, e.g.
+Target: `unsloth/Qwen3.8-27B-NVFP4` (compressed-tensors NVFP4, 64 layers). Drafter: an FP8 block-128 conversion of `z-lab/Qwen3.8-27B-DFlash2` (`DFlash2DraftModel`, 5 layers, `quant_method: fp8`, `weight_block_size: [128, 128]`). The drafter's `quantization_config.modules_to_not_convert` has 45 entries naming the modules its quantization must skip by checkpoint-local layer index, e.g.
 
 ```
+layers.0.attention_conv.base_kernel
 layers.0.attention_conv.kernel_projection
+layers.0.mlp_conv.base_kernel
+layers.0.mlp_conv.kernel_projection
+layers.0.input_layernorm
+...
 ```
 
-vLLM builds the draft layers at global indices after the target's layers (`start_layer_id` = 64 for this target), and `vllm/model_executor/models/qwen3_dflash.py::_add_global_draft_layer_exclusions` exists to add the globally-numbered aliases. It only patches `quant_config.exclude_modules`:
+vLLM builds the draft layers at global indices after the target's layers (`start_layer_id` = 64 for this target), and `vllm/model_executor/models/qwen3_dflash.py::_add_global_draft_layer_exclusions` (called from the draft model's `__init__` with `start_layer_id`) exists to add the globally-numbered aliases. It only patches `quant_config.exclude_modules`:
 
 ```python
 exclusions = getattr(quant_config, "exclude_modules", None)
@@ -22,7 +27,7 @@ if not isinstance(exclusions, list):
     return
 ```
 
-`Fp8Config` does not have `exclude_modules`; it reads `modules_to_not_convert` into `ignored_layers` and matches them with `ignored_layers_match_mode` (exact by default). So the global name `layers.64.attention_conv.kernel_projection` never matches, the grouped-conv kernel projections are built as fp8 linears, and the loader logs
+`Fp8Config` has no `exclude_modules`; `from_config` reads `modules_to_not_convert` into `ignored_layers`, and `ignored_layers_match_mode` is `"exact"` (`vllm/model_executor/layers/quantization/fp8.py`). So the global name `layers.64.attention_conv.kernel_projection` never matches, the grouped-conv kernel projections are built as fp8 linears, and the loader logs
 
 ```
 Attempted to load weight layers.0.attention_conv.kernel_projection.weight with dtype torch.bfloat16 into parameter with dtype torch.float8_e4m3fn
@@ -46,8 +51,8 @@ Working around it from outside (adding `layers.{i+start}` and `model.layers.{i+s
 ### Reproduction
 
 ```
-vllm serve /models/Qwen3.8-27B-NVFP4 --tensor-parallel-size 2 \
-  --speculative-config '{"model": "/models/Qwen3.8-27B-DFlash2-FP8", "num_speculative_tokens": 7}'
+vllm serve unsloth/Qwen3.8-27B-NVFP4 --tensor-parallel-size 2 \
+  --speculative-config '{"model": "<fp8 conversion of z-lab/Qwen3.8-27B-DFlash2>", "num_speculative_tokens": 7}'
 ```
 
 then watch for the dtype-mismatch load message above and `vllm:spec_decode_num_accepted_tokens_total / vllm:spec_decode_num_drafts_total` in `/metrics` during a decode (~1.0 per draft instead of ~4.3).
