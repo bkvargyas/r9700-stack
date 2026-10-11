@@ -71,3 +71,21 @@ tokens (v0.3.1: 166,818)**. Soak 16 clients, 1,557 s: 244 ok, 0 rejections, 0 er
 cache_moe, gemm_fp8, gdn_merge ALL OK; moe_route_r9k, moe_sum_r9k, fp8_prefill_r9k PASS; on a copy of the same tree
 (card 4): test_hc_f8 (exact to 300 rows), test_fp8_qa, test_hc_mix_r9k, test_router_r9k PASS. Chain finished
 22:43 UTC; everything green.
+
+## On the production host (VM 102 on 192.168.0.32: two R9700 on Gen5 root ports behind the emulated switch, 192 GB, 2026-10-11)
+
+First run of the stack on the production box, v0.3.2, `OVERLAYS=emulated-switch`, 210 W:
+
+| | 27B-NVFP4 TP2 | Flash-Next TP2, experts in host RAM |
+|---|---:|---:|
+| single-stream decode | 217.4 tok/s (4.25 tokens a step) | **143.0** (test box: 122.5) |
+| 8 / 16 streams | 604 / 670 | **257 / 245** (test box: 177 / 163) |
+| 8k prefill | 4,143 | **3,724** (test box: 2,594) |
+| KV cache | 367,494 tokens | 171,287 (cold compile cache) |
+| strict sanity, 9 clients x 20 | 0 bad of 180 | 0 bad of 180 |
+
+The Flash-Next-with-offload numbers are the Gen5 host links: the expert traffic that is link-bound on the Gen3
+test box is not here. Host RAM in use with it loaded: 118 GB (the VM had 96 GB until today; the workers were
+OOM-killed at the 19.4 GiB pinned PLE table plus 34 GB of expert offload per rank). Flash-Next soak, 16 clients,
+635 s: 137 ok, 0 errors, 3,291 prompt tok/s (test box: 2,420); 0 bad of 80 after long prompts; server errors 0.
+The 27B is what stays up on the box (port 8080).
