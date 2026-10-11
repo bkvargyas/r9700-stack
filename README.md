@@ -6,6 +6,8 @@ loads at runtime through vLLM's own extension points, so vLLM and ROCm update un
 
 Current release: **v0.3.2** (2026-10-10), [release notes](notes/release-v0.3.2.md), [CHANGELOG.md](CHANGELOG.md).
 
+![r9700-stack v0.3.2: what the kernels do, the speed, how to deploy](docs/r9700-stack-v0.3.2.png)
+
 ## What the kernels do
 
 - **MoE experts**: grouped MXFP4 x fp8 GEMMs with the routing, activation, per-token quant and top-k sum fused
