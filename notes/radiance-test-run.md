@@ -288,3 +288,40 @@ faster, our prefill 25-40%. Quality is equal within noise on both. The concurren
 gone in 1.3.0 as they were in 1.2.0. The "server error lines" counts in the log are the word "default" matching
 `fault`; the logs have no errors. Evals `~/.r9keval/radiance130-{fn-tp4,27b-tp2}.json`, BetterBench logs
 `~/rad130-*.bb.log` on the test box.
+
+## 1.4.0 against our v0.3.2 (2026-10-12)
+
+Brian: "new radiance engine came out, can you test against our 3.2 release?". 1.4.0 (image published 2026-10-12,
+151 MB; four commits past 1.3.0: a scheduler change that leaves a long prefill the rest of the step's room
+(`--busy-prefill-chunk`), the image ships curl / jq / a CA bundle so `--model` can fetch a Hugging Face repo, and
+the hfget tool runs under the image's busybox). Same compose files and `.rad` model files as 1.3.0, same checklist
+(`~/radtest140.sh` -> `~/radtest140.log`), sequentially: Flash-Next TP4 on HIP 0-3 (:8010), then the 27B TP2 on HIP
+4,5 (:8011), then our own 27B on v0.3.2 on the same two cards for a fresh BetterBench; 210 W / -42 mV, clients from
+the v0.3.2 tree. Our Flash-Next column is the v0.3.2 release record (`notes/release-v0.3.2.md`, two days earlier on
+this box).
+
+| | Flash-Next TP4: radiance 1.4.0 | radiance 1.3.0 (10-09) | ours v0.3.2 | 27B TP2: radiance 1.4.0 | ours v0.3.2 |
+|---|--:|--:|--:|--:|--:|
+| probe: decode / 8 conc / 16 conc / 8k prefill | 251 / 726 / 749 / 5,533 | 265 / 798 / 836 / 5,367 | 219 / 589 / 933 / 6,753 | 142 / 449 / 681 / 3,455 | 212-217 / 585-604 / 621-670 / 3,910-4,143 |
+| strict sanity (long prompts; conc N+1; conc 2N; after the soak) | 0 bad of 160 / 900 / 960 / 360 | clean | 0 of 5,060 | 0 bad of 160 / 1,700 / 1,920 / 680 | 0 of 1,040 |
+| GSM8K 1,319, no thinking, conc 1 | 95.83% (1,264) | 95.83% | 95.75% (1,263) | 95.91% (1,265) | 95.75-95.91% |
+| HumanEval 164 | 160 | 158 | 162 | 160 | 159-162 |
+| BetterBench combined decode / update p99 | 213.7 / 13.0 ms | 221.9 / 12.9 | 176.8 / 15.7 | 116.8 / 36.5 ms (1.3.0: 130.7 / 31.8) | **197.0** / 23.5 ms |
+| concurrency 1 / 2 / 4 / 8 (aggregate tok/s) | 194 / 292 / 422 / 536 | 196 / 309 / 402 / 537 | 172 / 261 / 403 / 514 | 103 / 190 / 312 / 448 (1.3.0: 121 / 219 / 342 / 475) | **180 / 308 / 428 / 600** |
+| prefill 2k / 8k / 16k / 32k / 64k (tok/s) | 5,183 / 5,436 / 5,378 / 5,444 / 5,474 | 4,870 / 5,270 / 5,224 / 5,281 / 5,291 | 5,189 / 7,076 / 7,388 / 7,137 / (32k max) | 3,260 / 3,370 / 3,374 / 3,293 / 3,079 | **3,789 / 3,999 / 3,955 / 3,745** / (32k max) |
+| soak, 16 clients, 25 min | 421 ok, 0 errors, 4,078 prompt tok/s | 456 ok, 3,994 | 792 ok, 0 errors, 6,414 | 260 ok, 0 errors, 2,715 prompt tok/s (1.3.0: 262 ok, 2,567) | 292 ok, 0 errors, 3,147 |
+
+Reading it: 1.4.0 is 1.3.0 with a scheduler change, and on this box it measures a little below 1.3.0 everywhere
+(Flash-Next TP4 BetterBench 213.7 vs 221.9, the 27B 116.8 vs 130.7, concurrency within a few percent) -- the
+`--busy-prefill-chunk` default seems to cost it something in these mixed workloads; its prefill is unchanged.
+Against our v0.3.2 the picture is the one from 1.3.0, with the gaps narrower on the decode side: on four cards
+radiance decodes 21% faster single-stream and leads BetterBench 213.7 to 176.8 and at 1-8 streams
+(194 / 292 / 422 / 536 vs 172 / 261 / 403 / 514), while we lead at 16 streams in the probe (933 vs 749), on
+prefill from 8k up by 30-37% (7,076 / 7,388 / 7,137 vs 5,436 / 5,378 / 5,444) and in the soak (792 vs 421 requests,
+6,414 vs 4,078 prompt tok/s); radiance runs 64k contexts here, we stop at 32k. On the 27B ours leads everywhere:
+BetterBench 197.0 vs 116.8, concurrency 180 / 308 / 428 / 600 vs 103 / 190 / 312 / 448, prefill 3,999 vs 3,370 at
+8k, soak 292 vs 260 requests. Quality equal within noise on both (GSM8K 95.83 / 95.91 vs 95.75; HumanEval 160 vs
+162 / 159-162). Nothing broke on either side: strict sanity 0 bad everywhere, 0 errors in every soak, and the
+"server error lines: 88" in the log is the word "default" matching `fault` again (0 real error lines in the
+container logs while they were up). Our 27B BetterBench had one 2.4 s TTFT p99 outlier at 4 streams (p50 122 ms).
+Evals `~/.r9keval/radiance140-{fn-tp4,27b-tp2}.json`, BetterBench logs `~/rad140-*.bb.log` and `~/ours27b-v032.bb.log`.
