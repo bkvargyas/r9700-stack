@@ -60,3 +60,45 @@ hipBLASLt, RCCL, rocWMMA, ROCr and the LLVM major are the 10.0 versions. The one
 on our path. Building vLLM from source on it would be a compatibility check with noise-level deltas expected. The
 interesting target is what is landing on `develop` for 10.2: the gfx1201 hipBLASLt tuning and the RCCL gfx120x
 protocol changes. Recommendation: do not build on 10.1; re-check at 10.2.
+
+## ROCm 10.2: what is landing (public sources, 2026-10-13)
+
+No release date is stated. TheRock `main` moved to 10.2.0 on 2026-09-10, a BKC branch was cut on 2026-09-22
+(`release/bkc/therock-10.2-20260922`), nightlies `10.2.0a...` since 2026-09-11, no release branch yet; at AMD's
+"approximately every six weeks" cadence and 10.1's four weeks from BKC cut to release, late October to mid
+November 2026 is an inference. https://github.com/ROCm/TheRock/pull/8134 ,
+https://github.com/ROCm/rocm-libraries/pull/12431
+
+Changes on `develop` worth knowing:
+
+- **HIP 7.17**: stream priorities disabled ("priority streams are currently not supported"); `__hip_bfloat162`
+  comparison fixes ("code that relied on the previous results may see different values"); the HRR capture feature
+  disabled; new hipModuleEnumerateFunctions / hipLibraryGetModule. No graph, dispatch or memory entries.
+  https://raw.githubusercontent.com/ROCm/rocm-systems/develop/projects/clr/CHANGELOG.md
+- **RCCL rebased onto NCCL 2.31.2 then 2.32.3**: per-architecture threshold table (`RCCL_IGNORE_ARCH_TABLE`),
+  `RCCL_CE_ALLREDUCE` (copy-engine all-reduce) now auto-enabled, breaking `NCCL_GIN_TYPE` values, a changed
+  `rcclSelectAllGather` signature, a P2P IPC registration fix. No gfx12 entry. The gfx120x "LL can deadlock
+  single-node gfx1200/gfx1201 collectives" PR (default to Simple) is still open and unapproved.
+  https://raw.githubusercontent.com/ROCm/rocm-systems/develop/projects/rccl/CHANGELOG.md ,
+  https://github.com/ROCm/rocm-systems/pull/13151
+- **hipBLASLt 1.5.0**: fixes a `hipErrorIllegalAddress` crash on gfx1201 with DirectToVgpr transpose loads;
+  OpenCL backend removed from TensileLite; solution ids churn (1.4.1 tuning tables are rejected by 1.5.0). The
+  gfx1201 GEMM tuning PR (-9.9% GEMM time) is still open.
+  https://raw.githubusercontent.com/ROCm/rocm-libraries/develop/projects/hipblaslt/CHANGELOG.md ,
+  https://github.com/ROCm/rocm-libraries/pull/13306
+- **LLVM**: still 24.0.0 on amd-staging, no 25 bump visible (low codegen risk for the WMMA / fp8 builtins).
+- **CK / rocprofiler / AMD SMI**: no 10.2 entries of note; deprecations carried over (hipFFT/rocFFT callback APIs,
+  AMD SMI UUID -> CUID); no OS or Python support changes found.
+- **PyTorch**: `torch 2.14.0+rocm10.2.0a` nightlies exist (also 2.13 / 2.12). vLLM: no statement on 10.2.
+- **MES / TLB invalidation**: the kernel-side rework is still under review (2026-09-11), not in mainline as of
+  October 1; nothing in 10.2's user space addresses the `INVALIDATE_TLBS` timeouts.
+- **The one HIP change in flight that could move decode**: PR 11212 (device-resident ordering edges, host-memory
+  signal polling across streams and graphs), motivated by "decode performance in several vLLM workloads regressed
+  in ROCm 7.14 and ROCm 10 ToT relative to ROCm 7.2.4" (-19.6% TPOT on MI355X); changes requested 2026-10-06,
+  gfx12 support unstated. https://github.com/ROCm/rocm-systems/pull/11212
+
+What it means for this stack at 10.2: the hostcall-free RCCL build must be re-ported onto the 2.32 tree and
+re-soaked with `NCCL_PROTO` and `RCCL_CE_ALLREDUCE` pinned explicitly (our own P2P all-reduce covers decode;
+RCCL serves prefill above 512 KB); anything relying on stream priorities silently loses it; custom kernels using
+`__hip_bfloat162` comparisons may change outputs (ours use scalar bf16 and fp32); hipBLASLt tuning tables need
+regenerating; and PR 11212 is the one to watch for decode.
