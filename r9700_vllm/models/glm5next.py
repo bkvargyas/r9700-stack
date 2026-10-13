@@ -24,6 +24,8 @@ R9K_DISABLE=glm5next leaves stock alone.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 from vllm.logger import init_logger
 
@@ -120,6 +122,57 @@ class _AiterOpsProxy:
         return getattr(self._real, name)
 
 
+# ------------------------------------------------------------------------------- sparse MLA on libr9k
+def _install_sparse_mla() -> bool:
+    """Route the sparse-MLA backend's attention through kernels/r9k_sparse_mla.hip. Stock's fp8-pool path is CDNA
+    assembly and its Triton path is bf16-only, so an fp8 KV cache has no gfx1201 kernel without this. Taken when the
+    KV cache is fp8 (R9K_SPARSE_MLA=stock opts out) or when R9K_SPARSE_MLA=r9k asks for it on a bf16 cache too. Only
+    the rope-free, kv_lora_rank 512 geometry (GLM-5.3-Flash); anything else runs the stock method."""
+    from ..attn import sparse_mla as SM
+    if not SM.available():
+        return False
+    from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as B
+    cls = B.ROCMAiterMLASparseImpl
+    orig = cls.forward_mqa
+    mode = os.environ.get("R9K_SPARSE_MLA", "auto")
+
+    def forward_mqa(self, q, kv_c_and_k_pe_cache, attn_metadata, layer):
+        fp8_attention = self.kv_cache_dtype.startswith("fp8")
+        take = mode == "r9k" or (mode == "auto" and fp8_attention)
+        if not take or self.kv_lora_rank != 512 or getattr(self, "qk_rope_head_dim", 0) != 0 or self.sinks is not None:
+            return orig(self, q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        if isinstance(q, tuple):
+            ql_nope, q_pe = q
+            if q_pe.shape[-1] != 0:
+                return orig(self, q, kv_c_and_k_pe_cache, attn_metadata, layer)
+            q = ql_nope                                        # rope-free: the latent query is the whole query
+        if q.dtype != torch.bfloat16:
+            return orig(self, q, kv_c_and_k_pe_cache, attn_metadata, layer)
+        n = attn_metadata.num_actual_tokens
+        topk_indices = B.fit_kpool_indices_to_aiter(self.topk_indices_buffer[:n], attn_metadata.topk_tokens)
+        kv, block_stride_rows = B.flat_kv_row_view(kv_c_and_k_pe_cache, attn_metadata.block_size)
+        B.triton_convert_req_index_to_global_index(
+            attn_metadata.req_id_per_token, attn_metadata.block_table, topk_indices, attn_metadata.paged_kv_indptr,
+            attn_metadata.paged_kv_indices, BLOCK_SIZE=attn_metadata.block_size, BLOCK_STRIDE_ROWS=block_stride_rows,
+            NUM_TOPK_TOKENS=attn_metadata.topk_tokens)
+        if fp8_attention:
+            kv = kv.view(torch.float8_e4m3fn)
+            desc = getattr(layer, "_r9k_kv_descale", None)
+            if desc is None:
+                desc = layer._r9k_kv_descale = float(layer._k_scale)      # once: fixed scale, no per-call sync
+        else:
+            desc = 1.0
+        out = torch.empty((q.shape[0], self.num_heads, self.kv_lora_rank), dtype=attn_metadata.attn_out_dtype,
+                          device=q.device)
+        SM.sparse_mla(q[:n].contiguous() if not q[:n].is_contiguous() else q[:n], kv, attn_metadata.paged_kv_indices,
+                      attn_metadata.paged_kv_indptr, self.scale, descale=desc, out=out[:n])
+        return out, None
+
+    forward_mqa.__r9k_patch__ = "glm5next_rdna4"
+    cls.forward_mqa = forward_mqa
+    return True
+
+
 def patch() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -146,6 +199,11 @@ def patch() -> bool:
             done.append("indexer:aiter-gate")
     except Exception as e:
         logger.warning("r9700: glm5next indexer gate not installed (%s)", e)
+    try:
+        if os.environ.get("R9K_SPARSE_MLA", "auto") != "stock" and _install_sparse_mla():
+            done.append("sparse-mla:libr9k(%s)" % os.environ.get("R9K_SPARSE_MLA", "auto"))
+    except Exception as e:
+        logger.warning("r9700: glm5next sparse MLA hook not installed (%s)", e)
     _PATCHED = True
     logger.info("r9700: glm5next on RDNA4: %s", ", ".join(done) or "nothing to do")
     return bool(done)
