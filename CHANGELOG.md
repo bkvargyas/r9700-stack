@@ -7,7 +7,18 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+- **The image pin moves to the 2026-10-12 vLLM ROCm 10 nightly** (`nightly-rocm100-fe4df3df`, vLLM
+  0.31.1rc1.dev296, torch 2.12+rocm10.0; `docker/Dockerfile`), from the September one. Same kernels; the plugin's
+  October compatibility fixes carry it. Flash-Next TP4 decode step 15.0 -> 14.3 ms, single-stream 219 -> 225 tok/s,
+  16 streams +2%, 8 streams and prefill unchanged (`notes/decode-step.md` round 4). The emulated-switch overlay
+  needs its patched pair regenerated for this image (`overlay/emulated-switch/patch-hostcall.sh`). The routing and
+  fold patches (`R9K_MOE_ROUTE`, `R9K_MOE_FOLD`, off since v0.3.0) do not start on this vLLM and are not re-ported.
+
+### Added
+- The fused MoE decode path (`R9K_MOE_FUSE=1`, `kernels/r9k_moe_mxfp4a8.hip` FUSE 1 / 2): silu(gate) * up in the
+  gate_up GEMM's epilogue, the per-row fp8 quant inside the down GEMM's A-load, bit-identical outputs
+  (`tests/test_moe_fused.py`). Off: it measures the same step time as the three-launch path.
 
 ## [0.3.2] - 2026-10-10
 

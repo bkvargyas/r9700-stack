@@ -26,6 +26,9 @@ def lib() -> ctypes.CDLL:
         L = ctypes.CDLL(path)
         L.r9k_moe_mxfp4a8.restype = ctypes.c_int
         L.r9k_moe_mxfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
+        if hasattr(L, "r9k_moe_mxfp4a8_f"):
+            L.r9k_moe_mxfp4a8_f.restype = ctypes.c_int
+            L.r9k_moe_mxfp4a8_f.argtypes = [ctypes.c_int] + [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_moe_nvfp4a8.restype = ctypes.c_int
         L.r9k_moe_nvfp4a8.argtypes = [ctypes.c_long] * 12 + [ctypes.c_int] * 9 + [ctypes.c_long]
         L.r9k_moe_4bit_prefill.restype = ctypes.c_int
@@ -395,7 +398,7 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
              sorted_ids: torch.Tensor, expert_ids: torch.Tensor, ntpp: torch.Tensor, numel: int,
              a_row_div: int, topk_w: torch.Tensor | None = None, WV: int = 2, SK: int = 4, NPW: int = 2,
              num_experts: int | None = None, MT: int = 1, ldsa: bool = False, prefill: int | None = None,
-             a_tiled: bool = False):
+             a_tiled: bool = False, fuse: int = 0):
     """out[r, :] = dequant(a_q[r // a_row_div]) @ W[expert(r)]^T (* topk_w[r]) for every routed flat row r.
 
     sorted_ids/expert_ids must come from moe_align_block_size(block_size=16*MT). MT M-tiles per workgroup share
@@ -409,8 +412,28 @@ def moe_gemm(a_q: torch.Tensor, a_s: torch.Tensor, w: Mxfp4Experts, out: torch.T
     a_tiled: a_q is the fragment-tiled buffer of quant_rows_fp8(tiled=True) in sorted-position order (dense:
     identity tables) and `prefill` is an A-tiled cfg (atiled_block(cfg) rows per block); MXFP4 only, w.fold picks
     the folded or the fp32-per-group variant."""
-    assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     E = num_experts if num_experts is not None else w.wq.shape[0]
+    if fuse:
+        # fuse 1: gate_up with silu(g)*u in the epilogue -> out fp32 [numel, N/2]; fuse 2: down with the fp32 A rows
+        # quantised on load (a_s unused). Decode direct path (MT == 1), MXFP4 experts (kernels/r9k_moe_mxfp4a8.hip).
+        assert isinstance(w, Mxfp4Experts) and MT == 1 and prefill is None and not a_tiled
+        assert a_q.shape[1] == w.K and (out.dtype == torch.float32 and out.shape[1] == w.N // 2 if fuse == 1
+                                        else out.dtype == torch.bfloat16 and out.shape[1] == w.N)
+        if fuse == 2:
+            assert a_q.dtype == torch.float32 and a_row_div == 1
+        blk = MOE_BLOCK
+        max_blocks = min(expert_ids.numel(), (numel + blk - 1) // blk + min(numel, E))
+        rc = lib().r9k_moe_mxfp4a8_f(
+            fuse, a_q.data_ptr(), a_s.data_ptr() if a_s is not None else 0, w.wq.data_ptr(), w.wsr.data_ptr(),
+            w.wsr.data_ptr() + (w.K // GROUP) * w.N, out.data_ptr(),
+            sorted_ids.data_ptr(), expert_ids.data_ptr(), ntpp.data_ptr(),
+            topk_w.data_ptr() if topk_w is not None else 0,
+            w.estride, w.estride, max_blocks, numel, a_row_div, w.K, w.N, WV, SK, NPW, 1 | (16 if w.fold else 0),
+            _stream())
+        if rc:
+            raise RuntimeError(f"r9k_moe_mxfp4a8_f failed ({rc}) fuse={fuse} N={w.N} K={w.K} WV={WV} SK={SK} NPW={NPW}")
+        return out
+    assert out.dtype == torch.bfloat16 and out.shape[1] == w.N and a_q.shape[1] == w.K
     if a_tiled:
         assert prefill is not None and isinstance(w, Mxfp4Experts), "a_tiled: MXFP4 prefill only"
         blk = atiled_block(prefill)

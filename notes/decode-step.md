@@ -189,3 +189,28 @@ kernels; `feedback`: sync serve/ with the code, read the quantise log line befor
 Paired: base-only-right 11, candidate-only-right 10, McNemar p = 1.00; outputs identical on 18.5% (the fp8 weights
 now reach every row count, so most answers differ in bf16 bits somewhere). No detectable difference. Both knobs and
 the 255-row cap become the `serve/flashnext.sh` defaults at TP2 and TP4 (`R9K_HC_FREE_BF16=0` keeps the bf16 pair).
+
+## Round 4 (2026-10-13, Brian: "1+3, go ahead"): the nightly pin and the MoE glue
+
+**The October nightlies.** v0.3.2's code on `nightly-rocm100-8cbd5d03` (2026-10-09; the plugin's compatibility fixes
+are from the week before): the four-card step **15.0 -> 14.4 ms**, single-stream 219 -> 225-228 tok/s, 16 streams
+938-948 (`~/nn1.log`, `~/k7.log`). The 8-stream probe read 451-473 on every cold-compile-cache first launch of this
+image and 597-630 warm (the old pin: 550-589); concurrent-burst measurements with the draft counters
+(`~/nn-diag.log`: 8 x 384-token essays) give 610-626 tok/s on the new image against 617-623 on the old, 2.4 tokens a
+step on both, so the "regression" is a first-launch artifact and the validation must warm the cache before it
+measures. The routing + fold patches fail to start on this vLLM (the rebound `MoERunner.forward` unpacks three
+values from a changed return): they stay off and are not re-ported for 0.13 ms. The 2026-10-12 nightly
+(`fe4df3df`, vLLM 0.31.1rc1.dev296) passes every kernel gate (`~/gates-fe4d.log`); its serving numbers below.
+
+**The fused MoE decode path** (`kernels/r9k_moe_mxfp4a8.hip` FUSE 1 / 2, `R9K_MOE_FUSE=1`): the gate_up block owns
+gate tile x and up tile x + N/32, rounds both GEMM outputs to bf16 as the separate kernel stored them and writes
+silu(g) * u as fp32; the down GEMM quantises those rows on load (the two K-half lanes split the absmax read, the
+hardware convert builds the fragments, amax/448 reaches the epilogue through LDS). Bit-identical down outputs to
+the three-launch path in `tests/test_moe_fused.py` (plain and folded MXFP4, four shapes). Serving on the 10-09
+nightly (`~/k7.log`, warm): base 14.41-14.42 ms/step, fused 14.51; 8 streams 596-597 vs 591, 16 streams 938-948 vs
+926: **no gain from removing the 48 silu+quant launches**. With the wave count of the tuned config restored
+(`R9K_MOE_CFG1=1,16,2`, `~/k8.log`): 14.52-14.53 ms, 8 streams 590, 16 streams 922 -- the same. The fp32
+activation and the in-kernel row quant cost what the separate launch cost; the launch itself was overlapped, as the
+2026-10-07 round found for the routing and the fold. The path stays in the tree (`R9K_MOE_FUSE=1`, tested) and off.
+The combine-norm-emits-fp8 idea (-48 quant launches) is not built: the same argument says it would measure the
+same. Part 3 of this round therefore ships nothing by default; the step gain of the round is the nightly.

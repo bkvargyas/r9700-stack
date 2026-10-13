@@ -54,6 +54,7 @@
 
 typedef int   v2i __attribute__((ext_vector_type(2)));
 typedef float v8f __attribute__((ext_vector_type(8)));
+typedef float v4f __attribute__((ext_vector_type(4)));
 
 __device__ __constant__ unsigned int kMag[16][2] = {
   {0x3c383000u, 0x4c484440u}, {0x34302800u, 0x44403c38u},
@@ -175,7 +176,15 @@ __device__ __forceinline__ void lds_barrier() {
 
 // FOLD (MXFP4 only): folded-exponent unpack (see mxfp4_unpack8_fold), no per-group FMAs, 2^(Wref - 127) in the
 // epilogue. Selected per weight tensor by the host (MT bit 4).
-template <int MT, int NPW, bool NV, bool LDSA, bool FOLD>
+// FUSE (decode direct path only, MT == 1):
+//   1 = gate_up with the activation in the epilogue: the block owns gate tile blockIdx.x and up tile blockIdx.x +
+//       N/32 (NPW == 2, WV == 1), rounds both GEMM outputs to bf16 as the separate kernel stored them, writes
+//       silu(g) * u as fp32 [numel, N/2] (C reinterpreted as float*): the per-row quant moves into the down GEMM.
+//   2 = down with the A rows quantised on load: A is that fp32 [numel, K] buffer, As unused; each lane takes its
+//       row's absmax (the two K-half lanes split the read and meet with one shuffle), converts 8 values a K step
+//       with the hardware fp8 convert and carries amax/448 to the epilogue through LDS (sAs, after the reduce
+//       buffer). Same bytes and scales as r9k_silu_mul_quant_fp8 + the fp8 path, one launch fewer a layer.
+template <int MT, int NPW, bool NV, bool LDSA, bool FOLD, int FUSE = 0>
 __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
     const unsigned char* __restrict__ A, const float* __restrict__ As,
     const unsigned int* __restrict__ Wp_all, const unsigned char* __restrict__ Ws_all,
@@ -188,6 +197,8 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
   constexpr int BLK = 16 * MT;
   static_assert(!(LDSA && MT == 1), "LDS A staging is for MT > 1");
   static_assert(!(NV && FOLD), "folding is for E8M0 (MXFP4) scales");
+  static_assert(FUSE == 0 || (MT == 1 && !LDSA), "the fused epilogue / A quant are decode (MT == 1) paths");
+  static_assert(FUSE != 1 || NPW == 2, "FUSE 1 pairs the gate tile with its up tile (NPW == 2)");
   const int by = blockIdx.y;
   if (by * BLK >= ntpp[0]) return;
   const int e = expert_ids[by];
@@ -217,8 +228,24 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
     for (int i = 0; i < MT; i++) {
       int flat = sorted_ids[by * BLK + i * 16 + nlane];
       if (flat >= numel) flat = first;
-      aoff[i] = (unsigned)(flat / a_row_div) * (unsigned)K + mhalf;
+      aoff[i] = ((unsigned)(flat / a_row_div) * (unsigned)K + mhalf) * (FUSE == 2 ? 4u : 1u);
     }
+  }
+  // FUSE 2: this lane's row absmax over all K (the two K-half lanes each read half, then meet), scale to LDS
+  float a_inv = 0.f;
+  float* const sAs = FUSE == 2 ? red + (size_t)(WV * NPW) * SK * 256 : nullptr;
+  if constexpr (FUSE == 2) {
+    const float* arow = (const float*)((const unsigned char*)A + aoff[0] - mhalf * 4u);   // row start
+    const int half = K / 2, h = lane >> 4;
+    float am = 0.f;
+    for (int k = h * half; k < (h + 1) * half; k += 4) {
+      const v4f v = *(const v4f*)(arow + k);
+      am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fmaxf(fabsf(v[2]), fabsf(v[3])), am));
+    }
+    am = fmaxf(am, __shfl_xor(am, 16, WAVE32));
+    am = fmaxf(am, 1e-12f);
+    a_inv = 448.f / am;
+    if (wave == 0 && lane < 16) sAs[nlane] = am / 448.f;       // read in the epilogue after its barrier
   }
 
   // LDS staging bookkeeping (LDSA): this thread's 16-byte chunks of the SK x BLK x DBK slab.
@@ -252,7 +279,7 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
   unsigned woff[NPW], soff[NPW];                    // byte offsets: weight fragment stream, scale column
 #pragma unroll
   for (int j = 0; j < NPW; j++) {
-    const int t = nt0 + j;
+    const int t = FUSE == 1 ? (int)blockIdx.x + j * (N / 32) : nt0 + j;     // FUSE 1: gate tile, its up tile
     const int wt = t < ntmax ? t : ntmax;
     woff[j] = ((unsigned)wt * (unsigned)ksteps * WAVE32 + lane) * 4u;
     soff[j] = (unsigned)(wt * 16 + nlane);
@@ -329,7 +356,19 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
         for (int j = 0; j < NPW; j++)
           wv[j][sidx] = ld_nt_u32off<(MT == 1)>(Wp, woff[j] + (unsigned)(kg / 16 + sidx) * (WAVE32 * 4));
 #pragma unroll
-        for (int i = 0; i < MT; i++) af[sidx][i] = ld_u32off((const v2i*)A, aoff[i] + (unsigned)(kg + sidx * 16));
+        for (int i = 0; i < MT; i++) {
+          if constexpr (FUSE == 2) {
+            const unsigned o = aoff[i] + (unsigned)(kg + sidx * 16) * 4u;
+            const v4f a0 = ld_u32off((const v4f*)A, o), a1 = ld_u32off((const v4f*)A, o + 16u);
+            int w0 = __builtin_amdgcn_cvt_pk_fp8_f32(a0[0] * a_inv, a0[1] * a_inv, 0, false);
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(a0[2] * a_inv, a0[3] * a_inv, w0, true);
+            int w1 = __builtin_amdgcn_cvt_pk_fp8_f32(a1[0] * a_inv, a1[1] * a_inv, 0, false);
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(a1[2] * a_inv, a1[3] * a_inv, w1, true);
+            af[sidx][i][0] = w0; af[sidx][i][1] = w1;
+          } else {
+            af[sidx][i] = ld_u32off((const v2i*)A, aoff[i] + (unsigned)(kg + sidx * 16));
+          }
+        }
       }
       R9K_GROUP(kg, af, wv)
     }
@@ -410,6 +449,23 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
       for (int q = 0; q < 8; q++) red[slot + lane * 8 + q] = acc[j][i][q];
     }
     __syncthreads();
+    if constexpr (FUSE == 1) {
+      // one thread per (row, gate column): the up column sits in reduce slot col 1 at the same offset
+      for (int off = tid; off < 256; off += blockDim.x) {
+        const int nl = (off >> 3) & 15, ng = blockIdx.x * 16 + nl, nu = ng + N / 2;
+        const int mrow = ((off >> 7) << 3) + (off & 7);
+        if (ng >= N / 2) continue;
+        const int fr = sorted_ids[by * BLK + mrow];
+        if (fr >= numel) continue;
+        float vg = 0.f, vu = 0.f;
+        for (int s = 0; s < SK; s++) { vg += red[s * 256 + off]; vu += red[(SK + s) * 256 + off]; }
+        const float as_ = As[fr / a_row_div];
+        const float sg = (NV ? Wg[ng] : (FOLD ? __uint_as_float((unsigned)Wref[ng] << 23) : 1.f)) * as_;
+        const float su = (NV ? Wg[nu] : (FOLD ? __uint_as_float((unsigned)Wref[nu] << 23) : 1.f)) * as_;
+        const float g = (float)(__hip_bfloat16)(vg * sg), u = (float)(__hip_bfloat16)(vu * su);   // as stored before
+        ((float*)C)[(size_t)fr * (N / 2) + ng] = g / (1.f + __expf(-g)) * u;
+      }
+    } else {
     for (int t = tid; t < ncols * 256; t += blockDim.x) {
       const int col = t >> 8, off = t & 255;
       const int n = (blockIdx.x * ncols + col) * 16 + ((off >> 3) & 15);
@@ -419,9 +475,11 @@ __global__ void __launch_bounds__(LDSA ? 256 : 1024) r9k_moe_mxfp4a8_kernel(
       if (fr >= numel) continue;                                  // padding row
       float v = 0.f;
       for (int s = 0; s < SK; s++) v += red[(col * SK + s) * 256 + off];
-      float sc = (NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f)) * As[fr / a_row_div];
+      float sc = (NV ? Wg[n] : (FOLD ? __uint_as_float((unsigned)Wref[n] << 23) : 1.f))
+                 * (FUSE == 2 ? sAs[mrow] : As[fr / a_row_div]);
       if (topk_w) sc *= topk_w[fr];
       C[(size_t)fr * N + n] = (__hip_bfloat16)(v * sc);
+    }
     }
   }
 }
@@ -501,8 +559,11 @@ extern "C" int r9k_fold_supported(void) { return 1; }       // folded-exponent M
 
 static int moe_launch(bool nv, long a, long as, long wq, long ws, long wref, long c, long sorted_ids,
                       long expert_ids, long ntpp, long topk_w, long ws_estride, long wref_estride, int max_blocks,
-                      int numel, int a_row_div, int K, int N, int WV, int SK, int NPW, int MT, long stream) {
+                      int numel, int a_row_div, int K, int N, int WV, int SK, int NPW, int MT, long stream,
+                      int fuse = 0) {
   if (N % 16) return -1;
+  if (fuse == 1) { if ((MT & 7) != 1 || N % 32 || topk_w) return -8; WV = 1; NPW = 2; }
+  if (fuse == 2) { if ((MT & 7) != 1 || K % 8) return -8; }
   if (K % (SK * (nv ? 16 : GROUP))) return -2;
   if (WV * SK * WAVE32 > 1024) return -3;
   const int ncols = WV * NPW;
@@ -520,18 +581,27 @@ static int moe_launch(bool nv, long a, long as, long wq, long ws, long wref, lon
   // without this check WV=1, MT=4 staged half the tile and read uninitialized LDS (NaN at serving batch 64).
   ldsa = ldsa && MT > 1 && K % (SK * LDSA_DBK) == 0 && WV * SK <= 8 && (2 * MT) % WV == 0 && (2 * MT) / WV <= LDSA_NCH;
   if (ldsa) { const size_t s2 = (size_t)SK * 16 * MT * LDSA_STR; if (s2 > smem) smem = s2; }
+  if (fuse == 2) smem += 16 * sizeof(float);                       // sAs
   if (smem > 64 * 1024) return -4;
-  dim3 grid((N / 16 + ncols - 1) / ncols, max_blocks), block(WV * SK * WAVE32);
+  dim3 grid(fuse == 1 ? N / 32 : (N / 16 + ncols - 1) / ncols, max_blocks), block(WV * SK * WAVE32);
   hipStream_t st = (hipStream_t)stream;
-#define L(MTv, NP, NVv, LD, FO) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP, NVv, LD, FO>), grid, block, smem, st, \
+#define LF(MTv, NP, NVv, LD, FO, FU) hipLaunchKernelGGL((r9k_moe_mxfp4a8_kernel<MTv, NP, NVv, LD, FO, FU>), grid, block, smem, st, \
       (const unsigned char*)a, (const float*)as, (const unsigned int*)wq, (const unsigned char*)ws, \
       (const unsigned char*)wref, (__hip_bfloat16*)c, (const int*)sorted_ids,                        \
       (const int*)expert_ids, (const int*)ntpp, (const float*)topk_w, ws_estride, wref_estride, numel,  \
       a_row_div, K, N, WV, SK)
+#define L(MTv, NP, NVv, LD, FO) LF(MTv, NP, NVv, LD, FO, 0)
 #define LN(MTv, NP, LD) do { if (nv) L(MTv, NP, true, LD, false); else if (fold) L(MTv, NP, false, LD, true); \
                              else L(MTv, NP, false, LD, false); } while (0)
 #define LM(MTv, LD) switch (NPW) { case 1: LN(MTv, 1, LD); break; case 2: LN(MTv, 2, LD); break; \
                                    case 4: LN(MTv, 4, LD); break; default: return -5; }
+#define LFN(NP, FU) do { if (nv) LF(1, NP, true, false, false, FU); else if (fold) LF(1, NP, false, false, true, FU); \
+                         else LF(1, NP, false, false, false, FU); } while (0)
+  if (fuse == 1) { LFN(2, 1); return hipGetLastError() == hipSuccess ? 0 : -6; }
+  if (fuse == 2) {
+    switch (NPW) { case 1: LFN(1, 2); break; case 2: LFN(2, 2); break; case 4: LFN(4, 2); break; default: return -5; }
+    return hipGetLastError() == hipSuccess ? 0 : -6;
+  }
   switch (MT) {
     case 1: LM(1, false); break;
     case 2: if (ldsa) LM(2, true) else LM(2, false); break;
@@ -541,7 +611,20 @@ static int moe_launch(bool nv, long a, long as, long wq, long ws, long wref, lon
 #undef LM
 #undef LN
 #undef L
+#undef LFN
+#undef LF
   return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// fuse: 1 = gate_up with silu(g)*u in the epilogue (c = fp32 [numel, N/2]; WV/NPW forced to 1/2), 2 = down with
+// the A rows quantised on load (a = fp32 [numel, K], as ignored). MT == 1 only. Same args otherwise.
+extern "C" int r9k_moe_mxfp4a8_f(int fuse, long a, long as, long wq, long ws, long wref, long c,
+                                 long sorted_ids, long expert_ids, long ntpp, long topk_w,
+                                 long ws_estride, long wref_estride, int max_blocks, int numel, int a_row_div, int K, int N,
+                                 int WV, int SK, int NPW, int MT, long stream) {
+  if (fuse < 1 || fuse > 2) return -8;
+  return moe_launch(false, a, as, wq, ws, wref, c, sorted_ids, expert_ids, ntpp, topk_w, ws_estride, wref_estride,
+                    max_blocks, numel, a_row_div, K, N, WV, SK, NPW, MT, stream, fuse);
 }
 
 // Returns 0 on success, negative on a shape error (the Python side raises).

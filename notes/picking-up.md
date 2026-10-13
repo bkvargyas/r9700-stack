@@ -220,7 +220,7 @@ and the only honest lever left.
 
 ### vLLM upgrade — done once (2026-10-09), the recipe that worked
 
-`notes/vllm-upgrade-2026-10.md`. In short: pull the `nightly-rocm100-<sha>` image (never the `v0.x` release
+`notes/vllm-upgrade-2026-10.md` (current pin: `fe4df3df`, 2026-10-12). In short: pull the `nightly-rocm100-<sha>` image (never the `v0.x` release
 images: those are ROCm 7), build `r9700/vllm:dev-<sha>` with `docker/Dockerfile` (the bare nightly has no plugin),
 run `overlay/emulated-switch/patch-hostcall.sh` with `IMG=` / `OUT=` for it, `IMG=... ~/gates4.sh`, then serve
 with `IMG=... PATCHED=...`. Three plugin fixes were needed for 360 commits of drift; the validation chain's

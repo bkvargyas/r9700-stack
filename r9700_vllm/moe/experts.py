@@ -52,6 +52,10 @@ def _legal(cfg: tuple[int, int, int], W) -> tuple[int, int, int]:
 
 
 FUSED_ACT = os.environ.get("R9K_FUSED_ACT", "1") == "1"
+# R9K_MOE_FUSE=1: at decode (MT == 1, MXFP4 experts) the activation moves into the gate_up GEMM's epilogue and the
+# per-row quant into the down GEMM's A-load (kernels/r9k_moe_mxfp4a8.hip FUSE): r9k_silu_mul_quant_fp8 is not
+# launched. Same bytes and scales, one launch fewer a layer.
+MOE_FUSE = os.environ.get("R9K_MOE_FUSE", "0") == "1"
 FUSED_SUM = os.environ.get("R9K_FUSED_SUM", "1") == "1"
 ZERO_DOWN = os.environ.get("R9K_MOE_ZERO_DOWN", "0") == "1"
 # Cold-pass strategy by step width (routed rows = tokens x top-k). Measured 2026-09-18, MTP-3, 270 slots:
@@ -183,12 +187,23 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
                     passes.append((c1, c2, cold_al))
 
         xq, xs = K.quant_rows_fp8(hidden_states)
-        gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
-        for W1, _, (sid, eid, ntpp) in passes:
-            K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *_legal(CFG_GATE_UP, W1),
-                       num_experts=global_num_experts, MT=MT, prefill=pf_gate)
+        fused = MOE_FUSE and MT == 1 and pf_gate is None and pf_down is None \
+            and all(isinstance(W1, K.Mxfp4Experts) and isinstance(W2, K.Mxfp4Experts) for W1, W2, _ in passes)
+        if fused:
+            act = torch.empty((numel, N1 // 2), dtype=torch.float32, device=dev)
+            for W1, _, (sid, eid, ntpp) in passes:
+                K.moe_gemm(xq, xs, W1, act, sid, eid, ntpp, numel, topk, None, *_legal(CFG_GATE_UP, W1),
+                           num_experts=global_num_experts, MT=1, fuse=1)
+            aq, as_ = act, None
+        else:
+            gate_up = torch.empty((numel, N1), dtype=torch.bfloat16, device=dev)
+            for W1, _, (sid, eid, ntpp) in passes:
+                K.moe_gemm(xq, xs, W1, gate_up, sid, eid, ntpp, numel, topk, None, *_legal(CFG_GATE_UP, W1),
+                           num_experts=global_num_experts, MT=MT, prefill=pf_gate)
 
-        if FUSED_ACT:
+        if fused:
+            pass
+        elif FUSED_ACT:
             aq, as_ = K.silu_mul_quant_fp8(gate_up)           # one launch: silu*mul + per-row fp8 quant
         else:
             act = torch.empty((numel, N1 // 2), dtype=torch.bfloat16, device=dev)
@@ -206,7 +221,8 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         tw = topk_weights.reshape(-1).to(torch.float32)
         for _, W2, (sid, eid, ntpp) in passes:
             K.moe_gemm(aq, as_, W2, down, sid, eid, ntpp, numel, 1, tw, *_legal(CFG_DOWN, W2),
-                       num_experts=global_num_experts, MT=MT, prefill=pf_down)
+                       num_experts=global_num_experts, MT=1 if fused else MT, prefill=None if fused else pf_down,
+                       fuse=2 if fused else 0)
         folded = fold.installed(self)                     # the runner no longer adds the shared output: we must
         if FUSED_SUM and hasattr(K.lib(), "r9k_moe_sum"):
             shared = fold.shared_output(self, M, N2) if folded else None
