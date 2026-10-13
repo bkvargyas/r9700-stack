@@ -4,7 +4,7 @@ Tuned GPU kernels and a vLLM plugin that make **Qwen3.8** run fast on **AMD Rade
 (gfx1201 / RDNA4) on **stock vLLM and stock ROCm**. No fork, no patched source, no vendored binaries: everything
 loads at runtime through vLLM's own extension points, so vLLM and ROCm update underneath it.
 
-Current release: **v0.3.2** (2026-10-10), [release notes](notes/release-v0.3.2.md), [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.3.3** (2026-10-13), [release notes](notes/release-v0.3.3.md), [CHANGELOG.md](CHANGELOG.md).
 
 ![r9700-stack v0.3.2: what the kernels do, the speed, how to deploy](docs/r9700-stack-v0.3.2.png)
 
@@ -29,21 +29,22 @@ Current release: **v0.3.2** (2026-10-10), [release notes](notes/release-v0.3.2.m
 
 Every default ships gated: the full 1,319-question GSM8K set paired per question against the previous numerics
 (McNemar), HumanEval, strict sanity under overload, a 25-minute mixed-length soak on every configuration, the
-multi-rank communication tests and the kernel unit gates. v0.3.2: GSM8K 95.75% (paired p = 1.00 against v0.3.1),
-HumanEval 162 / 164, 0 bad answers in 5,060 strict-sanity checks, 0 errors in 1,328 soak requests.
+multi-rank communication tests and the kernel unit gates. v0.3.2 kernels (unchanged in v0.3.3): GSM8K 95.75% (paired
+p = 1.00 against v0.3.1), HumanEval 162 / 164; v0.3.3 validation: 0 bad answers in 5,060 strict-sanity checks,
+0 errors in 1,224 soak requests.
 
-## Speed (v0.3.2, 210 W with a -42 mV offset, 32k context)
+## Speed (v0.3.3, 210 W with a -42 mV offset, 32k context)
 
 **Qwen3.8-Flash-Next (MXFP4 experts, fp8 dense), four cards, TP4, MTP-3**
 
 | | |
 |---|---:|
-| single-stream decode | 219 tok/s, 15.0 ms a step |
-| aggregate decode at 1 / 2 / 4 / 8 streams (BetterBench) | 172 / 261 / 403 / 514 tok/s |
-| aggregate decode at 8 / 16 streams (probe) | 582-589 / 933-935 tok/s |
+| single-stream decode | 225 tok/s, 14.3 ms a step |
+| aggregate decode at 1 / 2 / 4 / 8 streams (BetterBench) | 175 / 277 / 410 / 530 tok/s |
+| aggregate decode at 8 / 16 streams (probe) | 620 / 944 tok/s |
 | time to first token | 70-80 ms |
-| prompt processing at 2k / 8k / 16k / 32k | 5,189 / 7,076 / 7,388 / 7,137 tok/s |
-| KV cache | 515,577 tokens |
+| prompt processing at 2k / 8k / 16k / 32k | 5,175 / 7,141 / 7,489 / 7,233 tok/s |
+| KV cache | 518,481 tokens |
 
 **Qwen3.8-Flash-Next, two cards, TP2, experts in host RAM**
 
@@ -74,7 +75,7 @@ Requirements: 2x or 4x Radeon AI PRO R9700, ROCm 10 on the host, docker, the mod
    ```
    docker build -t r9700/vllm:dev docker/
    ```
-   The pinned nightly is in `docker/Dockerfile` (`--build-arg BASE=` for another).
+   The pinned nightly (2026-10-12) is in `docker/Dockerfile` (`--build-arg BASE=` for another).
 2. **Serve**:
    ```
    bash serve/27b.sh                                                  # 27B-NVFP4, two cards
