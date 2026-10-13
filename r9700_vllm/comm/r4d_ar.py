@@ -147,6 +147,13 @@ class R9kCommunicator(CudaCommunicator):
                 ar = R9kAllReduceN(self.cpu_group, self.device)
                 if not ar.disabled:
                     self._r9k_ar = ar
+                    # TP=8 on four switches: the flat one-shot collapses (126-288 us); the hierarchical
+                    # pair / cross / pair composition stays ~20 us (comm/r9k_ar8.py). R9K_AR8=0 keeps flat.
+                    if ws == 8 and os.environ.get("R9K_AR8", "1") == "1":
+                        from .r9k_ar8 import R9kAllReduce8
+                        a8 = R9kAllReduce8(self.cpu_group, self.device, flat=ar)
+                        if not a8.disabled:
+                            self._r9k_ar = a8
             elif "tp" in (getattr(self, "unique_name", "") or "") and ws == 2 and r9k_available():
                 # Ours is the default (kernels/r9k_ar.hip + r9k_ar_wht.hip, no libr4d). R9K_AR_IMPL=r4d keeps
                 # libr4d's for A/B. Together with R9K_PAGED_ATTN=r9k this makes the default configuration
