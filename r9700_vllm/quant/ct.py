@@ -42,6 +42,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
     CompressedTensorsW4A4Fp4,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    CompressedTensorsW8A16Fp8,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
@@ -360,6 +363,15 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         scheme = super().get_scheme(layer=layer, layer_name=layer_name)
         if scheme is None or not r9k_available():
             return scheme
+        if isinstance(scheme, CompressedTensorsW8A16Fp8) and not _off("fp8_w8a16") \
+                and not scheme.is_static_input_scheme:
+            # fp8 weight-only linears (W8A16: fp8 weights, bf16 activations; e.g. the dense/shared/attention
+            # projections of coolbho3k's GLM-5.3-Flash NVFP4 export). Stock serves them through CUDA Marlin only, so
+            # on ROCm the kernel search fails at construction. Serve them as W8A8 dynamic instead (same fp8 bytes
+            # and scales, activations quantized per token / per 128-group like the fp8 base checkpoints), which the
+            # branches below then put on libr9k. R9K_DISABLE=fp8_w8a16 keeps stock.
+            scheme = CompressedTensorsW8A8Fp8(weight_quant=scheme.weight_quant, is_static_input_scheme=False)
+            logger.info_once("r9700: fp8 weight-only (W8A16) linears -> W8A8 dynamic fp8 (no ROCm W8A16 kernel)")
         if isinstance(scheme, CompressedTensorsW4A4Mxfp4) and not _off("linear"):
             from ..linear.mxfp4 import R9700Mxfp4LinearKernel
             from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig

@@ -11,6 +11,7 @@ register():
   * DFlash/DFlash2 drafters with fp8 attention (context-KV dequant)          models/dflash.py
   * attention backend CUSTOM = TRITON_ATTN + split-KV for spec verify      attn/triton3d.py
   * one version-gated monkeypatch: MTP k>1 attention-type allowlist          spec/mtp_rocm.py
+  * GLM-5.3-Flash on RDNA4: indexer aiter gate + the missing _C top-k ops      models/glm5next.py
 Only engages on ROCm. R9K_DISABLE=quant,models,mtp turns individual pieces off (R9K_PLATFORM=0 for the platform).
 """
 import os
@@ -57,5 +58,9 @@ def register() -> None:
         from .spec import mtp_rocm
         if mtp_rocm.patch():
             done.append("patch:mtp_allowlist")
+    if not _disabled("glm5next"):
+        from .models import glm5next
+        if glm5next.patch():
+            done.append("patch:glm5next_rdna4")
     plat = type(current_platform).__name__
     log.info("r9700_vllm %s registered: %s (platform %s)", __version__, ", ".join(done) or "nothing", plat)

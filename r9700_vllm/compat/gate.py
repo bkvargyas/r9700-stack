@@ -21,6 +21,8 @@ TESTED = {
     # the decoder layer's post-attention tail as one op with the two all-reduces pipelined by row parts
     # (comm/pipe.py): Qwen4ExpDecoderLayer.forward, RowParallelLinear.reduce_results, moe_config.skip_final_all_reduce
     "layer_tail_pipe": (("e97573215",), "vllm: an all-reduce / compute overlap for row-local layer tails"),
+    # GLM-5.3-Flash sparse indexer on RDNA4: is_enabled() gate + the _C top-k ops the ROCm wheel lacks (models/glm5next.py)
+    "glm5next_rdna4": (("fe4df3df0",), "vllm: RDNA4 (is_rdna_aiter_enabled) support in models/glm5next/amd + ROCm top_k_per_row kernels"),
 }
 
 
