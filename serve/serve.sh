@@ -4,7 +4,7 @@
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
 # Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
-#   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
+#   side by side need distinct GPUS/PORT/NAME), SERVED_NAME=Qwen3.8 (the model name the API serves), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -126,7 +126,7 @@ sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host ${PIDNS--
   $DOCKER_ARGS "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
   -v $HOME/vllmstock-triton:/root/.triton \
   "${ENTRY[@]}" $IMG "${PRE[@]}" ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} \
-  --served-model-name Qwen3.8 --host 0.0.0.0 --port ${PORT:-8080} \
+  --served-model-name ${SERVED_NAME:-Qwen3.8} --host 0.0.0.0 --port ${PORT:-8080} \
   --tensor-parallel-size ${TP:-2} --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
   --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization $UTIL \
   "${OFFL[@]}" \
