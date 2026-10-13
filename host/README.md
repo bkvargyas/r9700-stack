@@ -273,3 +273,42 @@ once**, data checks OK (chains A and B: 25.23); a cross-chain pair 25.32. `p2pte
 pairs 12.5-13.0 GB/s one-way; its RCCL phase fails `hipIpcGetMemHandle` in `r9700/vllm:dev` without the overlay (the
 known IPC wall, not the hardware). Run the scripts with `docker run --entrypoint python3 --group-add 44 --group-add
 991 ...` (group names do not resolve inside the image). Idle host draw 395 W by in-band `ipmitool dcmi power reading`.
+
+### Eight cards, four switch-local pairs (2026-10-13)
+
+- **Host:** the two cards from the production box went onto the fourth PEX 8747 (root `80:03.1`, upstream `87:00.0`,
+  ports `88:08.0`/`88:10.0`), each behind its own Navi bridge pair like chain C: **`8b:00.0`** (port 88:08.0) and
+  **`8e:00.0`** (port 88:10.0). barfix chain D: `CHAIN_D_WIN` 0x1c0-0x1ff inside bus 80's aperture
+  (0x18050200000-0x200501fffff; the mlx5 NIC sits above 0x200), `CHAIN_D_AT` 0x1c0 (8b @0x1c0, 8e @0x1d0),
+  `CHAIN_D_P2P=1`. The first barfix run after the host reboot placed all four chains from their firmware 256 MB state,
+  so the host-reboot path (every chain re-placed by the pre-start hook) is now exercised.
+- **VM100 args:** fourth switch `p2prpd`/`p2pupd`/`p2pdn7` (chassis 100, slot 7 -> 8b)/`p2pdn8` (chassis 101, slot 8 ->
+  8e); `X-PciMmio64Mb` 393216 -> **507904 (496 G), not 524288**. OVMF aligns its 64-bit window base to the largest
+  power of two that is <= the window size: at 512 G the base moved from 0x140 to 0x180, the guest's root-bus window
+  then started at 0x180, and chain B's 0x140 fell outside it (guestplace -16, every card amdgpu -22). 496 G keeps the
+  256 G alignment (base 0x140) and still holds eight 64 G port slots (8 x 64 G = 480 G plus the small devices).
+  `pci-hole64-size` stays 3072G (window 0x140-0x43f covers chain D's 0x1c0 and chain C's 0x380).
+- **Guest:** chain D is `0f:00.0` (host 8b) and `10:00.0` (host 8e), HIP ordinals 6 and 7; `place=` lists all eight
+  (the module's MAX_CARDS is 8); LACT entries for 0f/10 at 210 W / -42 mV; the powercap service counts cards itself.
+
+Result: all eight at 32 GB at their host addresses, 8 KFD nodes with 7 peer links each, 0 MES timeouts, 0 IOMMU/AER
+faults on host and guest. `p2pbidir.py` on the chain D pair: 13.01 / 13.02 GB/s each way alone, **25.24 GB/s both at
+once** (chains A/B/C: 25.23-25.25). 8 x 8 `copy_matrix`: all 56 pairs 12.6-13.0 GB/s one-way, data checks OK.
+`serve/27b.sh` with `GPUS=6,7 TP=2` on the new pair: decode 220.9 tok/s, c8 516, c16 616, prefill-8k 3,896, strict
+sanity 0 bad of 360 -- identical to cards 0,1 the same morning. Host draw 463 W before the VM starts (eight cards with no
+driver), 262 W with the VM up and the GPUs idle.
+
+Open items from this round:
+
+- **One NMI burst.** At 13:57:11 CDT, during the 8 x 8 copy matrix, the host logged ten `Uhhuh. NMI received for
+  unknown reason 2d/3d` (CPUs 24-27, 53-55, 61-63, "Dazed and confused, but trying to continue") and the BMC logged
+  `Critical Interrupt #0x21 | NMI/Diag Interrupt` at the same second. No MCE, no GHES record, no `UESta` bit on any
+  root port, PLX port, Navi bridge or card (only the usual `CorrErr+ UnsupReq+ / AdvNonFatalErr+` advisory bits on
+  every PLX/Navi bridge, chains A-C included); nothing in the guest. It is the first NMI in this host's history (journal
+  since 09-23, full SEL) and the six-card matrix on 10-06 ran the same cross-chain pattern clean, so it is tied to
+  chain D taking part in cross-switch traffic through the root complex. Nothing since, including the TP2 serve on the
+  new pair (switch-local only). Not yet reproduced; the next step is a one-pair cross-chain copy (chain D <-> A/B/C)
+  while watching dmesg and the SEL.
+- `p2ptest4.py`'s RCCL phase fails `hipIpcGetMemHandle: invalid argument` at 4, 6 and 8 ranks on the fe4df3df image
+  even with the emulated-switch overlay mounted (`mp.spawn` ranks in one container); vLLM TP serving with the overlay
+  works, so this is the test harness, not the hardware.
