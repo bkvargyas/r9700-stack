@@ -6,7 +6,7 @@ loads at runtime through vLLM's own extension points, so vLLM and ROCm update un
 
 Current release: **v0.3.3** (2026-10-13), [release notes](notes/release-v0.3.3.md), [CHANGELOG.md](CHANGELOG.md).
 
-![r9700-stack v0.3.2: what the kernels do, the speed, how to deploy](docs/r9700-stack-v0.3.2.png)
+![r9700-stack v0.3.3: what the kernels do, the speed, how to deploy](docs/r9700-stack-v0.3.3.png)
 
 ## What the kernels do
 
@@ -59,9 +59,9 @@ p = 1.00 against v0.3.1), HumanEval 162 / 164; v0.3.3 validation: 0 bad answers 
 
 | | |
 |---|---:|
-| single-stream decode | 211-217 tok/s (4.3 tokens a step), 23 ms a step |
-| aggregate at 8 / 16 streams | 582-604 / 657-670 tok/s |
-| prompt processing at 8k | 3,948-4,143 tok/s |
+| single-stream decode | 222 tok/s (4.5 tokens a step), 22 ms a step |
+| aggregate at 8 / 16 streams | 527 / 640-658 tok/s (probe; equal-prompt bursts match the previous release) |
+| prompt processing at 8k | 3,901-4,143 tok/s |
 | KV cache | 367,494 tokens |
 
 How each number was produced, and what was tried and rejected: [PROGRESS.md](PROGRESS.md) and `notes/`.

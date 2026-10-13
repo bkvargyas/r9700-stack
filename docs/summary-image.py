@@ -1,4 +1,4 @@
-# Renders docs/r9700-stack-v0.3.2.png, the one-image summary at the top of README.md. Needs matplotlib:
+# Renders docs/r9700-stack-v0.3.3.png, the one-image summary at the top of README.md. Needs matplotlib:
 #   docker run --rm -v $PWD:/w --entrypoint bash r9700/vllm:dev -c "pip install -q matplotlib && python3 /w/docs/summary-image.py"
 # Update the numbers below from notes/release-v<version>.md when a release changes them.
 # r9700-stack v0.3.2 summary image for the README. Dark surface, the reference dataviz palette's dark steps
@@ -30,20 +30,20 @@ def tile(x, y, w, h, label, value, sub=None):
 
 # ---- header
 text(0.6, 0.45, "r9700-stack", 30, INK, "bold")
-text(3.55, 0.62, "v0.3.2", 15, INK2)
+text(3.55, 0.62, "v0.3.3", 15, INK2)
 text(0.6, 1.1, "Qwen3.8 on AMD Radeon AI PRO R9700  ·  stock vLLM + stock ROCm  ·  tuned gfx1201 kernels loaded as a plugin, no fork",
      11.5, INK2)
 
 # ---- hero figure (one) + the KPI row for the four-card configuration
 text(0.6, 1.75, "Flash-Next, four cards, tensor parallel 4", 10.5, INK2)
-text(0.6, 2.0, "219", 52, INK, "semibold")
+text(0.6, 2.0, "225", 52, INK, "semibold")
 text(2.35, 2.78, "tok/s single-stream decode", 13, INK2, va="bottom")
-text(0.65, 3.0, "15.0 ms a step, 3.2 tokens a step with MTP-3", 10, MUTED, va="top")
+text(0.65, 3.0, "14.3 ms a step, 3.1 tokens a step with MTP-3", 10, MUTED, va="top")
 
-tiles = [("Aggregate decode, 16 streams", "935 tok/s", "514 at 8 streams (BetterBench)"),
-         ("Prompt processing, 16k prompt", "7,388 tok/s", "7,076 at 8k · 7,137 at 32k"),
-         ("KV cache", "516k tokens", "15 full 32k contexts"),
-         ("Time to first token", "70-80 ms", "p50, 2k-token prompt")]
+tiles = [("Aggregate decode, 16 streams", "944 tok/s", "530 at 8 streams (BetterBench)"),
+         ("Prompt processing, 16k prompt", "7,489 tok/s", "7,141 at 8k · 7,233 at 32k"),
+         ("KV cache", "518k tokens", "15 full 32k contexts"),
+         ("Time to first token", "76 ms", "p50, single stream")]
 x0, y0, tw, th, gap = 6.35, 1.62, 2.25, 1.32, 0.15
 for i, (l, v, s) in enumerate(tiles):
     tile(x0 + i * (tw + gap), y0, tw, th, l, v, s)
@@ -51,9 +51,9 @@ for i, (l, v, s) in enumerate(tiles):
 # ---- grouped bars: aggregate decode by streams, three configurations
 ax = fig.add_axes([0.6 / W, 1 - 7.35 / H, 6.3 / W, 3.75 / H])
 streams = ["1", "8", "16"]
-data = [("Flash-Next, 4 cards", S1, [219, 585, 934]),
+data = [("Flash-Next, 4 cards", S1, [225, 623, 944]),
         ("Flash-Next, 2 cards, experts in host RAM", S2, [143, 257, 245]),
-        ("27B-NVFP4, 2 cards", S3, [217, 604, 670])]
+        ("27B-NVFP4, 2 cards", S3, [222, 527, 650])]
 import numpy as np
 xs = np.arange(len(streams)); bw = 0.13
 XMIN, XMAX, YMAX = -0.6, len(streams) - 0.4, 1080
@@ -91,7 +91,7 @@ for i, it in enumerate(items):
 
 text(7.6, 6.95, "Every default gated", 11, INK, "semibold")
 text(7.6, 7.3, "GSM8K, all 1,319 questions, paired per question against the previous numerics (p = 1.00)  ·  HumanEval 162 / 164\n"
-               "0 bad answers in 5,060 strict-sanity checks under overload  ·  0 errors in 1,328 mixed-length soak requests\n"
+               "0 bad answers in 5,060 strict-sanity checks under overload  ·  0 errors in 1,224 mixed-length soak requests\n"
                "across every configuration  ·  4-rank communication tests bit-exact  ·  kernel unit gates", 9.3, INK2, linespacing=1.6)
 
 # ---- footer: deploy
@@ -100,5 +100,5 @@ text(0.6, 8.15, "Deploy", 11, INK, "semibold")
 text(1.6, 8.17, "docker build -t r9700/vllm:dev docker/     then     GPUS=0,1,2,3 TP=4 OFFLOAD_GB=0 NSEQ=16 bash serve/flashnext.sh     or     bash serve/27b.sh",
      9.5, INK2, family="DejaVu Sans Mono")
 text(1.6, 8.5, "OpenAI-compatible API on :8080  ·  210 W per card  ·  github.com/bkvargyas/r9700-stack", 9.3, MUTED)
-fig.savefig("docs/r9700-stack-v0.3.2.png", dpi=200, facecolor=SURF)
+fig.savefig("docs/r9700-stack-v0.3.3.png", dpi=200, facecolor=SURF)
 print("saved")
