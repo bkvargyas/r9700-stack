@@ -13,9 +13,11 @@ per tensor (per partition for fused qkv / gate_up). Conversion per 32-group:
 This is lossy (two 16-groups share one power-of-two scale, values are re-rounded) -- roughly the error of an
 RTN-MXFP4 quantization of the original weights, not better (measured: relative weight error ~1.55x NVFP4's own).
 Dense linears therefore default to the NATIVE path (R9K_NVFP4=native): libr9k's NVFP4 kernel variant keeps the
-checkpoint bits exact. R9K_NVFP4=mxfp4 selects the conversion. MoE layers likewise default to NATIVE
-(R9K_NVFP4_MOE=native, libr9k's grouped NVFP4 kernel) when the experts are VRAM-resident; UVA-offloaded experts
-convert (the expert cache moves MXFP4-layout scales), and R9K_NVFP4_MOE=mxfp4 converts always.
+checkpoint bits exact. R9K_NVFP4=mxfp4 selects the conversion. MoE layers CONVERT by default: R9K_NVFP4_MOE=native
+serves VRAM-resident experts through libr9k's grouped NVFP4 kernel instead (exact bits; UVA-offloaded experts still
+convert, the expert cache moves MXFP4-layout scales). Measured on GLM-5.3-Flash TP8 (2026-10-14): native costs the
+e4m3 scales' VRAM (~1.1 GB a card, 26% of the KV cache at 0.94 utilisation), 1-2% at four streams and 37% on the
+MT=2 MoE shape, for no measurable gain -- GSM8K 96 vs 97 of 100, MTP draft acceptance 78.3% vs 78.0%.
 The NVFP4 activation scales (input_global_scale, W4A4 mode) are dropped: activations run in fp8 per row, as for
 MXFP4 checkpoints. Disable with R9K_DISABLE=nvfp4 (stock emulation for linears; NVFP4 MoE then fails on ROCm).
 """
@@ -177,7 +179,7 @@ def make_native_dense_scheme_cls(base):
 
 
 # -------------------------------------------------------------------------------------------------- MoE
-MOE_MODE = (os.environ.get("R9K_NVFP4_MOE", "") or "native").lower()
+MOE_MODE = (os.environ.get("R9K_NVFP4_MOE", "") or "mxfp4").lower()     # native: exact, costs VRAM and prefill
 
 
 def prep_native_moe(layer, div13: torch.Tensor, div2: torch.Tensor) -> None:
@@ -266,7 +268,8 @@ def make_moe_method_cls(mxfp4_method_cls):
                                  "R9K_NVFP4_MOE=mxfp4 converts at load instead)")
                 self._install_kernel(layer)                  # no expert cache: native experts are VRAM-resident
             else:
-                logger.info_once("r9700: NVFP4 MoE experts converted to MXFP4 at load -> libr9k")
+                logger.info_once("r9700: NVFP4 MoE experts converted to MXFP4 at load -> libr9k "
+                                 "(R9K_NVFP4_MOE=native keeps the checkpoint bits; costs VRAM and prefill speed)")
                 super().process_weights_after_loading(layer)
 
     return R9kNvfp4MoEMethod

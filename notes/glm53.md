@@ -15,6 +15,7 @@ dense / shared-expert / sparse-attention projections, BF16 KDA projections, no M
 | 8-rank all-gather `ag8` | `comm/r9k_ar8.py` | same for the logits gather (1.0-1.3 ms -> ~0.3) |
 | indexer head weights | `attn/sparse_mla.py SkinnyWeight` + `r9k_mm_f32_skinny` | hipBLASLt/rocBLAS take ~200 us on the 1 x 4096 x 32 fp32 mm, 11 per step |
 | KDA projections -> per-row fp8 | `models/glm5next.py` post-load swap (`R9K_FP8_LINEARS`) | the model builds them with `quant_config=None`; 4.6B params, 3.4 ms/step in bf16 |
+| native NVFP4 routed experts | `quant/nvfp4.py prep_native_moe`, `moe/experts.py` (`nv`), `r9k_moe_nvfp4a8` | the load-time NVFP4->MXFP4 conversion is lossy (~1.55x the checkpoint's own weight error); `R9K_NVFP4_MOE=native` keeps the bits for VRAM-resident experts (opt-in: same speed single stream, 127 vs 129 at four streams, GSM8K 96 vs 97 of 100, MTP acceptance 78.3 vs 78.0%, but ~1.1 GB/card of KV: 322k vs 436k tokens at 8k) |
 | sparse MLA on an fp8 (or bf16) pool | `kernels/r9k_sparse_mla.hip`, `attn/sparse_mla.py`, three backend hooks | stock's fp8 path is CDNA assembly, its Triton path bf16-only, aiter's kernel gfx950-only |
 
 The three sparse-MLA hooks: `forward_mqa` -> our kernel; `supports_quant_query_input = False` (the MLA layer would
@@ -32,8 +33,14 @@ otherwise call `aiter.get_mla_metadata_v1`, a CDNA kernel, and the pending error
 | + skinny indexer mm + KDA fp8 + ag8 | 52.5 |
 | fp8 KV cache (our sparse kernel) | 52.9, KV capacity 291k -> 436k tokens at 8k max-len |
 | MTP, 1 draft token (Red Hat's unmodified checkpoint, which ships the MTP layer) | 72.3, 75% draft acceptance |
+| MTP 1 draft + fp8 KV | 75.2, 78% acceptance; four streams 89 aggregate (MTP off: 129), so MTP for one or two streams only |
+| native NVFP4 experts (exact checkpoint bits, opt-in) | 52.8 MTP off, 74.1 MTP 1 draft; GSM8K 96/100 |
 
-Concurrency (256-token streams): 1 -> 44, 2 -> 76 aggregate, 4 -> 129 aggregate. Reference (djdeniro, forked
+Concurrency (256-token streams): 1 -> 44, 2 -> 76 aggregate, 4 -> 129 aggregate (native experts: 127).
+Kernel level (one MoE layer at the TP8 shapes, both GEMMs + activation): native NVFP4 equals MXFP4 at one row,
+is 6-9% slower at 4-256 rows (MT=1) and 37% slower at the MT=2 shape (8,192 routed rows); the exact e4m3 scales
+cost ~1.1 GB a card of KV, and draft acceptance with MTP is the same (78.3% vs 78.0%): the default stays MXFP4,
+`R9K_NVFP4_MOE=native` is the exact option. Reference (djdeniro, forked
 vLLM 0.24 + overlay, rfi quant): 34-39 single stream MTP off, 82-88 with MTP-3, 155 at four streams with MTP.
 
 ## The fabric cliff (measured, `tests/test_ar_nrank.py`, `tests/test_ar8.py`)
@@ -48,7 +55,8 @@ collectives, and only the even ranks ever send cross-chain.
 
 `KVDTYPE=fp8`, `R9K_SPARSE_MLA=auto|r9k|stock`, `R9K_SPARSE_MLA_SPLITS` (8), `R9K_INDEXER_MM=0`, `R9K_AR8=0`,
 `R9K_AR8_FP32=1` (exact, 45 us), `R9K_AG8=0`, `R9K_AG_MAX_KB` (2048 for the logits at 4 tokens),
-`R9K_FP8_LINEARS=<regex>`, `R9K_DISABLE=glm5next`. Everything keys on world size 8, the glm5next module path or
+`R9K_FP8_LINEARS=<regex>`, `R9K_NVFP4_MOE=mxfp4|native` (default converts; native = exact bits for VRAM-resident experts, offloaded experts
+always convert, the expert cache is MXFP4-only), `R9K_DISABLE=glm5next`. Everything keys on world size 8, the glm5next module path or
 checkpoint content the Qwen configurations do not have.
 
 ## Open
