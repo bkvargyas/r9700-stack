@@ -31,6 +31,7 @@ otherwise call `aiter.get_mla_metadata_v1`, a CDNA kernel, and the pending error
 | ar8 | 42 (stable probe) |
 | + skinny indexer mm + KDA fp8 + ag8 | 52.5 |
 | fp8 KV cache (our sparse kernel) | 52.9, KV capacity 291k -> 436k tokens at 8k max-len |
+| MTP, 1 draft token (Red Hat's unmodified checkpoint, which ships the MTP layer) | 72.3, 75% draft acceptance |
 
 Concurrency (256-token streams): 1 -> 44, 2 -> 76 aggregate, 4 -> 129 aggregate. Reference (djdeniro, forked
 vLLM 0.24 + overlay, rfi quant): 34-39 single stream MTP off, 82-88 with MTP-3, 155 at four streams with MTP.
@@ -52,6 +53,7 @@ checkpoint content the Qwen configurations do not have.
 
 ## Open
 
-GSM8K / HumanEval gates on this configuration; longer contexts (the fp8 cache is for them); the remaining per-step
-cost (profile after fp8 KV); MTP needs a checkpoint that ships the MTP layer (Red Hat's does) and a check of the
-stock proposer on this nightly.
+GSM8K (100 questions, four streams, medium reasoning) on the fp8-KV configuration: 97/100, no truncations.
+MTP works on this nightly with the stock proposer and the same hooks (no proposer patch, unlike the vLLM 0.24
+overlay). Open: more draft tokens, fp8 KV together with MTP, longer contexts, the next profile, HumanEval, and the
+QFN / 27B gates on the glm53 tree before any merge.
