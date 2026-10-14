@@ -197,6 +197,47 @@ def _install_indexer_weights() -> bool:
     return True
 
 
+# --------------------------------------------------------------------------- KDA projections -> fp8 at load
+def _install_fp8_linears_postload() -> bool:
+    """R9K_FP8_LINEARS=<regex> for GLM: the model builds its KDA attention with vllm_config.quant_config set to None
+    (kda.py) and its MLA/indexer projections with quant_config=None, so those linears get UnquantizedLinearMethod
+    directly and never pass through the plugin's quant config (where the regex normally applies, quant/ct.py).
+    Swap the method on matching modules right after load_weights; vLLM's process_weights_after_loading pass then
+    runs the per-row fp8 requant (quant/ct.py R9kFp8UnquantMethod), weights untouched on disk."""
+    import re
+    pat = os.environ.get("R9K_FP8_LINEARS", "")
+    if not pat:
+        return False
+    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+    from ..quant.ct import R9kFp8UnquantMethod
+    from vllm.models import glm5next as G
+    rx = re.compile(pat)
+    installed = []
+    for cname in ("Glm5NextForConditionalGeneration", "Glm5NextForCausalLM"):
+        cls = getattr(G, cname, None)
+        if cls is None or getattr(cls.load_weights, "__r9k_patch__", None):
+            continue
+        orig = cls.load_weights
+
+        def load_weights(self, weights, _orig=orig):
+            out = _orig(self, weights)
+            n = 0
+            for name, mod in self.named_modules():
+                qm = getattr(mod, "quant_method", None)
+                if type(qm) is UnquantizedLinearMethod and rx.search(name) and getattr(mod, "weight", None) is not None \
+                        and mod.weight.dtype == torch.bfloat16 and mod.weight.dim() == 2 \
+                        and mod.weight.shape[0] % 16 == 0 and mod.weight.shape[1] % 16 == 0:
+                    mod.quant_method = R9kFp8UnquantMethod()
+                    n += 1
+            logger.info("r9700: R9K_FP8_LINEARS post-load: %d bf16 linears -> per-row fp8 on libr9k (pattern %r)", n, pat)
+            return out
+
+        load_weights.__r9k_patch__ = "glm5next_rdna4"
+        cls.load_weights = load_weights
+        installed.append(cname)
+    return bool(installed)
+
+
 def patch() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -233,6 +274,11 @@ def patch() -> bool:
             done.append("indexer-weights:r9k_mm_f32_skinny")
     except Exception as e:
         logger.warning("r9700: glm5next indexer weights hook not installed (%s)", e)
+    try:
+        if _install_fp8_linears_postload():
+            done.append("fp8-linears:post-load")
+    except Exception as e:
+        logger.warning("r9700: glm5next fp8-linears post-load hook not installed (%s)", e)
     _PATCHED = True
     logger.info("r9700: glm5next on RDNA4: %s", ", ".join(done) or "nothing to do")
     return bool(done)
