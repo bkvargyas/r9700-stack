@@ -44,6 +44,30 @@ cost ~1.1 GB a card of KV, and draft acceptance with MTP is the same (78.3% vs 7
 `R9K_NVFP4_MOE=native` is the exact option. Reference (djdeniro, forked
 vLLM 0.24 + overlay, rfi quant): 34-39 single stream MTP off, 82-88 with MTP-3, 155 at four streams with MTP.
 
+## MTP on this nightly (2026-10-14)
+
+The engine runs the new GPU worker (`vllm/v1/worker/gpu/`) and its `TargetDependentARSpeculator`; the legacy
+`EagleProposer` is not on the path. Draft forwards are full-graph captured (decode mode FULL gives the drafter
+FULL_DECODE_ONLY). With two or more draft tokens every draft step runs inside ONE graph only when each drafter
+attention builder declares `supports_draft_decode_metadata_update`; the ROCm sparse builder does not, so the server
+rebuilt metadata eagerly between draft steps. `_install_draft_metadata_update` (glm5next.py) adds the refresh for
+the Triton-shaped metadata our kernel serves: the token -> request map and `paged_kv_indptr = cumsum(min(seq_len,
+topk))`, both over persistent buffers; `build()` is wrapped to keep the runner's `seq_lens` view. MTP=3: 71.3 -> 73.5
+tok/s, acceptance unchanged (1.52 of 3). The drafter is the sparse-attention block only (no KDA), and the indexer
+/ kpool builders already supported the update.
+
+Where an MTP=3 step goes (profile, ~34 ms, GPU-bound): the 8-rank all-reduce at four rows is 32 KB a message, above
+the 16 KB one-shot limit, and the cross-chain two-shot stage costs 80 us x ~99 = 8 ms; the pair stages 2.3 ms; the
+logits all-gather (one per draft step) 2.5 ms; bf16 skinny GEMMs (the Red Hat checkpoint keeps shared experts,
+dense MLPs and the MLA projections in bf16) 3.2 ms; MoE 3.5 ms. Draft acceptance itself is fine: 99.5% on a
+verbatim copy, 72% on a story at temperature 0 (83% at 0.7 -- stochastic acceptance is looser than argmax equality).
+
+Levers measured or in flight: `tests/test_ar8.py` at 32 KB: ar8 95 us (RCCL 120), at 64 KB 249 (RCCL 104), and a
+raised one-shot limit is worse (133 / 311) -- so `R9K_ARN_MAX_KB=40` hands >= 48 KB to RCCL; `R9K_AR8_CROSS_KB=16`
+slices the cross stage under the fabric's in-flight cliff (untested); `R9K_FP8_LINEARS` extended to the bf16
+projections (launch in flight); `SPEC_EXTRA='"use_local_argmax_reduction": true'` replaces the per-draft-step
+logits gather with a per-shard argmax (serve.sh now passes it on the MTP branch).
+
 ## The fabric cliff (measured, `tests/test_ar_nrank.py`, `tests/test_ar8.py`)
 
 Four ranks on any two switches: one-shot 6.8-10 us. Eight ranks on four: 126-288 us. Four ranks on four switches

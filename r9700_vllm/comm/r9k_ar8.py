@@ -42,6 +42,7 @@ class R9kAllReduce8:
         if self.flat.disabled:
             return
         self.fp32 = os.environ.get("R9K_AR8_FP32", "0") == "1"      # bf16: 22 us; fp32 (exact): 45 us (tests/test_ar8.py)
+        self.cross_kb = int(float(os.environ.get("R9K_AR8_CROSS_KB", "0")) * 1024)   # cross-stage slice bytes, 0 = whole
         g = dist.get_process_group_ranks(group)           # global ranks of the TP group, in TP-rank order
         # every rank must create every sub-group (new_group is collective over the world); keep ours
         pairs = [dist.new_group(ranks=[g[2 * i], g[2 * i + 1]], backend="gloo") for i in range(4)]
@@ -122,6 +123,17 @@ class R9kAllReduce8:
             z = self._zeros[key] = torch.zeros(x.numel(), dtype=x.dtype, device=x.device)
         return z
 
+    def _cross(self, y: torch.Tensor) -> torch.Tensor:
+        """The evens' 4-chain stage. Four senders x the message is what the fabric sees in flight; at 32 KB a message
+        that is 128 KB, inside the measured cliff (tests/test_ar8.py: 95 us at 4 rows against 41 at 2). R9K_AR8_CROSS_KB
+        (0 = off) caps the bytes a sender has in flight by running the stage over consecutive slices."""
+        n = y.numel() * y.element_size()
+        if not self.cross_kb or n <= self.cross_kb:
+            return self.cross.all_reduce(y)
+        per = max(16, (self.cross_kb // y.element_size() // 8) * 8)    # elements a slice (16-byte multiples)
+        parts = [self.cross.all_reduce(y[i:i + per]) for i in range(0, y.numel(), per)]
+        return torch.cat(parts)
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if not self._takes(x):
             return self.flat.all_reduce(x)
@@ -129,7 +141,7 @@ class R9kAllReduce8:
         work = flat.float() if self.fp32 and x.dtype != torch.float32 else flat
         y = self.pair.all_reduce(work)                       # both pair members: the pair sum
         if self.pair_pos == 0:
-            z = self.cross.all_reduce(y)                     # evens: the total, four senders on four switches
+            z = self._cross(y)                               # evens: the total, four senders on four switches
             if z.dtype != x.dtype:
                 z = z.to(x.dtype)
             out = self.pair.all_reduce(z)                    # odd adds zeros -> both hold the total, unrounded

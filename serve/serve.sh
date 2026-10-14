@@ -110,7 +110,7 @@ MTP=${MTP-3}
 if [ -n "$DRAFT" ]; then
   ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 elif [ -n "$MTP" ]; then
-  ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
+  ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 fi
 # DRYRUN=1: print the assembled docker command and exit (config check without touching the GPUs)
 if [ "${DRYRUN:-0}" = 1 ]; then
