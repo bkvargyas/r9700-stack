@@ -97,6 +97,19 @@ def main():
     for r, y in enumerate(ys):
         check(f"graph {r}", y, ref(world, 100 + r, 4096, torch.bfloat16, dev), ulps=TOL)
     check("graph chained", y2, ref(world, 100, 4096, torch.bfloat16, dev).float().mul(world).to(torch.bfloat16), ulps=2 * TOL)
+    # all-gather: vLLM concat semantics along dim=-1, TP rank order (logits: [tokens, vocab/8] bf16 per rank)
+    os.environ.setdefault("R9K_AG_MAX_KB", "1024")
+    for rows, cols in ((1, 19360), (4, 19360), (2, 4096)):
+        x = inp(rank, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols)
+        want = torch.cat([inp(q, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols) for q in range(world)], dim=-1)
+        if ar8._ag_takes(x, -1):
+            got = ar8.all_gather(x, -1)
+            ok = torch.equal(got, want)
+            if rank == 0:
+                print(f"ag8 [{rows}, {cols}] -> {tuple(got.shape)}: {'OK' if ok else 'MISMATCH'}", flush=True)
+            bad += (not ok)
+        elif rank == 0:
+            print(f"ag8 [{rows}, {cols}]: not taken (caps: pair ag_max {ar8.pair.ag_max >> 10} KiB)", flush=True)
     if rank == 0:
         print("RESULT", "PASS" if bad == 0 else f"FAIL ({bad})", flush=True)
     if os.environ.get("BENCH", "1") == "1":
@@ -111,6 +124,14 @@ def main():
             t_8 = graph_time(lambda: ar8.all_reduce(x))
             if rank == 0:
                 print(f"{tok:>7} {n * 2 // 1024:>6} {t_rccl:>8.1f} {t_1s:>8.1f} {t_2s:>8.1f} {t_8:>8.1f}", flush=True)
+        xg = inp(rank, 4000, 19360, torch.bfloat16, dev).view(1, 19360)
+        if ar8._ag_takes(xg, -1):
+            t_ag_flat = graph_time(lambda: flat.all_gather(xg, -1)) if flat.should_ag(xg, -1) else float("nan")
+            t_ag8 = graph_time(lambda: ar8.all_gather(xg, -1))
+            out_r = [torch.empty_like(xg) for _ in range(world)]
+            t_ag_rccl = graph_time(lambda: dist.all_gather(out_r, xg))
+            if rank == 0:
+                print(f"all-gather [1, 19360] bf16 (38 KB/rank): rccl {t_ag_rccl:.1f}  flat-ag {t_ag_flat:.1f}  ag8 {t_ag8:.1f} us", flush=True)
     if os.environ.get("PARTS", "0") in ("1", "2"):
         # component timing: where does the composed cost come from?
         n = 4096

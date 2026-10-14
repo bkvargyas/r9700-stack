@@ -63,12 +63,44 @@ class R9kAllReduce8:
                     self.rank // 2, "cross-chain sender" if self.pair_pos == 0 else "idle in the cross step",
                     "fp32" if self.fp32 else "bf16")
 
-    # the flat instance decides for anything we do not take (and for every all-gather)
+    # ------------------------------------------------------------------------------------ all-gather
+    # The flat 8-rank one-shot all-gather (the logits every step, ~38 KB per rank) hits the same fabric cliff:
+    # 1.34 ms per call in the 2026-10-14 profile. Same shape as the reduce: pair all-gather (2 pieces), cross
+    # all-gather among the evens (8 pieces, four senders), pair all-gather again with the odd contributing zeros
+    # so the even's full result lands as the first half on both. Concatenation order = TP rank order, as vLLM's.
     def should_ag(self, x, dim):
-        return self.flat.should_ag(x, dim)
+        if self.disabled or os.environ.get("R9K_AG8", "1") != "1":
+            return self.flat.should_ag(x, dim)
+        return self._ag_takes(x, dim) or self.flat.should_ag(x, dim)
+
+    def _ag_takes(self, x, dim) -> bool:
+        if not self.pair.should_ag(x, dim):
+            return False
+        d = dim + x.dim() if dim < 0 else dim
+        shape2 = list(x.shape); shape2[d] *= 2
+        shape8 = list(x.shape); shape8[d] *= 8
+        n2 = x.numel() * 2 * x.element_size(); n8 = x.numel() * 8 * x.element_size()
+        return (self.cross is None or n2 <= self.cross.ag_max) and n8 <= self.pair.ag_max
 
     def all_gather(self, x, dim=-1):
-        return self.flat.all_gather(x, dim)
+        if not (os.environ.get("R9K_AG8", "1") == "1" and self._ag_takes(x, dim)):
+            return self.flat.all_gather(x, dim)
+        d = dim + x.dim() if dim < 0 else dim
+        y = self.pair.all_gather(x, d)                      # [.., 2 v, ..] = [even, odd] of this pair
+        if self.pair_pos == 0:
+            z = self.cross.all_gather(y, d)                  # [.., 8 v, ..] in TP rank order (pairs in order)
+            full = self.pair.all_gather(z, d)                # [.., 16 v, ..]: [evens' z | odd's zeros]
+        else:
+            full = self.pair.all_gather(self._zero_like(y, d, 4), d)
+        return full.narrow(d, 0, x.shape[d] * 8).contiguous()
+
+    def _zero_like(self, y, d, mult):
+        shape = list(y.shape); shape[d] *= mult
+        key = ("ag", tuple(shape), y.dtype)
+        z = self._zeros.get(key)
+        if z is None:
+            z = self._zeros[key] = torch.zeros(shape, dtype=y.dtype, device=y.device)
+        return z
 
     def _takes(self, x: torch.Tensor) -> bool:
         if self.disabled or x.dtype not in _DTYPE or not x.is_contiguous():
