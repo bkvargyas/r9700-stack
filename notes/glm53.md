@@ -36,6 +36,7 @@ otherwise call `aiter.get_mla_metadata_v1`, a CDNA kernel, and the pending error
 | MTP 1 draft + fp8 KV | 75.2-75.9; four streams 108 aggregate (MTP off: 127-129), so MTP for one or two streams only |
 | draft acceptance (1 draft, temp 0) | 72% on a story, 99.5% on a verbatim copy: the proposer path is right, the head is as good as the text is predictable |
 | native NVFP4 experts (exact checkpoint bits, opt-in) | 52.8 MTP off, 74.1 MTP 1 draft; GSM8K 96/100 |
+| MTP 3 drafts: in-graph draft metadata + 8 KB cross-stage slices + RCCL above 40 KB + local-argmax drafts | **79.6** (78.4 the run before), 2.3 tokens a step on a story; four streams 158 aggregate (second run), 124-129 first; GSM8K 97/100 in 1.6 min; verbatim copy 97.5% accepted |
 
 Concurrency (256-token streams): 1 -> 44, 2 -> 76 aggregate, 4 -> 129 aggregate (native experts: 127).
 Kernel level (one MoE layer at the TP8 shapes, both GEMMs + activation): native NVFP4 equals MXFP4 at one row,
@@ -43,6 +44,7 @@ is 6-9% slower at 4-256 rows (MT=1) and 37% slower at the MT=2 shape (8,192 rout
 cost ~1.1 GB a card of KV, and draft acceptance with MTP is the same (78.3% vs 78.0%): the default stays MXFP4,
 `R9K_NVFP4_MOE=native` is the exact option. Reference (djdeniro, forked
 vLLM 0.24 + overlay, rfi quant): 34-39 single stream MTP off, 82-88 with MTP-3, 155 at four streams with MTP.
+Ours after the MTP round: 79.6 single stream with 3 drafts, 158 at four streams.
 
 ## MTP on this nightly (2026-10-14)
 
@@ -62,11 +64,14 @@ logits all-gather (one per draft step) 2.5 ms; bf16 skinny GEMMs (the Red Hat ch
 dense MLPs and the MLA projections in bf16) 3.2 ms; MoE 3.5 ms. Draft acceptance itself is fine: 99.5% on a
 verbatim copy, 72% on a story at temperature 0 (83% at 0.7 -- stochastic acceptance is looser than argmax equality).
 
-Levers measured or in flight: `tests/test_ar8.py` at 32 KB: ar8 95 us (RCCL 120), at 64 KB 249 (RCCL 104), and a
-raised one-shot limit is worse (133 / 311) -- so `R9K_ARN_MAX_KB=40` hands >= 48 KB to RCCL; `R9K_AR8_CROSS_KB=16`
-slices the cross stage under the fabric's in-flight cliff (untested); `R9K_FP8_LINEARS` extended to the bf16
-projections (launch in flight); `SPEC_EXTRA='"use_local_argmax_reduction": true'` replaces the per-draft-step
-logits gather with a per-shard argmax (serve.sh now passes it on the MTP branch).
+Levers, measured (`tests/test_ar8.py`, us): at 32 KB ar8 96 (RCCL 117), at 64 KB 250 (RCCL 102); a raised one-shot
+limit is worse (133 / 311); slicing the cross stage into 8 KB pieces gives 69 / 157 (`R9K_AR8_CROSS_KB`, default 8);
+above 40 KB the 8-rank object now declines and RCCL runs the message (`R9K_AR8_MAX_KB`), which alone took the
+four-stream MTP=3 aggregate from 87 to 116. `use_local_argmax_reduction` (speculative config; `SPEC_EXTRA` on the
+serve.sh MTP branch, the GLM launch helper's default) replaces the per-draft-step logits gather with a per-shard
+argmax. Together: 78.4 single stream, 158 at four streams. Not taken: per-row fp8 for the Red Hat checkpoint's
+remaining bf16 projections (33 more linears: -6% single stream, lower acceptance, GSM8K 97) and a DMA-engine
+all-reduce for 32 KB (the ar4 SDMA mode's flag kernels alone cost 20-28 us each).
 
 ## The fabric cliff (measured, `tests/test_ar_nrank.py`, `tests/test_ar8.py`)
 
