@@ -13,12 +13,15 @@ per tensor (per partition for fused qkv / gate_up). Conversion per 32-group:
 This is lossy (two 16-groups share one power-of-two scale, values are re-rounded) -- roughly the error of an
 RTN-MXFP4 quantization of the original weights, not better (measured: relative weight error ~1.55x NVFP4's own).
 Dense linears therefore default to the NATIVE path (R9K_NVFP4=native): libr9k's NVFP4 kernel variant keeps the
-checkpoint bits exact. R9K_NVFP4=mxfp4 selects the conversion. MoE layers always convert for now (the expert
-cache moves MXFP4-layout scales).
+checkpoint bits exact. R9K_NVFP4=mxfp4 selects the conversion. MoE layers likewise default to NATIVE
+(R9K_NVFP4_MOE=native, libr9k's grouped NVFP4 kernel) when the experts are VRAM-resident; UVA-offloaded experts
+convert (the expert cache moves MXFP4-layout scales), and R9K_NVFP4_MOE=mxfp4 converts always.
 The NVFP4 activation scales (input_global_scale, W4A4 mode) are dropped: activations run in fp8 per row, as for
 MXFP4 checkpoints. Disable with R9K_DISABLE=nvfp4 (stock emulation for linears; NVFP4 MoE then fails on ROCm).
 """
 from __future__ import annotations
+
+import os
 
 import torch
 from torch.nn.parameter import Parameter
@@ -174,6 +177,33 @@ def make_native_dense_scheme_cls(base):
 
 
 # -------------------------------------------------------------------------------------------------- MoE
+MOE_MODE = (os.environ.get("R9K_NVFP4_MOE", "") or "native").lower()
+
+
+def prep_native_moe(layer, div13: torch.Tensor, div2: torch.Tensor) -> None:
+    """Serve the layer's NVFP4 experts exactly (kernels/moe.py Nvfp4Experts): the e2m1 codes permuted IN PLACE to
+    fragment order (the order the MXFP4 kernels use too), the e4m3 per-16 scales transposed to [E, K/16, N] bits,
+    the per-shard global divisors (div13 [E, 2I], div2 [E, N]) as per-row fp32 multipliers. Leaves w13_weight /
+    w2_weight (fragment int32), *_weight_scale (u8), *_weight_row_mult (fp32) on the layer; drops *_weight_packed."""
+    from ..moe import prep
+    dev = torch.device("cuda", torch.cuda.current_device())
+    for pre, div in (("w13", div13), ("w2", div2)):
+        packed = getattr(layer, f"{pre}_weight_packed")
+        scale = getattr(layer, f"{pre}_weight_scale")
+        E, N, Kh = packed.shape
+        assert scale.shape == (E, N, Kh * 2 // 16), (pre, scale.shape, packed.shape)
+        assert div.shape == (E, N), (pre, div.shape, (E, N))
+        wq = prep.permute_in_place(packed.data)
+        ws = prep.nvfp4_scales_gpu(scale.data, dev)
+        wg = (1.0 / div.float()).reshape(E, N).contiguous().to(dev)
+        setattr(layer, f"{pre}_weight", prep.as_param(wq, packed))
+        delattr(layer, f"{pre}_weight_packed")
+        setattr(layer, f"{pre}_weight_scale", Parameter(ws, requires_grad=False))
+        setattr(layer, f"{pre}_weight_row_mult", Parameter(wg, requires_grad=False))
+    layer._r9k_fold = (False, False)
+    layer._r9k_nvfp4 = True
+
+
 def make_moe_method_cls(mxfp4_method_cls):
     """NVFP4 checkpoint layout at create time (stock CompressedTensorsW4A4Nvfp4MoEMethod.create_weights), converted
     per expert IN PLACE (MXFP4 codes are the same size) to the MXFP4 layout R9kMxfp4MoEMethod consumes. Works on
@@ -214,15 +244,29 @@ def make_moe_method_cls(mxfp4_method_cls):
             div13 = g13.repeat_interleave(I2 // g13.shape[1], dim=1)          # [E, 2I]
             g2 = layer.w2_weight_global_scale.data.float()                    # [E]
             div2 = g2[:, None].expand(-1, layer.w2_weight_packed.shape[1])
-            s13 = self._convert(layer.w13_weight_packed, layer.w13_weight_scale, div13)
-            s2 = self._convert(layer.w2_weight_packed, layer.w2_weight_scale, div2)
+            from ..moe import cache as C
+            resident = not (C.is_host(layer.w13_weight_packed) or C.is_host(layer.w2_weight_packed))
+            native = MOE_MODE == "native" and resident
+            if MOE_MODE == "native" and not resident:
+                logger.info_once("r9700: NVFP4 MoE experts are host-offloaded: converting to MXFP4 (the expert "
+                                 "cache is MXFP4-only); R9K_NVFP4_MOE=native applies to VRAM-resident experts")
+            if native:
+                prep_native_moe(layer, div13, div2)
+            else:
+                s13 = self._convert(layer.w13_weight_packed, layer.w13_weight_scale, div13)
+                s2 = self._convert(layer.w2_weight_packed, layer.w2_weight_scale, div2)
+                layer.w13_weight_scale = Parameter(s13, requires_grad=False)
+                layer.w2_weight_scale = Parameter(s2, requires_grad=False)
             for n in ("w13_weight_global_scale", "w2_weight_global_scale", "w13_input_global_scale",
                       "w2_input_global_scale"):
                 if hasattr(layer, n):
                     delattr(layer, n)
-            layer.w13_weight_scale = Parameter(s13, requires_grad=False)
-            layer.w2_weight_scale = Parameter(s2, requires_grad=False)
-            logger.info_once("r9700: NVFP4 MoE experts converted to MXFP4 at load -> libr9k")
-            super().process_weights_after_loading(layer)
+            if native:
+                logger.info_once("r9700: NVFP4 MoE experts served natively by libr9k (exact checkpoint bits; "
+                                 "R9K_NVFP4_MOE=mxfp4 converts at load instead)")
+                self._install_kernel(layer)                  # no expert cache: native experts are VRAM-resident
+            else:
+                logger.info_once("r9700: NVFP4 MoE experts converted to MXFP4 at load -> libr9k")
+                super().process_weights_after_loading(layer)
 
     return R9kNvfp4MoEMethod

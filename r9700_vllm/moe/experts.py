@@ -115,9 +115,14 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         return not (moe_parallel_config.use_fi_nvl_two_sided_kernels
                     or moe_parallel_config.use_fi_nvl_one_sided_kernels)
 
-    @staticmethod
-    def _dims(ws: torch.Tensor) -> tuple[int, int]:
-        """(N, K) of one GEMM from its packed scale tensor [E, K/32 + 1, N]."""
+    # native NVFP4 experts (quant/nvfp4.py prep_native_moe): (w13, w2) per-row fp32 multipliers [E, N]; the scale
+    # tensors are then e4m3 bits [E, K/16, N] and the GEMMs run r9k_moe_nvfp4a8 (exact checkpoint bits, no fold/fuse)
+    nv: tuple[torch.Tensor, torch.Tensor] | None = None
+
+    def _dims(self, ws: torch.Tensor) -> tuple[int, int]:
+        """(N, K) of one GEMM from its scale tensor: MXFP4 packed [E, K/32 + 1, N]; native NVFP4 [E, K/16, N]."""
+        if self.nv is not None:
+            return ws.shape[2], ws.shape[1] * 16
         return ws.shape[2], (ws.shape[1] - 1) * K.GROUP
 
     # folded-exponent kernels per GEMM (quant/ct.py decides per tensor at weight prep: layer._r9k_fold)
@@ -128,6 +133,8 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
         if sup is not None:
             sup(layer)
         self.fold = tuple(getattr(layer, "_r9k_fold", (False, False)))
+        self.nv = ((layer.w13_weight_row_mult, layer.w2_weight_row_mult)
+                   if getattr(layer, "_r9k_nvfp4", False) else None)
 
     def moe_problem_size(self, a1, w1, w2, topk_ids):
         N1, _ = self._dims(self.w1_scale)
@@ -163,10 +170,15 @@ class R9700Mxfp4Experts(mk.FusedMoEExpertsModular):
             tabs = route.take(getattr(self, "r9k_layer", None), topk_ids, blk, numel) if expert_map is None else None
             if tabs is None:
                 tabs = moe_align_block_size(topk_ids, blk, global_num_experts, expert_map)
-            passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1, self.fold[0]),
-                       K.Mxfp4Experts(w2, self.w2_scale, N2, K2, self.fold[1]), tabs)]
+            if self.nv is not None:
+                passes = [(K.Nvfp4Experts(w1, self.w1_scale, self.nv[0], N1, K1),
+                           K.Nvfp4Experts(w2, self.w2_scale, self.nv[1], N2, K2), tabs)]
+            else:
+                passes = [(K.Mxfp4Experts(w1, self.w1_scale, N1, K1, self.fold[0]),
+                           K.Mxfp4Experts(w2, self.w2_scale, N2, K2, self.fold[1]), tabs)]
         else:
             assert expert_map is None, "r9k expert cache: expert parallelism not supported"
+            assert self.nv is None, "r9k expert cache: MXFP4 layout only (native NVFP4 experts stay VRAM-resident)"
             (h1, h2), (c1, c2) = cache.hot(), cache.cold()
             if cache.fused:
                 # one launch: LRU manage + align over slots + align over host, then gather misses

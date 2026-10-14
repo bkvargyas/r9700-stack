@@ -114,6 +114,61 @@ for MT in (1, 2, 4):
     ok &= good
     print(f"  grouped E={E} top{top} T={T} MT={MT}: rel {rk:.2e} {'ok' if good else '<-- FAIL'}")
 
+# MoE method, native prep (quant/nvfp4.py prep_native_moe): a CT-layout layer (w13 = two shards with their own
+# global divisors, w2 one) -> bit-identical to prepare_nvfp4_weights on copies, and the grouped GEMM through the
+# layer's tensors matches the exact dequant reference (what R9700Mxfp4Experts.apply builds with nv set)
+from torch.nn.parameter import Parameter
+print("MoE method native prep")
+E, I, Kd, T, top = 8, 128, 512, 24, 2
+q13 = [[nvfp4_quant(w[:I]), nvfp4_quant(w[I:])] for w in [(torch.randn(2 * I, Kd, generator=g) * 0.02) for _ in range(E)]]
+P13 = torch.stack([torch.cat([a[0], b[0]]) for a, b in q13]).cuda()
+S13 = torch.stack([torch.cat([a[1], b[1]]) for a, b in q13]).cuda()
+G13 = torch.stack([torch.stack([a[2], b[2]]) for a, b in q13]).cuda()                 # [E, 2] shard divisors
+q2 = [nvfp4_quant(torch.randn(Kd, I, generator=g) * 0.02) for _ in range(E)]
+P2 = torch.stack([q[0] for q in q2]).cuda(); S2 = torch.stack([q[1] for q in q2]).cuda()
+G2 = torch.stack([q[2] for q in q2]).cuda()                                             # [E]
+div13 = G13.repeat_interleave(I, dim=1)                                                 # [E, 2I]
+div2 = G2[:, None].expand(-1, Kd)                                                       # [E, K]
+
+
+class _Layer:
+    pass
+
+
+layer = _Layer()
+layer.w13_weight_packed = Parameter(P13.clone(), requires_grad=False)
+layer.w13_weight_scale = Parameter(S13.clone(), requires_grad=False)
+layer.w2_weight_packed = Parameter(P2.clone(), requires_grad=False)
+layer.w2_weight_scale = Parameter(S2.clone(), requires_grad=False)
+NV.prep_native_moe(layer, div13, div2)
+R13 = K.prepare_nvfp4_weights(P13, S13, 1.0 / div13)
+R2 = K.prepare_nvfp4_weights(P2, S2, 1.0 / div2)
+same = (torch.equal(layer.w13_weight.data, R13.wq) and torch.equal(layer.w13_weight_scale.data, R13.ws)
+        and torch.equal(layer.w13_weight_row_mult.data, R13.wg) and torch.equal(layer.w2_weight.data, R2.wq)
+        and torch.equal(layer.w2_weight_scale.data, R2.ws) and torch.equal(layer.w2_weight_row_mult.data, R2.wg)
+        and not hasattr(layer, "w13_weight_packed") and layer._r9k_nvfp4 and layer._r9k_fold == (False, False))
+ok &= same
+print(f"  layer tensors == prepare_nvfp4_weights: {'ok' if same else '<-- FAIL'}")
+W13 = K.Nvfp4Experts(layer.w13_weight.data, layer.w13_weight_scale.data, layer.w13_weight_row_mult.data,
+                     layer.w13_weight_scale.shape[2], layer.w13_weight_scale.shape[1] * 16)
+good = (W13.N, W13.K) == (2 * I, Kd)
+ok &= good
+print(f"  dims from the scale tensor: N={W13.N} K={W13.K} {'ok' if good else '<-- FAIL'}")
+deq13 = [NV.dequant_nvfp4(P13[e].cpu(), S13[e].cpu(), div13[e].cpu().contiguous()) for e in range(E)]
+x = torch.randn(T, Kd, generator=g).to(torch.bfloat16).cuda()
+q, s = K.quant_rows_fp8(x)
+xd = (q.float() * s[:, None]).cpu()
+topk = torch.stack([torch.randperm(E, generator=g)[:top] for _ in range(T)])
+ref = torch.stack([torch.stack([xd[t] @ deq13[int(topk[t, j])].T for j in range(top)]) for t in range(T)]).reshape(T * top, 2 * I)
+sid, eid, ntpp = K.align_block_size_ref(topk, E, 16)
+out = torch.zeros(T * top, 2 * I, dtype=torch.bfloat16, device="cuda")
+K.moe_gemm(q, s, W13, out, sid.cuda(), eid.cuda(), ntpp.cuda(), T * top, top, None, *K.pick_cfg(2 * I, Kd, 16),
+           num_experts=E, MT=1)
+rk = rel(out.cpu(), ref)
+good = rk < 5e-3
+ok &= good
+print(f"  grouped gate_up GEMM through the layer tensors: rel {rk:.2e} {'ok' if good else '<-- FAIL'}")
+
 # speed: native NVFP4 vs MXFP4 (converted) on the same weights, dense decode shapes
 from r9700_vllm import ops
 
