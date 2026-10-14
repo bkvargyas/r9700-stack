@@ -42,7 +42,11 @@ class R9kAllReduce8:
         if self.flat.disabled:
             return
         self.fp32 = os.environ.get("R9K_AR8_FP32", "0") == "1"      # bf16: 22 us; fp32 (exact): 45 us (tests/test_ar8.py)
-        self.cross_kb = int(float(os.environ.get("R9K_AR8_CROSS_KB", "0")) * 1024)   # cross-stage slice bytes, 0 = whole
+        # cross-stage slice (tests/test_ar8.py: 32 KB messages 96 -> 69 us, 64 KB 250 -> 157 with 8 KB slices; 0 = whole)
+        self.cross_kb = int(float(os.environ.get("R9K_AR8_CROSS_KB", "8")) * 1024)
+        # above this the hierarchy loses to RCCL (64 KB: 157 us sliced vs RCCL 104) and so does the flat two-shot (449):
+        # should() declines and vLLM's communicator runs the message on RCCL. Only this 8-rank object looks at it.
+        self.max_kb = int(float(os.environ.get("R9K_AR8_MAX_KB", "40")) * 1024)
         g = dist.get_process_group_ranks(group)           # global ranks of the TP group, in TP-rank order
         # every rank must create every sub-group (new_group is collective over the world); keep ours
         pairs = [dist.new_group(ranks=[g[2 * i], g[2 * i + 1]], backend="gloo") for i in range(4)]
@@ -114,6 +118,8 @@ class R9kAllReduce8:
         return nw <= cap and n <= self.pair.max_bytes
 
     def should(self, x: torch.Tensor) -> bool:
+        if x.numel() * x.element_size() > self.max_kb:
+            return False                                     # RCCL: 104 us at 64 KB against 157 here, 449 flat
         return self._takes(x) or self.flat.should(x)
 
     def _zero(self, x: torch.Tensor) -> torch.Tensor:
@@ -136,7 +142,7 @@ class R9kAllReduce8:
 
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if not self._takes(x):
-            return self.flat.all_reduce(x)
+            return self.flat.all_reduce(x)                   # callers check should() first: never above max_kb
         flat = x.view(-1)
         work = flat.float() if self.fp32 and x.dtype != torch.float32 else flat
         y = self.pair.all_reduce(work)                       # both pair members: the pair sum
