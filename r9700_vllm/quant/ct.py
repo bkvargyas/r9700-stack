@@ -418,7 +418,10 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
             return R9kMx4UnquantMethod()
         pat = os.environ.get("R9K_FP8_LINEARS", "")
         if pat and type(m) is UnquantizedLinearMethod and re.search(pat, prefix or ""):
+            logger.info_once("r9700: R9K_FP8_LINEARS matched (first: %s) -> per-row fp8 on libr9k", prefix)
             return R9kFp8UnquantMethod()
+        if pat and os.environ.get("R9K_FP8_LINEARS_DEBUG") == "1":
+            logger.info("r9700: R9K_FP8_LINEARS no match: prefix=%r method=%s", prefix, type(m).__name__)
         return m
 
     def _is_nvfp4_moe(self, layer, prefix) -> bool:

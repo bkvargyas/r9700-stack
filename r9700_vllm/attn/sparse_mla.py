@@ -66,3 +66,47 @@ def sparse_mla(q: torch.Tensor, pool: torch.Tensor, indices: torch.Tensor, indpt
     if rc:
         raise RuntimeError(f"r9k_sparse_mla failed ({rc}) T={T} H={H} fp8={fp8} nsplit={nsplit}")
     return out
+
+
+# ------------------------------------------------------------------------------ skinny fp32 mm (indexer weights)
+def _skinny_lib():
+    L = lib()
+    if not hasattr(L.r9k_mm_f32_skinny, "_r9k_bound"):
+        L.r9k_mm_f32_skinny.restype = ctypes.c_int
+        L.r9k_mm_f32_skinny.argtypes = [ctypes.c_long] * 3 + [ctypes.c_int] * 3 + [ctypes.c_long] * 4
+        L.r9k_mm_f32_skinny._r9k_bound = True
+    return L
+
+
+def mm_f32_skinny(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """x [T, K] fp32 @ w [K, N] fp32 (N <= 32) -> [T, N] fp32, fp32 accumulate; same math as torch.mm in fp32."""
+    assert x.dtype == torch.float32 and w.dtype == torch.float32 and x.dim() == 2 and w.dim() == 2
+    assert x.stride(1) == 1 and w.stride(1) == 1 and x.shape[1] == w.shape[0] and w.shape[1] <= 32
+    out = torch.empty((x.shape[0], w.shape[1]), dtype=torch.float32, device=x.device)
+    rc = _skinny_lib().r9k_mm_f32_skinny(x.data_ptr(), w.data_ptr(), out.data_ptr(), x.shape[0], x.shape[1], w.shape[1],
+                                         x.stride(0), w.stride(0), out.stride(0), torch.cuda.current_stream().cuda_stream)
+    if rc:
+        raise RuntimeError(f"r9k_mm_f32_skinny failed ({rc}) {tuple(x.shape)} x {tuple(w.shape)}")
+    return out
+
+
+class SkinnyWeight(torch.Tensor):
+    """An fp32 [K, N] weight whose torch.mm(x, self) runs on r9k_mm_f32_skinny (every other op: plain tensor). Used
+    for the indexer's cached head-weight projection, which the model computes with a 1 x 4096 x 32 fp32 torch.mm that
+    costs ~200 us per call on hipBLASLt/rocBLAS at decode."""
+
+    @staticmethod
+    def __new__(cls, t: torch.Tensor):
+        return torch.Tensor._make_subclass(cls, t, require_grad=False)
+
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        kwargs = kwargs or {}
+        if func is torch.mm and len(args) == 2 and isinstance(args[1], SkinnyWeight) and isinstance(args[0], torch.Tensor) \
+                and args[0].dtype == torch.float32 and args[0].dim() == 2 and args[0].stride(1) == 1:
+            w = torch.Tensor._make_subclass(torch.Tensor, args[1], require_grad=False)
+            return mm_f32_skinny(args[0], w)
+        plain = tuple(torch.Tensor._make_subclass(torch.Tensor, a, require_grad=False) if isinstance(a, SkinnyWeight) else a
+                      for a in args)
+        with torch._C.DisableTorchFunctionSubclass():
+            return func(*plain, **kwargs)

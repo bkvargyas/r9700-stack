@@ -173,6 +173,30 @@ def _install_sparse_mla() -> bool:
     return True
 
 
+# ----------------------------------------------------------------------------- indexer head-weight mm
+def _install_indexer_weights() -> bool:
+    """The indexer computes its per-head weights as torch.mm(hidden.float(), W_fp32) with W a [4096, 32] exact upcast
+    of a bf16 weight: ~200 us per call on hipBLASLt/rocBLAS at decode, 11 calls a step (4.6 ms of a 24 ms step). Hand
+    the cached fp32 weight over as a SkinnyWeight so that one torch.mm runs on r9k_mm_f32_skinny (same fp32 math).
+    The model fills the cache lazily on its first forward; this wrapper fills it first, the same way."""
+    from ..attn.sparse_mla import SkinnyWeight, available
+    if not available():
+        return False
+    from vllm.models.glm5next.common import attention as A
+    cls = A.Indexer
+    orig = cls.forward
+
+    def forward(self, hidden_states, qr, positions, rotary_emb):
+        if getattr(self, "_wp_fp32", None) is None and hasattr(self, "wk_weights_proj") and hasattr(self, "head_dim"):
+            w = self.wk_weights_proj.weight.data[self.head_dim:, :].t().contiguous().float()
+            self._wp_fp32 = SkinnyWeight(w) if w.shape[1] <= 32 else w
+        return orig(self, hidden_states, qr, positions, rotary_emb)
+
+    forward.__r9k_patch__ = "glm5next_rdna4"
+    cls.forward = forward
+    return True
+
+
 def patch() -> bool:
     global _PATCHED
     if _PATCHED:
@@ -204,6 +228,11 @@ def patch() -> bool:
             done.append("sparse-mla:libr9k(%s)" % os.environ.get("R9K_SPARSE_MLA", "auto"))
     except Exception as e:
         logger.warning("r9700: glm5next sparse MLA hook not installed (%s)", e)
+    try:
+        if os.environ.get("R9K_INDEXER_MM", "1") == "1" and _install_indexer_weights():
+            done.append("indexer-weights:r9k_mm_f32_skinny")
+    except Exception as e:
+        logger.warning("r9700: glm5next indexer weights hook not installed (%s)", e)
     _PATCHED = True
     logger.info("r9700: glm5next on RDNA4: %s", ", ".join(done) or "nothing to do")
     return bool(done)

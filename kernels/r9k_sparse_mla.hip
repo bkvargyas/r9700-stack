@@ -288,3 +288,42 @@ extern "C" int r9k_sparse_mla(long q_ptr, long pool_ptr, long indices_ptr, long 
                        (uint16_t*)out_ptr, nheads, out_stride_t, out_stride_h, out_mult, nsplit);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
+
+// ---------------------------------------------------------------- skinny fp32 GEMM (indexer head weights)
+// out[t, n] = sum_k x[t, k] * w[k, n], fp32 in / fp32 accumulate / fp32 out, N <= 32 (GLM-5.3-Flash: 32 indexer heads,
+// K = 4096). hipBLASLt and rocBLAS both spend ~200 us on this shape at decode; this is a few microseconds.
+// Block = 256 threads per token: wave w owns columns [4 w, 4 w + 4), lane strides K by 32.
+namespace {
+__global__ void __launch_bounds__(256) skinny_f32_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                         float* __restrict__ out, int K, int N, long x_stride,
+                                                         long w_stride, long out_stride) {
+  const int t = blockIdx.x, wave = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int n0 = wave * 4;
+  if (n0 >= N) return;
+  const float* xr = x + (long)t * x_stride;
+  float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
+  for (int k = lane; k < K; k += 32) {
+    const float xv = xr[k];
+    const float* wr = w + (long)k * w_stride + n0;
+    a0 = fmaf(xv, wr[0], a0);
+    if (n0 + 1 < N) a1 = fmaf(xv, wr[1], a1);
+    if (n0 + 2 < N) a2 = fmaf(xv, wr[2], a2);
+    if (n0 + 3 < N) a3 = fmaf(xv, wr[3], a3);
+  }
+  a0 = wave_sum(a0); a1 = wave_sum(a1); a2 = wave_sum(a2); a3 = wave_sum(a3);
+  if (lane == 0) {
+    float* o = out + (long)t * out_stride + n0;
+    o[0] = a0;
+    if (n0 + 1 < N) o[1] = a1;
+    if (n0 + 2 < N) o[2] = a2;
+    if (n0 + 3 < N) o[3] = a3;
+  }
+}
+}  // namespace
+extern "C" int r9k_mm_f32_skinny(long x_ptr, long w_ptr, long out_ptr, int T, int K, int N, long x_stride,
+                                 long w_stride, long out_stride, long stream) {
+  if (T <= 0 || K <= 0 || N <= 0 || N > 32) return -1;
+  hipLaunchKernelGGL(skinny_f32_kernel, dim3(T), dim3(256), 0, (hipStream_t)stream, (const float*)x_ptr,
+                     (const float*)w_ptr, (float*)out_ptr, K, N, x_stride, w_stride, out_stride);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
