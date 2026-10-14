@@ -171,6 +171,25 @@ def _install_sparse_mla() -> bool:
     forward_mqa.__r9k_patch__ = "glm5next_rdna4"
     cls.forward_mqa = forward_mqa
 
+    # The metadata builder keys its aiter persistent-metadata path (aiter.get_mla_metadata_v1, a CDNA kernel) on
+    # "not the Triton sparse path", and the Triton path is defined as non-fp8. With our kernel serving the fp8 pool
+    # the builder must take the Triton-shaped metadata (plain ragged indptr/indices, no aiter work metadata), so the
+    # selector answers True whenever the hook takes over. Module-level function: patched in place.
+    orig_sel = B._use_rocm_sparse_triton
+
+    def _use_rocm_sparse_triton(*, kv_cache_dtype, head_size, kv_lora_rank, num_prefills, num_decodes,
+                                num_decode_tokens, max_query_len):
+        fp8 = str(kv_cache_dtype).startswith("fp8")
+        if (mode == "r9k" or (mode == "auto" and fp8)) and head_size == kv_lora_rank == 512 \
+                and (num_prefills > 0 or num_decodes > 0):
+            return True
+        return orig_sel(kv_cache_dtype=kv_cache_dtype, head_size=head_size, kv_lora_rank=kv_lora_rank,
+                        num_prefills=num_prefills, num_decodes=num_decodes, num_decode_tokens=num_decode_tokens,
+                        max_query_len=max_query_len)
+
+    _use_rocm_sparse_triton.__r9k_patch__ = "glm5next_rdna4"
+    B._use_rocm_sparse_triton = _use_rocm_sparse_triton
+
     # With an fp8 cache the MLA layer pre-quantizes the query to fp8 (fused concat+quant) when the impl declares
     # supports_quant_query_input, and the stock fp8 path then runs CDNA assembly (a GPU fault on gfx1201). Our
     # kernel wants the bf16 latent query, so the impl declines quantized queries whenever the hook will take over.
