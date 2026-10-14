@@ -170,6 +170,20 @@ def _install_sparse_mla() -> bool:
 
     forward_mqa.__r9k_patch__ = "glm5next_rdna4"
     cls.forward_mqa = forward_mqa
+
+    # With an fp8 cache the MLA layer pre-quantizes the query to fp8 (fused concat+quant) when the impl declares
+    # supports_quant_query_input, and the stock fp8 path then runs CDNA assembly (a GPU fault on gfx1201). Our
+    # kernel wants the bf16 latent query, so the impl declines quantized queries whenever the hook will take over.
+    orig_init = cls.__init__
+
+    def __init__(self, *a, **k):
+        orig_init(self, *a, **k)
+        fp8 = str(getattr(self, "kv_cache_dtype", "")).startswith("fp8")
+        if mode == "r9k" or (mode == "auto" and fp8):
+            self.supports_quant_query_input = False
+
+    __init__.__r9k_patch__ = "glm5next_rdna4"
+    cls.__init__ = __init__
     return True
 
 
