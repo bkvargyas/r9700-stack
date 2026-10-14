@@ -33,7 +33,8 @@ otherwise call `aiter.get_mla_metadata_v1`, a CDNA kernel, and the pending error
 | + skinny indexer mm + KDA fp8 + ag8 | 52.5 |
 | fp8 KV cache (our sparse kernel) | 52.9, KV capacity 291k -> 436k tokens at 8k max-len |
 | MTP, 1 draft token (Red Hat's unmodified checkpoint, which ships the MTP layer) | 72.3, 75% draft acceptance |
-| MTP 1 draft + fp8 KV | 75.2, 78% acceptance; four streams 89 aggregate (MTP off: 129), so MTP for one or two streams only |
+| MTP 1 draft + fp8 KV | 75.2-75.9; four streams 108 aggregate (MTP off: 127-129), so MTP for one or two streams only |
+| draft acceptance (1 draft, temp 0) | 72% on a story, 99.5% on a verbatim copy: the proposer path is right, the head is as good as the text is predictable |
 | native NVFP4 experts (exact checkpoint bits, opt-in) | 52.8 MTP off, 74.1 MTP 1 draft; GSM8K 96/100 |
 
 Concurrency (256-token streams): 1 -> 44, 2 -> 76 aggregate, 4 -> 129 aggregate (native experts: 127).
