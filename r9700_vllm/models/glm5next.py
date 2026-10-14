@@ -207,6 +207,46 @@ def _install_sparse_mla() -> bool:
 
 
 # ----------------------------------------------------------------------------- indexer head-weight mm
+def _install_draft_metadata_update() -> bool:
+    """Let the speculator refresh the sparse-MLA decode metadata inside its draft graph. With two or more draft
+    tokens the GPU speculator records every draft step in ONE HIP graph when each attention builder declares
+    supports_draft_decode_metadata_update; stock's ROCm sparse builder leaves it False, so the server fell back to an
+    eager build() between draft steps (numpy token map + pinned H2D copy, per step, per request batch). On the
+    Triton-shaped metadata our hook serves, a decode step's refresh is two device ops over persistent buffers:
+    the token -> request map (the identity at one query a request) and paged_kv_indptr = cumsum(min(seq_len, topk)).
+    build() reads the runner's seq_lens but does not keep it, so build is wrapped to stash that view."""
+    from vllm.v1.attention.backends.mla import rocm_aiter_mla_sparse as B
+    from vllm.v1.attention.ops.metadata import compute_token_to_req_indices
+    bld = B.ROCMAiterMLASparseMetadataBuilder
+    if getattr(bld.build, "__r9k_patch__", None):
+        return True
+    orig_build = bld.build
+
+    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+        md = orig_build(self, common_prefix_len, common_attn_metadata, fast_build)
+        md._r9k_seq_lens = common_attn_metadata.seq_lens          # view of a runner / speculator buffer
+        return md
+
+    def update_draft_decode_metadata(self, metadata):
+        n = metadata.num_decode_tokens
+        if n == 0:
+            return
+        assert metadata.num_prefills == 0 and metadata.num_decodes == n, \
+            ("r9k draft update: decode-only batches", metadata.num_prefills, metadata.num_decodes, n)
+        seq_lens = getattr(metadata, "_r9k_seq_lens", None)
+        assert seq_lens is not None, "r9k draft update: metadata built without the seq_lens view"
+        compute_token_to_req_indices(metadata.query_start_loc, metadata.req_id_per_token, n, n)
+        sparse = torch.clamp(seq_lens[:n], max=self.topk_tokens)      # generate_sparse_seqlen at query_len == 1
+        torch.cumsum(sparse, dim=0, out=metadata.paged_kv_indptr[1:n + 1])
+
+    build.__r9k_patch__ = "glm5next_rdna4"
+    update_draft_decode_metadata.__r9k_patch__ = "glm5next_rdna4"
+    bld.build = build
+    bld.update_draft_decode_metadata = update_draft_decode_metadata
+    bld.supports_draft_decode_metadata_update = True
+    return True
+
+
 def _install_indexer_weights() -> bool:
     """The indexer computes its per-head weights as torch.mm(hidden.float(), W_fp32) with W a [4096, 32] exact upcast
     of a bf16 weight: ~200 us per call on hipBLASLt/rocBLAS at decode, 11 calls a step (4.6 ms of a 24 ms step). Hand
@@ -302,6 +342,11 @@ def patch() -> bool:
             done.append("sparse-mla:libr9k(%s)" % os.environ.get("R9K_SPARSE_MLA", "auto"))
     except Exception as e:
         logger.warning("r9700: glm5next sparse MLA hook not installed (%s)", e)
+    try:
+        if os.environ.get("R9K_DRAFT_META", "1") == "1" and _install_draft_metadata_update():
+            done.append("draft-metadata:in-graph")
+    except Exception as e:
+        logger.warning("r9700: glm5next draft metadata hook not installed (%s)", e)
     try:
         if os.environ.get("R9K_INDEXER_MM", "1") == "1" and _install_indexer_weights():
             done.append("indexer-weights:r9k_mm_f32_skinny")
