@@ -89,6 +89,8 @@ def mtp_weights(weights, mtp_mxfp4: bool):
         if _DROP_MTP_HEAD.search(name):
             dropped.append(name)
             continue
+        if _DROP_ATTN_SCALE.search(name):
+            continue
         if mtp_mxfp4 and _MTP_MLP_FP8.search(name):
             base = name.rsplit(".", 1)[0]
             kind = "scale" if name.endswith(("weight_scale_inv", "weight_scale")) else "w"

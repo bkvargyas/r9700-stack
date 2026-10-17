@@ -83,7 +83,8 @@ s = torch.rand(5, 2) + 0.5
 mt = list(Q.mtp_weights([("mtp.lm_head.weight_q4", 0),
                          ("mtp.layers.0.mlp.experts.7.up_proj.weight", w),
                          ("mtp.layers.0.mlp.experts.7.up_proj.weight_scale_inv", s),
-                         ("mtp.layers.0.self_attn.o_proj.weight_scale_inv", 3)], True))
+                         ("mtp.layers.0.self_attn.o_proj.weight_scale_inv", 3),
+                         ("mtp.layers.0.self_attn.attn.k_scale", 4)], True))
 mn = {n: t for n, t in mt}
 check("MTP filter: fork head dropped, fp8 expert -> MXFP4, scale renamed",
       set(mn) == {"mtp.layers.0.mlp.experts.7.up_proj.weight_packed", "mtp.layers.0.mlp.experts.7.up_proj.weight_scale",
