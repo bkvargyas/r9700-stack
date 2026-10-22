@@ -73,6 +73,25 @@ argmax. Together: 78.4 single stream, 158 at four streams. Not taken: per-row fp
 remaining bf16 projections (33 more linears: -6% single stream, lower acceptance, GSM8K 97) and a DMA-engine
 all-reduce for 32 KB (the ar4 SDMA mode's flag kernels alone cost 20-28 us each).
 
+## Long context (2026-10-19 to 10-22)
+
+A 262,144-token launch fits (415k KV tokens with a fixed 2.7 GiB KV budget, `KVMEM=2.7`) and serves 236k-token
+requests without faults. The fixed budget matters: at 0.94 utilisation a 131k request died in the stock ROCm
+indexer's prefill, which materialises a `[step tokens, context]` logits buffer per step and found 0 bytes free.
+Prefill: 2,100-2,300 tok/s at 2k-token steps, 3,100 at 8k steps (`NBT=8192`, worth keeping); 32k-token steps run
+the cards out of memory in that same buffer. Decode at depth with MTP: 97 tok/s at 73k, 82 at 151k.
+
+Retrieval is unreliable above roughly 12k-21k tokens on this nightly: a unique needle sentence is found at 3k
+and 6k and missed from 12.7k on (the boundary moved with the launch's max length: 12.7k passed on the 262k launch,
+failed on the 65k one). The failure is identical with every piece of this stack switched off -- stock bf16
+attention, stock indexer weights, bf16 KDA projections, RCCL for every collective, no MTP -- so it is the stock
+GLM-5.3 long-context path on ROCm (the indexer's chunked top-k or the KDA chunked prefill) or the model itself,
+not ours. A single-step prefill would separate those two but does not fit in 32 GB. Parked; an offline reproducer
+of the indexer's prefill top-k is the next step.
+
+Stability at 32k: 16 streams, sanity 96/96 after 24k-token prefills (`THINK=1`, the strict check needs the
+reasoning in its own field for this model), 15-minute mixed soak 0 errors, VRAM flat.
+
 ## The fabric cliff (measured, `tests/test_ar_nrank.py`, `tests/test_ar8.py`)
 
 Four ranks on any two switches: one-shot 6.8-10 us. Eight ranks on four: 126-288 us. Four ranks on four switches
