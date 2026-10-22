@@ -42,6 +42,18 @@ def pack_scales_gpu(scale: torch.Tensor, device) -> torch.Tensor:
     return out
 
 
+def nvfp4_scales_gpu(scale16: torch.Tensor, device) -> torch.Tensor:
+    """[E, N, K/16] e4m3 per-16 scales (GPU or UVA) -> [E, K/16, N] uint8 bits on `device` (the K-step-major
+    layout kernels/moe.py Nvfp4Experts.ws uses), chunked by expert."""
+    E, N, S = scale16.shape
+    out = torch.empty((E, S, N), dtype=torch.uint8, device=device)
+    step = max(1, _CHUNK_BYTES // (N * S))
+    for e0 in range(0, E, step):
+        e1 = min(E, e0 + step)
+        out[e0:e1].copy_(scale16[e0:e1].to(device).view(torch.uint8).transpose(1, 2))
+    return out
+
+
 def as_param(t: torch.Tensor, like: torch.nn.Parameter) -> torch.nn.Parameter:
     p = torch.nn.Parameter(t, requires_grad=False)
     if getattr(like, "_vllm_is_uva_offloaded", False):

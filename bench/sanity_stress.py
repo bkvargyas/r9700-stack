@@ -21,9 +21,16 @@ WORDS = ("In distributed systems the tension between consistency, availability, 
          "every design decision. A service that prioritizes strong consistency may reject writes during a network "
          "split, while an available-first design accepts them and reconciles later.").split()
 
+# THINK=1: reasoning models whose template narrates INTO the content when thinking is off (GLM-5.3) -- let them think
+# (the reasoning lands in the separate field) and give the answer room; the strict check still reads content only.
+THINK = os.environ.get("THINK", "0") == "1"
+
+
 def post(content, max_tokens, temperature=0):
+    if THINK and max_tokens < 1024:
+        max_tokens = 1024
     b = {"model": "Qwen3.8", "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,
-         "temperature": temperature, "chat_template_kwargs": {"enable_thinking": False}}
+         "temperature": temperature, "chat_template_kwargs": {"enable_thinking": THINK}}
     try:
         r = json.loads(urllib.request.urlopen(urllib.request.Request(B + "/v1/chat/completions", json.dumps(b).encode(),
                                               {"Content-Type": "application/json"}), timeout=900).read())

@@ -2,9 +2,9 @@
 # Qwen3.8-Flash-Next GPTQ on STOCK vLLM (ROCm 10 nightly image) + the r9700_vllm plugin, 2x R9700 TP2.
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
-# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
+# Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, KVDTYPE=fp8, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
 #   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
-#   side by side need distinct GPUS/PORT/NAME), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
+#   side by side need distinct GPUS/PORT/NAME), SERVED_NAME=Qwen3.8 (the model name the API serves), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
 REPO=${REPO:-$HOME/r9700-build/repo}
@@ -67,6 +67,9 @@ OFFL=(); [ "${OFFLOAD_GB:-34}" != 0 ] && OFFL=(--cpu-offload-gb ${OFFLOAD_GB:-34
 # 1.2 GiB free at the peak of a 5.7-minute burst (a full soak of that case is still owed). UTIL=0.94 restores.
 UTIL=${UTIL:-$([ "${OFFLOAD_GB:-34}" != 0 ] && [ "${TP:-2}" = 2 ] && echo 0.96 || echo 0.94)}
 [ "${EAGER:-0}" = 1 ] && ARGS+=(--enforce-eager)
+# KVDTYPE=fp8: fp8 KV cache (vLLM --kv-cache-dtype; unset = "auto" = the model dtype). On GLM-5.3-Flash only the 11 sparse-MLA
+# layers hold KV; the gfx1201 path for an fp8 pool is aiter's Triton sparse_mla_fwd (plugin models/glm5next.py), scales 1.0.
+[ -n "$KVDTYPE" ] && ARGS+=(--kv-cache-dtype "$KVDTYPE")
 # PREFIX_CACHE=0: disable prefix caching. On hybrid (GDN + attention) models prefix caching puts the mamba cache in
 # "align" mode, and the scheduler then aligns every prefill chunk end to the mamba block size, so a prompt that is
 # not a multiple of it costs an extra forward pass (~285 ms of CPU-bound Python each; a 1.5k prompt ran as two).
@@ -107,7 +110,7 @@ MTP=${MTP-3}
 if [ -n "$DRAFT" ]; then
   ARGS+=(--speculative-config "{\"model\": \"$DRAFT\", \"num_speculative_tokens\": ${SPEC:-7}${SPEC_METHOD:+, \"method\": \"$SPEC_METHOD\"}${DRAFT_ATTN:+, \"attention_backend\": \"$DRAFT_ATTN\"}${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 elif [ -n "$MTP" ]; then
-  ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP}")
+  ARGS+=(--speculative-config "{\"method\": \"mtp\", \"num_speculative_tokens\": $MTP${SPEC_EXTRA:+, $SPEC_EXTRA}}")
 fi
 # DRYRUN=1: print the assembled docker command and exit (config check without touching the GPUs)
 if [ "${DRYRUN:-0}" = 1 ]; then
@@ -126,7 +129,7 @@ sudo docker run -d --name ${NAME:-vllmstock} --ipc=host --network=host ${PIDNS--
   $DOCKER_ARGS "${MNT[@]}" -v $HOME/models:/models -v $HOME/vllmstock-cache-$CKEY:/root/.cache/vllm \
   -v $HOME/vllmstock-triton:/root/.triton \
   "${ENTRY[@]}" $IMG "${PRE[@]}" ${MODEL:-/models/Qwen3.8-Flash-Next-MXFP4-FP8-GPTQ} \
-  --served-model-name Qwen3.8 --host 0.0.0.0 --port ${PORT:-8080} \
+  --served-model-name ${SERVED_NAME:-Qwen3.8} --host 0.0.0.0 --port ${PORT:-8080} \
   --tensor-parallel-size ${TP:-2} --max-model-len ${MAXLEN:-32768} --max-num-seqs ${NSEQ:-4} \
   --max-num-batched-tokens ${NBT:-4096} --gpu-memory-utilization $UTIL \
   "${OFFL[@]}" \

@@ -42,6 +42,9 @@ from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compress
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_nvfp4 import (
     CompressedTensorsW4A4Fp4,
 )
+from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a16_fp8 import (
+    CompressedTensorsW8A16Fp8,
+)
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
@@ -72,8 +75,11 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
         logger.info_once("r9700: CT MXFP4 MoE -> R9700Mxfp4Experts (libr9k grouped MXFP4xFP8)")
 
     def process_weights_after_loading(self, layer) -> None:
-        from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
-        from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import make_mxfp4_moe_kernel
+        self._prep_mxfp4(layer)
+        self._install_kernel(layer)
+        prep.maybe_attach_cache(self, layer)
+
+    def _prep_mxfp4(self, layer) -> None:
         dev = torch.device("cuda", torch.cuda.current_device())
         w13p, w2p = layer.w13_weight_packed, layer.w2_weight_packed
         w13 = prep.permute_in_place(w13p.data)
@@ -89,6 +95,11 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
         from ..kernels.moe import fold_decide
         name = getattr(layer, "layer_name", "") or "moe"
         layer._r9k_fold = (fold_decide(s13, name + ".w13", logger.info), fold_decide(s2, name + ".w2", logger.info))
+
+    def _install_kernel(self, layer) -> None:
+        """The libr9k experts kernel over whatever _prep_* left on the layer (MXFP4 packed, or native NVFP4)."""
+        from vllm.model_executor.layers.fused_moe.config import mxfp4_w4a16_moe_quant_config
+        from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import make_mxfp4_moe_kernel
         self.moe_quant_config = mxfp4_w4a16_moe_quant_config(w1_scale=layer.w13_weight_scale,
                                                              w2_scale=layer.w2_weight_scale)
         self.moe_kernel = make_mxfp4_moe_kernel(
@@ -97,7 +108,6 @@ class R9kMxfp4MoEMethod(CompressedTensorsW4A4Mxfp4MoEMethod):
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
         self.moe_kernel.fused_experts.r9k_layer = layer     # where moe/route.py leaves the routing tables
         fold.alias(self.moe_kernel)                          # no finalize copy: experts write the output
-        prep.maybe_attach_cache(self, layer)
 
 
 # ------------------------------------------------------------------------------------------------ fp8 block
@@ -360,6 +370,15 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
         scheme = super().get_scheme(layer=layer, layer_name=layer_name)
         if scheme is None or not r9k_available():
             return scheme
+        if isinstance(scheme, CompressedTensorsW8A16Fp8) and not _off("fp8_w8a16") \
+                and not scheme.is_static_input_scheme:
+            # fp8 weight-only linears (W8A16: fp8 weights, bf16 activations; e.g. the dense/shared/attention
+            # projections of coolbho3k's GLM-5.3-Flash NVFP4 export). Stock serves them through CUDA Marlin only, so
+            # on ROCm the kernel search fails at construction. Serve them as W8A8 dynamic instead (same fp8 bytes
+            # and scales, activations quantized per token / per 128-group like the fp8 base checkpoints), which the
+            # branches below then put on libr9k. R9K_DISABLE=fp8_w8a16 keeps stock.
+            scheme = CompressedTensorsW8A8Fp8(weight_quant=scheme.weight_quant, is_static_input_scheme=False)
+            logger.info_once("r9700: fp8 weight-only (W8A16) linears -> W8A8 dynamic fp8 (no ROCm W8A16 kernel)")
         if isinstance(scheme, CompressedTensorsW4A4Mxfp4) and not _off("linear"):
             from ..linear.mxfp4 import R9700Mxfp4LinearKernel
             from vllm.model_executor.kernels.linear.mxfp4.base import MxFp4LinearLayerConfig
@@ -406,7 +425,10 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
             return R9kMx4UnquantMethod()
         pat = os.environ.get("R9K_FP8_LINEARS", "")
         if pat and type(m) is UnquantizedLinearMethod and re.search(pat, prefix or ""):
+            logger.info_once("r9700: R9K_FP8_LINEARS matched (first: %s) -> per-row fp8 on libr9k", prefix)
             return R9kFp8UnquantMethod()
+        if pat and os.environ.get("R9K_FP8_LINEARS_DEBUG") == "1":
+            logger.info("r9700: R9K_FP8_LINEARS no match: prefix=%r method=%s", prefix, type(m).__name__)
         return m
 
     def _is_nvfp4_moe(self, layer, prefix) -> bool:
