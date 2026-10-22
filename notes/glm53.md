@@ -92,6 +92,15 @@ of the indexer's prefill top-k is the next step.
 Stability at 32k: 16 streams, sanity 96/96 after 24k-token prefills (`THINK=1`, the strict check needs the
 reasoning in its own field for this model), 15-minute mixed soak 0 errors, VRAM flat.
 
+## Qwen gates on this tree (2026-10-22, `~/validate-glm53-qwen.sh`)
+
+The production configurations must not move; they did not. 27B TP2: single-stream 219.4 tok/s (v0.3.3 ~221),
+4.5 tokens a step, 515 / 585 at 8 / 16 streams, 8k prefill 3,830; 26-minute soak 286 requests 0 errors, VRAM flat;
+strict sanity 0 bad of 2,900. Flash-Next TP4: 223.1 tok/s single-stream (v0.3.3 225.0), 3.11 tokens a step, 610 /
+930 at 8 / 16 streams, 8k prefill 6,847; BetterBench combined 185.3 (v0.3.3 188.0), update p99 15.2 ms, prompt
+processing 7.1-7.4k tok/s; 25-minute soak 806 requests 0 errors, VRAM flat; strict sanity 0 bad of 5,380. Comm tests
+(ag_nrank, ar_nrank 4 ranks, ar_race) and every single-GPU kernel gate pass. No server errors, no MES timeouts.
+
 ## The fabric cliff (measured, `tests/test_ar_nrank.py`, `tests/test_ar8.py`)
 
 Four ranks on any two switches: one-shot 6.8-10 us. Eight ranks on four: 126-288 us. Four ranks on four switches
