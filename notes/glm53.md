@@ -92,6 +92,10 @@ argmax. The prefill side (gather, aiter prefill logits, top-k op) is exact. `att
 kernel that reads the tiled layout and matches the reference to 0.1 on logits of 100-180 at every size up to 65k
 pools, for one row and for MTP verify rows, in 92-100 us against the stock kernel's 153-158; `_install_paged_logits`
 (glm5next.py) swaps it in where the wrapper would take the fall-through (`R9K_INDEXER_LOGITS=stock` restores).
+With it, on a 262k launch, the unique needle is found at 67k, 150k and 216k (prefill 2.7-2.8k tok/s, decode at
+depth 61-107 tok/s, acceptance 76-91%); the near-duplicate numbered needle holds to 35k and is hit-or-miss
+beyond (the model reasons without concluding), which is the task's difficulty rather than a kernel fault.
+GSM8K 95/100, decode probe 74.7 tok/s (the usual 70-80 band).
 
 Stability at 32k: 16 streams, sanity 96/96 after 24k-token prefills (`THINK=1`, the strict check needs the
 reasoning in its own field for this model), 15-minute mixed soak 0 errors, VRAM flat.
