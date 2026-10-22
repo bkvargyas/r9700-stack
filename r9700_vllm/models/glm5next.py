@@ -247,6 +247,34 @@ def _install_draft_metadata_update() -> bool:
     return True
 
 
+def _install_paged_logits() -> bool:
+    """Decode-side indexer logits over the tiled paged K cache (attn/indexer_logits.py). Stock's ROCm wrapper reads
+    that cache back with aiter's pre-shuffle Gluon kernel on gfx942/gfx950 only; on every other GPU it falls through to
+    aiter's stage-1 kernel, which reads a linear page, so the logits are scrambled and retrieval fails above ~12k tokens
+    (notes/glm53.md). Taken whenever the wrapper would take that fall-through and the cache is paged (page > 1)."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
+    from vllm.v1.worker.workspace import current_workspace_manager
+    from ..attn.indexer_logits import paged_mqa_logits
+    if getattr(O.rocm_fp8_paged_mqa_logits, "__r9k_patch__", None):
+        return True
+    if getattr(O, "_ON_GFX942", False) or getattr(O, "_ON_GFX950", False):
+        return False                                      # stock has the pre-shuffle reader there
+    orig = O.rocm_fp8_paged_mqa_logits
+
+    def rocm_fp8_paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata,
+                                  max_model_len, *, compress_ratio=1):
+        if kv_cache_fp8.shape[1] <= 1:
+            return orig(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, schedule_metadata, max_model_len,
+                        compress_ratio=compress_ratio)
+        rows = q_fp8.shape[0] * q_fp8.shape[1]
+        (out,) = current_workspace_manager().get_simultaneous(((rows, max_model_len), torch.float32))
+        return paged_mqa_logits(q_fp8, kv_cache_fp8, weights, context_lens, block_tables, max_model_len, out=out)
+
+    rocm_fp8_paged_mqa_logits.__r9k_patch__ = "glm5next_rdna4"
+    O.rocm_fp8_paged_mqa_logits = rocm_fp8_paged_mqa_logits
+    return True
+
+
 def _install_indexer_weights() -> bool:
     """The indexer computes its per-head weights as torch.mm(hidden.float(), W_fp32) with W a [4096, 32] exact upcast
     of a bf16 weight: ~200 us per call on hipBLASLt/rocBLAS at decode, 11 calls a step (4.6 ms of a 24 ms step). Hand
@@ -342,6 +370,11 @@ def patch() -> bool:
             done.append("sparse-mla:libr9k(%s)" % os.environ.get("R9K_SPARSE_MLA", "auto"))
     except Exception as e:
         logger.warning("r9700: glm5next sparse MLA hook not installed (%s)", e)
+    try:
+        if os.environ.get("R9K_INDEXER_LOGITS", "r9k") != "stock" and _install_paged_logits():
+            done.append("indexer-logits:r9k-tiled")
+    except Exception as e:
+        logger.warning("r9700: glm5next indexer paged-logits hook not installed (%s)", e)
     try:
         if os.environ.get("R9K_DRAFT_META", "1") == "1" and _install_draft_metadata_update():
             done.append("draft-metadata:in-graph")

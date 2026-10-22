@@ -81,13 +81,17 @@ indexer's prefill, which materialises a `[step tokens, context]` logits buffer p
 Prefill: 2,100-2,300 tok/s at 2k-token steps, 3,100 at 8k steps (`NBT=8192`, worth keeping); 32k-token steps run
 the cards out of memory in that same buffer. Decode at depth with MTP: 97 tok/s at 73k, 82 at 151k.
 
-Retrieval is unreliable above roughly 12k-21k tokens on this nightly: a unique needle sentence is found at 3k
-and 6k and missed from 12.7k on (the boundary moved with the launch's max length: 12.7k passed on the 262k launch,
-failed on the 65k one). The failure is identical with every piece of this stack switched off -- stock bf16
-attention, stock indexer weights, bf16 KDA projections, RCCL for every collective, no MTP -- so it is the stock
-GLM-5.3 long-context path on ROCm (the indexer's chunked top-k or the KDA chunked prefill) or the model itself,
-not ours. A single-step prefill would separate those two but does not fit in 32 GB. Parked; an offline reproducer
-of the indexer's prefill top-k is the next step.
+Retrieval was unreliable above roughly 12k tokens on this nightly: a unique needle sentence found at 3k and 6k,
+missed from 12.7k on, identically with every piece of this stack switched off. The offline reproducer
+(`tests/test_indexer_logits_r9k.py`) found the cause on the decode side. The indexer's K cache is written by vLLM's
+kpool compress kernel in pages of 64 pooled entries laid out in 16-entry x 16-dim tiles. On gfx942/gfx950 stock reads
+it back with aiter's pre-shuffle Gluon kernel; on every other GPU its wrapper falls through to aiter's stage-1
+kernel, which reads a linear page. The scores it returns are scrambled: against the torch reference on the same
+cache bytes, top-512 overlap 70% at 760 pools, 18% at 3.2k, 8% at 8k, 3% at 32k, and a planted needle is never the
+argmax. The prefill side (gather, aiter prefill logits, top-k op) is exact. `attn/indexer_logits.py` is a Triton
+kernel that reads the tiled layout and matches the reference to 0.1 on logits of 100-180 at every size up to 65k
+pools, for one row and for MTP verify rows, in 92-100 us against the stock kernel's 153-158; `_install_paged_logits`
+(glm5next.py) swaps it in where the wrapper would take the fall-through (`R9K_INDEXER_LOGITS=stock` restores).
 
 Stability at 32k: 16 streams, sanity 96/96 after 24k-token prefills (`THINK=1`, the strict check needs the
 reasoning in its own field for this model), 15-minute mixed soak 0 errors, VRAM flat.
