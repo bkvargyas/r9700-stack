@@ -59,7 +59,7 @@ cfg = {
         "g_mtp": {"targets": ["re:mtp.*mlp.*"], "weights": {"num_bits": 8, "type": "float", "strategy": "block",
                                                             "block_structure": [128, 128], "symmetric": True}},
     },
-    "ignore": ["lm_head"],
+    "ignore": ["lm_head", r"re:^mtp\."],
 }
 import copy
 c = copy.deepcopy(cfg)
@@ -70,6 +70,10 @@ except Exception as e:
     check("from_config accepts a fork-style config", False, e)
 check("format-less fp8 group -> float-quantized", c["config_groups"]["g_fp8"].get("format") == "float-quantized")
 check("MTP MLP fp8 group dropped (R9K_MTP_MLP=mxfp4)", "g_mtp" not in c["config_groups"])
+import re
+mtp_ign = c["ignore"][1][3:]
+check("bf16 MTP: MLP un-ignored", not re.match(mtp_ign, "mtp.layers.48.mlp.experts")
+      and re.match(mtp_ign, "mtp.layers.48.self_attn.qkv_proj"), c["ignore"])
 
 # --- checkpoint stream filters ----------------------------------------------------------------------------------
 gen, _ = Q.target_weights([
@@ -83,11 +87,19 @@ s = torch.rand(5, 2) + 0.5
 mt = list(Q.mtp_weights([("mtp.lm_head.weight_q4", 0),
                          ("mtp.layers.0.mlp.experts.7.up_proj.weight", w),
                          ("mtp.layers.0.mlp.experts.7.up_proj.weight_scale_inv", s),
-                         ("mtp.layers.0.self_attn.o_proj.weight_scale_inv", 3)], True))
+                         ("mtp.layers.0.self_attn.o_proj.weight_scale_inv", 3),
+                         ("mtp.layers.0.self_attn.attn.k_scale", 4),
+                         ("mtp.layers.0.mlp.experts.gate_up_proj", torch.randn(4, 1280, 256).to(torch.bfloat16)),
+                         ("mtp.layers.0.mlp.shared_expert.up_proj.weight", torch.randn(640, 256).to(torch.bfloat16))],
+                        True))
 mn = {n: t for n, t in mt}
-check("MTP filter: fork head dropped, fp8 expert -> MXFP4, scale renamed",
+check("MTP filter: fork head dropped, fp8 + bf16 MLP -> MXFP4, scale renamed",
       set(mn) == {"mtp.layers.0.mlp.experts.7.up_proj.weight_packed", "mtp.layers.0.mlp.experts.7.up_proj.weight_scale",
-                  "mtp.layers.0.self_attn.o_proj.weight_scale"}, list(mn))
+                  "mtp.layers.0.self_attn.o_proj.weight_scale",
+                  "mtp.layers.0.mlp.experts.gate_up_proj_packed", "mtp.layers.0.mlp.experts.gate_up_proj_scale",
+                  "mtp.layers.0.mlp.shared_expert.up_proj.weight_packed",
+                  "mtp.layers.0.mlp.shared_expert.up_proj.weight_scale"}, list(mn))
+check("bf16 MTP MXFP4 shapes", tuple(mn["mtp.layers.0.mlp.experts.gate_up_proj_packed"].shape) == (4, 1280, 128))
 p = mn.get("mtp.layers.0.mlp.experts.7.up_proj.weight_packed")
 check("MTP MXFP4 shapes", p is not None and tuple(p.shape) == (640, 128)
       and tuple(mn["mtp.layers.0.mlp.experts.7.up_proj.weight_scale"].shape) == (640, 8))
