@@ -100,6 +100,41 @@ GSM8K 95/100, decode probe 74.7 tok/s (the usual 70-80 band).
 Stability at 32k: 16 streams, sanity 96/96 after 24k-token prefills (`THINK=1`, the strict check needs the
 reasoning in its own field for this model), 15-minute mixed soak 0 errors, VRAM flat.
 
+## Four cards (2026-10-25)
+
+Brian: "Is there any way to run GLM-5.3-Flash with just 4 or 6 cards?" Six is out (64 attention heads: TP must divide
+64, and PP would still need the experts offloaded). Four runs, with the routed experts in pinned host memory (stock
+`--cpu-offload-params experts`) and the plugin's device LRU expert cache, `~/glm-launch4.sh` on VM100:
+
+- Per rank after the MXFP4 conversion: 40.5 GB of routed experts (288 x 42 x 3.35 MB) + ~8 GB of everything else.
+  The guest has 251 GB; each worker ends up with ~43 GB of pinned memory plus ~4 GB anon regardless of
+  `OFFLOAD_GB` (24: 43.4 GB; 30 and 44 were OOM-killed while loading), so 4 ranks = ~188 GB and nothing else may
+  run on the box while a 4-rank server loads (a gate run on card 4 OOM-killed attempt 3 in graph capture).
+- The config that fits: `OFFLOAD_GB=24 R9K_EXPERT_CACHE_GB=2 R9K_EXPERT_CACHE_SLOTS=0 MAXLEN=16384 NSEQ=4 NBT=4096
+  KVMEM=1.0 MTP=3 KVDTYPE=fp8` (24.4 GiB of weights per card leaves room for a 2 GiB cache and a 55k-token KV).
+  Ready in 659 s.
+
+| four cards (TP4, experts offloaded) | eight cards (TP8, v0.3.5 record) |
+|---|---|
+| decode 8.1 tok/s single; 10.8-11.5 aggregate at four streams | 79.6 single; 158 at four |
+| prefill 636 tok/s (12.7k prompt, ttft 20 s) | 5,000+ |
+| draft acceptance 43-57 % (79 % on the needle probe) | 70-80 % |
+| 85 / 12.7k needle correct | correct to 216k |
+
+- Host memory per rank is about **2 x OFFLOAD_GB** (shmem per worker: 43 GB at 24, 76 GB at 40): stock's UVA parameter
+  copy and the plugin's fragment-order pinned copy (`moe/cache.py`) coexist. A 40 GB/rank, 12 GiB-cache run needs
+  ~320 GB of pinned memory for four ranks -- it was OOM-killed even in the 384 GiB guest while a 2-card eager server
+  shared the box, and **was OOM-killed again alone in the 384 GiB guest** (22:09: 4 x 76 GB shmem + 26 GB anon + the
+  loader's page cache exceed 377 GiB). Freeing stock's copy after the re-layout would halve this (open item); until
+  then the only four-card config that loads is the 24 GB / 2 GiB-cache one above.
+
+Ten times slower: the 2 GiB cache (~0.6 % of the experts) misses on most steps and every missed expert streams over
+PCIe 3 at 11-13 GB/s. A useful four-card server would need all experts host-resident (`OFFLOAD_GB=40`, freeing ~12 GiB
+of VRAM per card for the cache), which this guest cannot hold: VM100's RAM ceiling is 256 GiB because guest RAM
+(GPA 1 TiB upward) meets chain B's GPA==HPA placement at 0x140 (the 400 GiB attempt broke every card's probe;
+384 GiB is possible only by moving chain B to 0x160 -- host notes). Even then the PCIe stream, not the cache,
+bounds decode at perhaps 15-20 tok/s. Verdict: feasible, correct, not worth running; eight cards stay the config.
+
 ## Qwen gates on this tree (2026-10-22, `~/validate-glm53-qwen.sh`)
 
 The production configurations must not move; they did not. 27B TP2: single-stream 219.4 tok/s (v0.3.3 ~221),

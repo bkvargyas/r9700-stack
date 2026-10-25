@@ -7,7 +7,40 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+- **GLM-5.3-Flash on the vLLM 0.32-era nightly (e4a5b553) died at the first prefill**: upstream gave sparse MLA
+  layers a dense-MHA prefill path and the ROCm selector hands it the CK flash-attention backend, whose wheel has no
+  gfx1201 kernels (`HIP Function Failed ... device kernel image is invalid`). `R9700Platform` now answers the MLA
+  prefill backend question with "none" on gfx1201 (`R9K_MLA_PREFILL=stock` defers to stock), so the sparse layer
+  keeps the top-k MQA prefill path it always used here; `tests/test_integration.py` checks both halves.
+
+- **Qwen3.8-27B on the 0.32-era nightly: GPU page fault on the first request.** Stock's Triton attention impl now
+  advertises fp8 *query* input on gfx12 (`supports_quant_query_input`, formerly CUDA-only), so with the 27B's fp8 KV
+  cache the attention layer quantized q before `forward` and our paged prefill kernel read the half-size fp8 buffer
+  as bf16. `R9kTriton3DImpl` pins the flag to False and falls back to stock for any non-16-bit query or output.
+  Found by bisection: stock `TRITON_ATTN` served 0 bad of 440; GDN and the drafter were cleared first. Known gap on
+  that nightly: the compiled 27B serves correctly but accepts no DFlash drafts (1.0 tokens a step; eager accepts 4.49) --
+  not attention, not the plugin's fp8 drafter linears or lm-heads; under investigation ([notes/vllm-0.32.md](notes/vllm-0.32.md)).
+- **Our Triton-attention builder no longer reports `max_query_len = 1` for small verify batches on nightlies whose
+  `unified_attention` runs multi-query batches on its split-KV path itself (`MAX_3D_QUERY_LEN`)**: the new kernel sizes
+  its query grid from that value. The paged prefill path is unchanged.
+- **Flash-Next on the 0.32-era nightly: two loader-time breaks.** The int6 PLE loader imported stock's
+  `compute_ple_shard_overlap`, which moved into `PLEVocabParallelEmbedding._compute_shard_overlap`; the three-line
+  overlap arithmetic now lives in `ple/int6.py`. The hyper-connection mix hook read `GatedResidual.lora_rank`, which
+  the nightly renamed to `hc_lowrank`; `hc.py` reads either (or the down projection's width).
+- **Flash-Next TP4 at `UTIL=0.98` no longer starts on torch 2.13**: the runtime's per-process baseline on an idle
+  card grew to ~0.7 GiB, so 31.22 GiB of 31.86 is not free at startup. Use 0.97 on that nightly.
+
+### Changed
+- **The PLE short-conv prefill path is retired** (`ple/short_conv.py`, off unless `R9K_PLE_CONV=r9k`). The October
+  nightlies replaced `Qwen4ExpPLELayer._short_conv_dilated_prefill_batched` with a fused Triton kernel
+  (`ops/ple.py: ple_conv`): bit-identical to ours and 8x faster on gfx1201 (496 vs 4,120 us per 4,096-token chunk,
+  80 vs 420-530 MiB peak). Our hook had silently had nothing to bind to since the fe4df3df pin, and
+  `tests/test_ple_conv.py` crashed with an `AttributeError`; the test now compares the two implementations and times
+  them. Found while testing the vLLM 0.32-era nightly ([notes/vllm-0.32.md](notes/vllm-0.32.md)).
+- `overlay/emulated-switch/patch-hostcall.sh` reports compressed offload bundles (CCOB), which its byte patch cannot
+  reach, and lists the remaining hostcall kernels by family: on the 0.32-era nightly `_rocm_C` ships compressed and
+  its 782 hostcall kernels are all gfx9-only (`paged_attention_ll4mi`, `wvSplitK`), so the unpatched copy serves.
 
 ## [0.3.6] - 2026-10-25
 

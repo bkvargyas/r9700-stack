@@ -17,4 +17,8 @@ assert len(a) == len(b)
 for f in glob.glob("/out/*.so"):
     d = open(f, "rb").read(); n = d.count(a); open(f, "wb").write(d.replace(a, b)); print(n, "patched", f)
 PY
-echo "kernels still requesting hostcall:"; /h.sh /out/_rocm_C.abi3.so /out/_C_stable_libtorch.abi3.so | grep -c "^  " || true'
+for f in /out/*.so; do n=$(grep -c -a CCOB $f); [ "$n" != 0 ] && echo "$f: $n compressed offload bundles (CCOB): the byte patch cannot reach their metadata (0 patched is expected); check the families below are gfx9-only"; done
+for f in /out/_rocm_C.abi3.so /out/_C_stable_libtorch.abi3.so; do
+  echo "$f: $(/h.sh $f | grep -c "^  ") kernels still requesting hostcall, by family:"
+  /h.sh $f | grep "^  " | sed -E "s/^  _Z[0-9]+//; s/^  //" | grep -oE "^[A-Za-z_]+[A-Za-z0-9_]{0,24}" | sort | uniq -c | sort -rn | head -6
+done'

@@ -3,7 +3,9 @@
 Single GPU:  python3 tests/test_ple_conv.py            (BENCH=0 skips the timing table)
 
   * r9k_transpose16 vs x.transpose(1, 2).contiguous() on ragged shapes and strided (sliced) inputs, bf16 and fp16
-  * ple/short_conv.prefill_batched vs Qwen4ExpPLELayer._short_conv_dilated_prefill_batched, run unbound on a stand-in
+  * ple/short_conv.prefill_batched vs stock's prefill short conv: the fused Triton ``ple_conv(mode="prefill")`` of the
+    October 2026 nightlies (one rounding point: compared within 2 bf16 ulps, conv state bit-exact), or the packed
+    ``Qwen4ExpPLELayer._short_conv_dilated_prefill_batched`` of older vLLMs (bit-exact), run unbound on a stand-in
     layer object (the method only reads conv_state_len and short_conv_dilation): output bit-identical, written-back
     conv state bit-identical, on one long prefill, a mixed batch with a decode prefix, empty and NULL-block states
 Then times both on the served shape (one 4096-token prefill, 4 x 2560 channels).
@@ -23,6 +25,11 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID  # noqa: E402
 
 from r9700_vllm.ple import short_conv as S  # noqa: E402
 
+try:
+    from vllm.models.qwen4_exp.common.ops.ple import ple_conv  # noqa: E402  (2026-10 nightlies: fused Triton short conv)
+except ImportError:
+    ple_conv = None
+
 dev = torch.device("cuda")
 H, KSZ, DIL = 4 * 2560, 4, 3           # Flash-Next: hc 4 x hidden 2560, conv kernel 4, dilation = ngram_size
 g = torch.Generator(device="cpu").manual_seed(0)
@@ -33,6 +40,35 @@ def ok(name, cond):
     global bad
     print(f"  {name:<60} {'ok' if cond else 'FAIL'}")
     bad += not cond
+
+
+def stock_prefill(self, x_p, md, conv_state, w, idx, P, num_decode_tokens, ntok):
+    """Stock's prefill short conv with the same arguments as ours. Returns the activated conv output, or None when
+    the stock path cannot run this case (the fused kernel indexes the state cache; it cannot take an empty one)."""
+    legacy = getattr(Qwen4ExpPLELayer, "_short_conv_dilated_prefill_batched", None)
+    if legacy is not None:
+        return legacy(self, x_p, md, conv_state, w, idx, P, num_decode_tokens, ntok)
+    if conv_state.shape[0] == 0:
+        return None
+    qsl = (md.non_spec_query_start_loc[-P - 1:] - num_decode_tokens).to(torch.int32)
+    out = torch.zeros_like(x_p)                      # residual = 0: the kernel leaves act(conv) in it
+    ple_conv(x_p, out, conv_state[..., : self.conv_state_len], w, idx[:P], None, mode="prefill",
+             dilation=self.short_conv_dilation, query_start_loc=qsl, has_initial_states=md.has_initial_states_p[:P])
+    return out
+
+
+EXACT = ple_conv is None or hasattr(Qwen4ExpPLELayer, "_short_conv_dilated_prefill_batched")
+STOCK_LABEL = "legacy packed method (bit-exact)" if EXACT else "fused Triton ple_conv (2 bf16 ulps)"
+
+
+def same_output(a, b):
+    """Bit-exact against the legacy method; within 2 bf16 ulps of the largest value against the fused kernel, whose
+    silu runs in fp32 on the fp32 conv sum (ours rounds the conv output to bf16 first, as the legacy method did)."""
+    if EXACT:
+        return torch.equal(a, b), ""
+    d = (a.float() - b.float()).abs().max().item()
+    scale = max(b.float().abs().max().item(), 1e-6)
+    return d <= 2 * 2 ** -7 * scale, f" (max diff {d:.3g} of {scale:.3g})"
 
 
 def t_transpose():
@@ -65,7 +101,7 @@ def run_case(name, q_lens, num_decode_tokens, state_slots, has_init, null_slots=
         idx[j] = NULL_BLOCK_ID
     idx = idx.to(dev)
     outs, peaks = [], []
-    for fn in (Qwen4ExpPLELayer._short_conv_dilated_prefill_batched, S.prefill_batched):
+    for fn in (stock_prefill, S.prefill_batched):
         cs = st0.clone()
         torch.cuda.synchronize()
         torch.cuda.reset_peak_memory_stats()
@@ -74,8 +110,12 @@ def run_case(name, q_lens, num_decode_tokens, state_slots, has_init, null_slots=
         torch.cuda.synchronize()
         peaks.append((torch.cuda.max_memory_allocated() - base) / 2**20)
         outs.append((o, cs))
-    ok(f"{name}: output", torch.equal(outs[0][0], outs[1][0]))
-    ok(f"{name}: conv state", torch.equal(outs[0][1], outs[1][1]))
+    if outs[0][0] is None:
+        ok(f"{name}: ours runs (stock skipped: empty state cache)", outs[1][0].shape == x.shape)
+    else:
+        good, detail = same_output(outs[1][0], outs[0][0])
+        ok(f"{name}: output{detail}", good)
+        ok(f"{name}: conv state", torch.equal(outs[0][1], outs[1][1]))
     if max_peak is not None:
         ok(f"{name}: peak {peaks[1]:.0f} MiB (stock {peaks[0]:.0f}), limit {max_peak}", peaks[1] <= max_peak)
     return x, w, md, st0, idx, fake, P, ntok
@@ -85,6 +125,7 @@ def main():
     if not S.available():
         print("libr9k.so has no r9k_transpose16: rebuild kernels/")
         sys.exit(1)
+    print(f"  stock reference: {STOCK_LABEL}")
     t_transpose()
     run_case("prefill 1 x 4096, initial state", [4096], 0, 8, [True])
     run_case("prefill 1 x 4096, no initial state", [4096], 0, 8, [False])
@@ -106,7 +147,7 @@ def main():
     print("correctness:", "PASS" if bad == 0 else f"FAIL ({bad})")
     if os.environ.get("BENCH", "1") == "1":
         x, w, md, st0, idx, fake, P, ntok = run_case("bench shape", [4096], 0, 8, [True])
-        for fn, lab in ((Qwen4ExpPLELayer._short_conv_dilated_prefill_batched, "stock"), (S.prefill_batched, "ours")):
+        for fn, lab in ((stock_prefill, "stock"), (S.prefill_batched, "ours")):
             cs = st0.clone()
             for _ in range(3):
                 fn(fake, x, md, cs, w, idx, P, 0, ntok)

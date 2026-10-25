@@ -131,6 +131,42 @@ check("MTP allowlist target: SpecDecodeBaseProposer.allowed_attn_types still exi
 check("MTP allowlist patch installed", getattr(lbp.SpecDecodeBaseProposer.__init__, "__r9k_patch__", None) == "mtp_allowlist")
 check("MTP allowlist still needed (else retire the patch)", "QSAForwardMetadata" not in src)
 
+# --- MLA prefill on gfx1201: the platform answers "none valid"; the sparse layer must still fall back ---------
+import inspect
+from vllm.model_executor.layers.attention import mla_attention as _mla
+try:
+    R9700Platform.get_mla_prefill_backend_cls(None)
+    _raised = False
+except ValueError:
+    _raised = True
+check("MLA prefill: platform raises ValueError (no gfx1201 backend)", _raised)
+_src = inspect.getsource(_mla)
+check("MLA prefill: sparse layer falls back to the top-k MQA path on ValueError",
+      "except ValueError" in _src and "top-k MQA path only" in _src)
+
+# --- Flash-Next attributes the plugin reads (renamed in the 0.32-era nightly) ----------------------------------
+try:
+    from vllm.models.qwen4_exp.amd.hyperconnection import GatedResidual as _GR
+    _gr_src = inspect.getsource(_GR.__init__)
+    check("hyper-connection exposes its low-rank width (hc_lowrank / lora_rank)",
+          "self.hc_lowrank" in _gr_src or "self.lora_rank" in _gr_src)
+except ImportError as e:
+    check("hyper-connection class importable", False, e)
+try:
+    from vllm.models.qwen4_exp.common.ple import PLEVocabParallelEmbedding as _PLE
+    check("PLE embedding keeps shard_indices for the int6 loader's TP overlap",
+          "shard_indices" in inspect.getsource(_PLE) or "shard_indices" in inspect.getsource(_PLE.__mro__[1]))
+except ImportError as e:
+    check("PLE embedding class importable", False, e)
+
+# --- attention: our impl must keep 16-bit queries (the 2026-10 Triton impl advertises fp8 q on gfx12) -----------
+from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl as _TAI
+_tai_src = inspect.getsource(_TAI.__init__)
+check("stock Triton impl still decides supports_quant_query_input in __init__", "supports_quant_query_input" in _tai_src)
+from r9700_vllm.attn.triton3d import R9kTriton3DImpl as _R3
+check("R9kTriton3DImpl pins supports_quant_query_input = False",
+      "self.supports_quant_query_input = False" in inspect.getsource(_R3.__init__))
+
 # --- kernels plugged into stock objects -----------------------------------------------------------------------
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxfp4 import (
     CompressedTensorsW4A4Mxfp4)

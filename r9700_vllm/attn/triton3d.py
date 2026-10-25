@@ -82,6 +82,27 @@ def _r4d_kernels():
         return None
 
 
+_NATIVE_3D = None
+
+
+def _native_3d() -> bool:
+    """True when stock's unified_attention takes multi-query batches down its split-KV path itself (the 2026-10
+    nightlies: MAX_3D_QUERY_LEN = 8, scratch sized per query token in the builder). Then max_query_len must be
+    reported honestly -- the new kernel sizes its query grid from it, and the old "report 1" trick computes only the
+    first token of every verify sequence (correct bonus token, every draft rejected: 1.0 tokens a step)."""
+    global _NATIVE_3D
+    if _NATIVE_3D is None:
+        try:
+            from vllm.v1.attention.ops import triton_unified_attention as U
+            _NATIVE_3D = hasattr(U, "MAX_3D_QUERY_LEN")
+        except Exception:
+            _NATIVE_3D = False
+        if _NATIVE_3D:
+            logger.info_once("r9700: stock unified_attention runs multi-query verify batches on its split-KV path "
+                             "(MAX_3D_QUERY_LEN); the r9k max_query_len=1 trick is off, paged prefill stays")
+    return _NATIVE_3D
+
+
 def _plan(qsl_cpu, num_reqs):
     """Maximal runs of consecutive requests with equal query length: (first req, count, q_len, first token)."""
     qs = qsl_cpu.tolist()
@@ -130,7 +151,7 @@ class R9kTriton3DMetadataBuilder(TritonAttentionMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata, fast_build: bool = False):
         md = super().build(common_prefix_len, common_attn_metadata, fast_build)
         num_seqs = md.query_start_loc.shape[0] - 1
-        if (1 < md.max_query_len <= MAXQ and md.num_actual_tokens <= self._cap_tokens
+        if (not _native_3d() and 1 < md.max_query_len <= MAXQ and md.num_actual_tokens <= self._cap_tokens
                 and num_seqs <= self.seq_threshold_3D):
             md.max_query_len = 1          # -> unified_attention's split-KV path (see module doc)
         elif self._r4d is not None and md.max_query_len > MAXQ:
@@ -144,6 +165,15 @@ class R9kTriton3DImpl(TritonAttentionImpl):
     """Stock Triton attention, except prefill / mixed batches of a matching layer go to the paged kernels."""
 
     _r4d_ok = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # 2026-10 nightlies: stock's Triton impl advertises fp8 QUERY input on gfx12 when the KV cache is fp8, and
+        # the attention layer then quantizes q before forward. Our paged kernels take bf16 queries (they read q
+        # rows by element size: an fp8 q is half the bytes -> reads past the buffer, GPU page fault on the first
+        # prefill of the 27B). Keep q in 16 bits for this impl; stock's own kernel path dequantizes nothing it
+        # was not given.
+        self.supports_quant_query_input = False
 
     def _r4d_layer_ok(self, kv_cache) -> bool:
         if self._r4d_ok is None:
@@ -165,6 +195,7 @@ class R9kTriton3DImpl(TritonAttentionImpl):
                                 output_scale is None, output_block_scale is None)
         if (plan is None or output_scale is not None or output_block_scale is not None or kv_cache.numel() == 0
                 or attn_metadata.causal is not True or not self._r4d_layer_ok(kv_cache)
+                or query.element_size() != 2 or output.element_size() != 2
                 or not query.is_contiguous() or not output.is_contiguous()):
             return super().forward(layer, query, key, value, kv_cache, attn_metadata, output, output_scale,
                                    output_block_scale)

@@ -16,6 +16,9 @@ symptom it works around and how to check whether a host still needs it.
   trace off and `ENABLE_DEVICE_LINKER=OFF` (no hostcall kernels). Mounted over `librccl.so.1`.
 - `patch-hostcall.sh` -- copies of vLLM's two extensions with the `hidden_hostcall_buffer` argument-metadata name
   rewritten to the equal-length `hidden_global_offset_x` (the kernels never use hostcall). Mounted over the stock files.
+  2026-10-25, the 0.32-era nightly (e4a5b553): `_rocm_C` now ships compressed offload bundles (CCOB), which the
+  byte patch cannot reach (`0 patched`); its 782 hostcall kernels are the gfx9-only `paged_attention_ll4mi` and
+  `wvSplitK` families, never launched on gfx1201, so the unpatched copy serves. `_C_stable_libtorch` still patches (15 -> 0).
 - `overlay.sh` -- the mounts. `scanhc.sh` / `hcnames.sh` list kernels in a .so that still request hostcall;
   `p2ptest.py` checks P2P IPC; `ab-p2p.*` is the P2P vs no-P2P A/B that motivated it.
 **Rebuild on a new image pin:** re-run `rccl/build-nightly.sh` and `patch-hostcall.sh` against the new image.

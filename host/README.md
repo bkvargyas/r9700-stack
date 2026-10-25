@@ -312,3 +312,23 @@ Open items from this round:
 - `p2ptest4.py`'s RCCL phase fails `hipIpcGetMemHandle: invalid argument` at 4, 6 and 8 ranks on the fe4df3df image
   even with the emulated-switch overlay mounted (`mp.spawn` ranks in one container); vLLM TP serving with the overlay
   works, so this is the test harness, not the hardware.
+
+### 384 GiB of guest RAM: chain B moved to 0x160 (2026-10-25)
+
+QEMU puts the guest's RAM at GPA 1 TiB (the AMD HT hole) and it grows upward, so with chain B at 0x140 the guest
+could hold at most 256 GiB (RAM end 0x13f8). A 400 GiB attempt ran RAM to 0x1638, OVMF placed its 64-bit window at
+ALIGN_UP(RAM end, 256 G) = 0x180 (OVMF aligns the window to the largest power of two not above `X-PciMmio64Mb`:
+496 G -> 256 G) and `r9700_guestplace` failed -16 on chain B, after which no card probed.
+
+Chain B now sits at the top of the c0 host-bridge aperture: `CHAIN_B_WIN="00000160 00000180 0000017f"`,
+`CHAIN_B_AT=0x16000000000` (c5 @0x160, c8 @0x170), guest `r9700-guestplace.conf` `08:00.0@0x160, 07:00.0@0x170`.
+That makes 384 GiB the layout maximum (RAM end 0x15f8). Two more things were needed:
+
+- **`X-PciMmio64Mb` stays at 507904 (496 G).** 253952 (248 G, for a 128 G alignment that would have put the base at
+  0x160) hung OVMF before display init: the four 96 GiB switch windows no longer fit its aperture.
+- **The guest kernel boots with `pci=nocrs`** (GRUB_CMDLINE_LINUX). With 496 G the OVMF base is 0x180 for a 384 GiB
+  guest, and QEMU's ACPI root window starts at the lowest firmware-assigned BAR, so chain B's 0x160 would be outside
+  it; `pci=nocrs` drops that window and guestplace places the switch at 0x160 (not RAM, not anyone's BAR).
+
+Verified: `memory: 393216` -> guest 377 GiB, eight cards at A 0x260/0x270, B 0x160/0x170, C 0x380/0x390,
+D 0x1c0/0x1d0, `tests/test_ar8.py` on eight ranks passes. 262144 boots on the same layout (fallback).

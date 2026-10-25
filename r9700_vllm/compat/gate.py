@@ -13,7 +13,7 @@ logger = init_logger("vllm." + __name__)
 
 TESTED = {
     # patch name: (vLLM commits tested, upstream issue/PR that would retire it)
-    "mtp_allowlist": (("dee37d891", "e97573215", "8cbd5d030", "fe4df3df0"), "vllm-project/vllm#55292 (closed unmerged 2026-10)"),
+    "mtp_allowlist": (("dee37d891", "e97573215", "8cbd5d030", "fe4df3df0", "e4a5b5537"), "vllm-project/vllm#55292 (closed unmerged 2026-10)"),
     # the modular MoE kernel copies its workspace into the layer output on ROCm unless aiter is on (moe/fold.py)
     "moe_output_alias": (("e97573215",), "vllm: FusedMoEKernelModularImpl._fused_experts output alias on ROCm"),
     # the runner adds the shared expert after the experts return; ours folds it into the top-k sum (moe/fold.py)
@@ -22,7 +22,7 @@ TESTED = {
     # (comm/pipe.py): Qwen4ExpDecoderLayer.forward, RowParallelLinear.reduce_results, moe_config.skip_final_all_reduce
     "layer_tail_pipe": (("e97573215",), "vllm: an all-reduce / compute overlap for row-local layer tails"),
     # GLM-5.3-Flash sparse indexer on RDNA4: is_enabled() gate + the _C top-k ops the ROCm wheel lacks (models/glm5next.py)
-    "glm5next_rdna4": (("fe4df3df0",), "vllm: RDNA4 (is_rdna_aiter_enabled) support in models/glm5next/amd + ROCm top_k_per_row kernels"),
+    "glm5next_rdna4": (("fe4df3df0", "e4a5b5537"), "vllm: RDNA4 (is_rdna_aiter_enabled) support in models/glm5next/amd + ROCm top_k_per_row kernels"),
 }
 
 

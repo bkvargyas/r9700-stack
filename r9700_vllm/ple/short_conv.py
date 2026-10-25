@@ -7,8 +7,13 @@ chunk, 23 of the op's 27 ms (the depthwise conv itself is ~1 ms). ``r9k_transpos
 64x64 LDS tiles with coalesced 16-byte reads and writes.
 
 Everything else in ``prefill_batched`` mirrors the stock method (same ops, same order, same rounding points), so the
-output and the written-back conv state are identical. Bound per PLE layer instance by ``install`` (models/qwen4_exp.py);
-R9K_PLE_CONV=stock keeps vLLM's method.
+output and the written-back conv state are identical. Bound per PLE layer instance by ``install`` (models/qwen4_exp.py).
+
+RETIRED 2026-10-25 (off by default, R9K_PLE_CONV=r9k turns it back on where the packed method exists): the October
+2026 nightlies run the short conv as one fused Triton kernel on the token-major layout (``ops/ple.py: ple_conv``,
+no packing, no transposes, state write-back fused), bit-identical to this path and 8x faster on gfx1201 (496 vs
+4,120 us for 1 x 4096 x 10240, 80 vs 420-530 MiB peak; tests/test_ple_conv.py). ``r9k_transpose16`` itself is
+still 6.6x torch's permuted copy (465 vs 3,075 us) and stays in libr9k for reuse.
 """
 from __future__ import annotations
 
@@ -188,7 +193,7 @@ def prefill_batched(self, x_p, metadata, conv_state, conv_weights, state_indices
 
 def install(model: torch.nn.Module) -> int:
     """Bind our prefill short conv on every Qwen4ExpPLELayer under `model`. Returns how many were switched."""
-    if os.environ.get("R9K_PLE_CONV", "r9k") != "r9k" or not available():
+    if os.environ.get("R9K_PLE_CONV", "stock") != "r9k" or not available():
         return 0
     n = 0
     for mod in model.modules():
@@ -198,4 +203,7 @@ def install(model: torch.nn.Module) -> int:
             n += 1
     if n:
         logger.info("r9700: r9k PLE short-conv prefill (tiled transposes) installed on %d layers", n)
+    elif any(type(m).__name__ == "Qwen4ExpPLELayer" for m in model.modules()):
+        logger.info("r9700: R9K_PLE_CONV=r9k requested but this vLLM has no packed prefill short conv to replace "
+                    "(stock's fused ple_conv runs)")
     return n

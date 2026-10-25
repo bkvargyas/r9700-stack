@@ -34,7 +34,7 @@ CHAIN_D="${CHAIN_D-8b:00.0 8e:00.0}"
 FORCE="${FORCE:-0}"
 # Chain windows pre-programmed before the rescan: "<upper32 base> <upper32 limit root> <upper32 limit upstream>"
 CHAIN_A_WIN="${CHAIN_A_WIN-00000260 000002e0 000002df}"
-CHAIN_B_WIN="${CHAIN_B_WIN-00000140 00000160 0000015f}"
+CHAIN_B_WIN="${CHAIN_B_WIN-00000160 00000180 0000017f}"   # moved 2026-10-25 (was 0x140-0x15f) for 384 GiB guest RAM
 CHAIN_C_WIN="${CHAIN_C_WIN-00000380 000003c0 000003bf}"   # inside bus 00 aperture 0x300b0200000-0x400b01fffff
 CHAIN_D_WIN="${CHAIN_D_WIN-000001c0 000001ff 000001fe}"   # inside bus 80 aperture 0x18050200000-0x200501fffff (mlx5 NIC sits above 0x200)
 # Force a chain's window (= its first card's BAR0) to start at a given host address, e.g. 0x26000000000; the
@@ -42,7 +42,7 @@ CHAIN_D_WIN="${CHAIN_D_WIN-000001c0 000001ff 000001fe}"   # inside bus 80 apertu
 # (switch-local P2P), so these must match /etc/modprobe.d/r9700-guestplace.conf in VM100. Any address inside
 # the chain's own root-complex aperture works; empty = kernel's first fit (then the guest cannot match).
 CHAIN_A_AT="${CHAIN_A_AT-0x26000000000}"
-CHAIN_B_AT="${CHAIN_B_AT-0x14000000000}"
+CHAIN_B_AT="${CHAIN_B_AT-0x16000000000}"
 CHAIN_C_AT="${CHAIN_C_AT-0x38000000000}"
 CHAIN_D_AT="${CHAIN_D_AT-0x1c000000000}"
 # Switch-local P2P: clear ACS ReqRedir/CmpltRedir on the chain's PLX downstream ports so peer traffic between

@@ -11,7 +11,7 @@ int6 GPTQ checkpoint (``ngram_embedding.shard_N.weight_packed`` u8 [rows, 120] +
     TP all-reduce in ``VocabParallelEmbedding.forward`` are untouched);
   * it has its own ``load_weights``: stock ``Qwen4ExpNGramEmbedding.load_weights`` hands the (non-``.weight``)
     ``shard_N.weight_packed / weight_scale`` tensors to ``AutoWeightsLoader``, which recurses into the child's
-    ``load_weights`` -- they land in the fused host rows (TP overlap via stock ``compute_ple_shard_overlap``).
+    ``load_weights`` -- they land in the fused host rows (TP overlap computed here; stock's helper moved twice in 2026-10).
 
 Only engages when the checkpoint's PLE shards are int6 (fp16 scales); otherwise stock behaviour.
 ~20.8 GB of pinned host RAM per rank at TP2 for Qwen3.8-Flash-Next.
@@ -137,20 +137,23 @@ def make_int6_embedding_cls(base):
             return None
 
         def load_int6_shard(self, shard_index: int, kind: str, tensor: torch.Tensor, shard_size: int) -> int:
-            from vllm.models.qwen4_exp.common.ple import compute_ple_shard_overlap
-            ov = compute_ple_shard_overlap(checkpoint_start=shard_index * shard_size, checkpoint_rows=tensor.shape[0],
-                                           tp_start=self.shard_indices.org_vocab_start_index,
-                                           tp_end=self.shard_indices.org_vocab_end_index)
-            if ov is None:
+            # the overlap of checkpoint shard [start, start+rows) with this rank's vocabulary range; stock's helper
+            # for it moved twice in October 2026 (module function -> PLEShardOverlap._compute_shard_overlap), and
+            # it is three lines of arithmetic, so it lives here
+            ck_start, ck_end = shard_index * shard_size, shard_index * shard_size + tensor.shape[0]
+            tp_start, tp_end = self.shard_indices.org_vocab_start_index, self.shard_indices.org_vocab_end_index
+            lo, hi = max(ck_start, tp_start), min(ck_end, tp_end)
+            if lo >= hi:
                 return 0
-            src = tensor.narrow(0, ov.source_start, ov.row_count).to("cpu")
-            dst = self._r9k_host.narrow(0, ov.destination_start, ov.row_count)
+            src_start, dst_start, rows = lo - ck_start, lo - tp_start, hi - lo
+            src = tensor.narrow(0, src_start, rows).to("cpu")
+            dst = self._r9k_host.narrow(0, dst_start, rows)
             packed_bytes = self.head_dim * 6 // 8
             if kind == "packed":
                 dst[:, :packed_bytes].copy_(src.view(torch.uint8))
             else:
-                dst[:, packed_bytes:].copy_(src.contiguous().view(torch.uint8).view(ov.row_count, -1))
-            return ov.row_count
+                dst[:, packed_bytes:].copy_(src.contiguous().view(torch.uint8).view(rows, -1))
+            return rows
 
         def load_weights(self, weights):
             shard_size = (self.org_vocab_size + self.split_parts - 1) // self.split_parts

@@ -299,8 +299,23 @@ def op_combine_norm(residual: torch.Tensor, block_output: torch.Tensor, injectio
     return torch.ops.r9700.hc_combine_norm(residual, block_output, injection_logits, norm_weight, eps, hc_count)
 
 
+def _lora_rank(mod) -> int:
+    """The hyper-connection's low-rank width: `lora_rank` on the pinned nightlies, `hc_lowrank` (also
+    `config.hc_lowrank`) on the 0.32-era ones, else read off the down projection (its output is the rank, plus
+    hc_count injection columns when combine is merged in)."""
+    lr = getattr(mod, "lora_rank", None)
+    if lr is None:
+        lr = getattr(mod, "hc_lowrank", None)
+    if lr is None:
+        lr = getattr(getattr(mod, "config", None), "hc_lowrank", None)
+    if lr is None:
+        down = mod.input_mix_weight_down_block_inject if getattr(mod, "use_combine", False) else mod.input_mix_weight_down
+        lr = down.weight.shape[0] - (mod.hc_count if getattr(mod, "use_combine", False) else 0)
+    return int(lr)
+
+
 def _mix_tail(self, xn: torch.Tensor):
-    lr, hc = self.lora_rank, self.hc_count
+    lr, hc = _lora_rank(self), self.hc_count
     dq, ds, uq, us = getattr(self, "_r9k_hc_fp8", (None, None, None, None))
     n_down = getattr(self, "_r9k_hc_ndown", 0)
     if self.use_combine:
