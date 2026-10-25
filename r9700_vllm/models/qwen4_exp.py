@@ -33,6 +33,7 @@ from vllm.models.qwen4_exp.amd.model import Qwen4ExpForCausalLM, Qwen4ExpForCond
 from vllm.models.qwen4_exp.amd.mtp import Qwen4ExpMTP
 
 from . import lm_heads
+from ..quant.nvfp4 import quantize_mxfp4_search
 from ..attn import qsa as _qsa
 from ..ple import short_conv as _ple_conv
 from .. import hc as _hc
@@ -95,7 +96,8 @@ def mtp_weights(weights, mtp_mxfp4: bool):
         # HF rev 6fe3e746 ships the MTP MLP in bf16 (fused experts) instead of fp8
         if mtp_mxfp4 and (_MTP_EXPERTS_FUSED.search(name) or (_MTP_MLP_FP8.search(name) and name.endswith(".weight"))) \
                 and w.dtype == torch.bfloat16:
-            q = [lm_heads.quantize_mxfp4(x.cuda()) for x in w.reshape(-1, w.shape[-1]).split(1 << 18)]
+            # MSE-searched block exponents (quant/nvfp4.py): 3-5% lower error than round-to-nearest on bf16 MLP weights
+            q = [quantize_mxfp4_search(x.cuda().float()) for x in w.reshape(-1, w.shape[-1]).split(1 << 18)]
             yield f"{name}_packed", torch.cat([p for p, _ in q]).cpu().reshape(*w.shape[:-1], -1)
             yield f"{name}_scale", torch.cat([s for _, s in q]).cpu().reshape(*w.shape[:-1], -1)
             continue

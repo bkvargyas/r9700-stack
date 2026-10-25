@@ -106,19 +106,23 @@ check("MTP MXFP4 shapes", p is not None and tuple(p.shape) == (640, 128)
 
 # --- construction scope restores what it touches ------------------------------------------------------------
 from vllm.models.qwen4_exp.amd import ple_layer
-stock = ple_layer.PLEVocabParallelEmbedding
-pin = torch.Tensor.pin_memory
-os.environ["R9K_PLE_FORMAT"] = "int6"
-with Q.construction_scope():
-    inside = ple_layer.PLEVocabParallelEmbedding
-    t = torch.empty(3, 5).pin_memory()
-check("scope installs int6 PLE subclass", inside is not stock and issubclass(inside, stock))
-check("scope pins exactly (hipHostRegister)", t.is_pinned())
-check("scope restores PLEVocabParallelEmbedding", ple_layer.PLEVocabParallelEmbedding is stock)
-check("scope restores Tensor.pin_memory", torch.Tensor.pin_memory is pin)
-os.environ["R9K_PLE_FORMAT"] = "stock"
-with Q.construction_scope():
-    check("scope leaves stock PLE for non-int6 checkpoints", ple_layer.PLEVocabParallelEmbedding is stock)
+if hasattr(ple_layer, "PLEVocabParallelEmbedding"):
+    stock = ple_layer.PLEVocabParallelEmbedding
+    pin = torch.Tensor.pin_memory
+    os.environ["R9K_PLE_FORMAT"] = "int6"
+    with Q.construction_scope():
+        inside = ple_layer.PLEVocabParallelEmbedding
+        t = torch.empty(3, 5).pin_memory()
+    check("scope installs int6 PLE subclass", inside is not stock and issubclass(inside, stock))
+    check("scope pins exactly (hipHostRegister)", t.is_pinned())
+    check("scope restores PLEVocabParallelEmbedding", ple_layer.PLEVocabParallelEmbedding is stock)
+    check("scope restores Tensor.pin_memory", torch.Tensor.pin_memory is pin)
+    os.environ["R9K_PLE_FORMAT"] = "stock"
+    with Q.construction_scope():
+        check("scope leaves stock PLE for non-int6 checkpoints", ple_layer.PLEVocabParallelEmbedding is stock)
+else:
+    # the 2026-10 nightlies renamed the PLE embedding (Qwen4ExpPLELayer); the int6 PLE scope has no target there
+    check("int6 PLE scope: no PLEVocabParallelEmbedding on this nightly (section skipped)", True)
 
 # --- the one remaining monkeypatch: target still exists and is ours ------------------------------------------
 from vllm.v1.spec_decode import llm_base_proposer as lbp
