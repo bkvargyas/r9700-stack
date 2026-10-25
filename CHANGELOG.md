@@ -9,6 +9,18 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
+## [0.3.6] - 2026-10-25
+
+Release notes with the validation record: [notes/release-v0.3.6.md](notes/release-v0.3.6.md).
+
+### Fixed
+- **Flash-Next checkpoint revision 6fe3e746 (2026-10-01) loads and drafts again** -- Altay Sansal (@tasansal),
+  [#1](https://github.com/bkvargyas/r9700-stack/pull/1). The revision's MTP attention KV scales crashed the loader
+  and its bf16 MTP MLP defeated the MXFP4 conversion (shared expert dropped, 0% draft acceptance). The scales are
+  dropped like the main model's; the bf16 MLP is quantized to MXFP4 at load, with the MSE-searched block exponents
+  (`quant/nvfp4.py`). Older fp8 MTP checkpoints are unaffected; Flash-Next TP4 on the September revision re-measured
+  within noise of v0.3.5.
+
 ## [0.3.5] - 2026-10-22
 
 Release notes with the validation record: [notes/release-v0.3.5.md](notes/release-v0.3.5.md).
@@ -436,7 +448,8 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.3...v0.3.4
 [0.2.2]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.1...v0.2.2
