@@ -49,6 +49,7 @@ _DROP_MTP_HEAD = re.compile(r"(^|\.)mtp\.lm_head\.weight_(q4|scale|zero)$")
 _DROP_ATTN_SCALE = re.compile(r"\.self_attn\.(attn\.)?[qkv]_scale$")     # bf16 KV: all unused
 _MTP_MLP_FP8 = re.compile(r"(^|\.)mtp\.layers\.\d+\.mlp\.(experts\.\d+|shared_expert)\.(gate|up|down)_proj\."
                           r"weight(_scale_inv|_scale)?$")
+_MTP_EXPERTS_FUSED = re.compile(r"(^|\.)mtp\.layers\.\d+\.mlp\.experts\.(gate_up|down)_proj$")
 
 
 def rename_scale(name: str) -> str:
@@ -88,6 +89,15 @@ def mtp_weights(weights, mtp_mxfp4: bool):
     for name, w in weights:
         if _DROP_MTP_HEAD.search(name):
             dropped.append(name)
+            continue
+        if _DROP_ATTN_SCALE.search(name):
+            continue
+        # HF rev 6fe3e746 ships the MTP MLP in bf16 (fused experts) instead of fp8
+        if mtp_mxfp4 and (_MTP_EXPERTS_FUSED.search(name) or (_MTP_MLP_FP8.search(name) and name.endswith(".weight"))) \
+                and w.dtype == torch.bfloat16:
+            q = [lm_heads.quantize_mxfp4(x.cuda()) for x in w.reshape(-1, w.shape[-1]).split(1 << 18)]
+            yield f"{name}_packed", torch.cat([p for p, _ in q]).cpu().reshape(*w.shape[:-1], -1)
+            yield f"{name}_scale", torch.cat([s for _, s in q]).cpu().reshape(*w.shape[:-1], -1)
             continue
         if mtp_mxfp4 and _MTP_MLP_FP8.search(name):
             base = name.rsplit(".", 1)[0]

@@ -356,6 +356,12 @@ class R9kCompressedTensorsConfig(CompressedTensorsConfig):
                     del groups[name]
                     logger.info_once("r9700: CT group %s (MTP MLP, fp8 block-128) dropped; re-quantized to "
                                      "MXFP4 at load", name)
+            # The checkpoint stores the MTP head unquantized (bf16), but we quantize its MLP at load,
+            # so vLLM has to build MXFP4 layers for it.
+            ign = config.get("ignore") or []
+            for i, pat in enumerate(ign):
+                if pat == r"re:^mtp\.":
+                    ign[i] = r"re:^mtp\.(?!layers\.\d+\.mlp\.(experts|shared_expert)(\.|$))"
         gfmt = config.get("format")
         if gfmt and gfmt != "float-quantized":
             for name, grp in (config.get("config_groups") or {}).items():
