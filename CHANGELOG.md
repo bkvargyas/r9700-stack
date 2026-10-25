@@ -9,6 +9,42 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
+## [0.3.5] - 2026-10-22
+
+Release notes with the validation record: [notes/release-v0.3.5.md](notes/release-v0.3.5.md).
+
+### Fixed
+- **GLM-5.3-Flash long-context retrieval.** The indexer's K cache is written in pages of 64 pooled entries in 16x16
+  tiles; stock vLLM reads it back correctly only on gfx942/gfx950 and falls through to a linear-page kernel
+  elsewhere, so the decode-time scores were scrambled (top-512 overlap with the reference 70% at 760 pools, 3% at
+  32k) and needle lookups failed from ~12k tokens on. `r9700_vllm/attn/indexer_logits.py` reads the tiled layout
+  (matches the torch reference to 0.1 at every size up to 65k pools, 92-100 us a call against the stock kernel's
+  153-158); `_install_paged_logits` swaps it in where stock would fall through (`R9K_INDEXER_LOGITS=stock` restores).
+  Needles found at 12.7k / 23.7k / 34.7k and, on a 262k launch, at 67k / 150k / 216k; decode at depth 92-110 tok/s.
+
+### Added
+- `tests/test_indexer_logits_r9k.py`: the cache written by the real kpool writer, stock's reader and ours against the
+  reference at 760 to 65k pools, one row and MTP verify rows.
+
+## [0.3.4] - 2026-10-22
+
+Release notes with the validation record: [notes/release-v0.3.4.md](notes/release-v0.3.4.md).
+
+### Added
+- **GLM-5.3-Flash on eight R9700s** from the same plugin on the same nightly: 79.6 tok/s single stream with three
+  MTP drafts, 158 tok/s aggregate at four streams, GSM8K 97/100, 262k-token launches (`notes/glm53.md`). The pieces,
+  all scoped to the glm5next module path and world size 8: the indexer AITER gate, the sparse-MLA kernel over an fp8
+  or bf16 pool (`kernels/r9k_sparse_mla.hip`), the skinny fp32 indexer matmul, post-load per-row fp8 for the KDA
+  projections (`R9K_FP8_LINEARS`), the in-graph draft metadata refresh (all draft steps in one graph), and the
+  hierarchical 8-rank all-reduce / all-gather (`comm/r9k_ar8.py`: 8 KB cross-stage slices, RCCL above 40 KB).
+- NVFP4 MoE experts served natively (`R9K_NVFP4_MOE=native`, exact checkpoint bits); the default stays the MXFP4
+  conversion (same speed and accuracy measured, 1.1 GB a card of KV).
+- `serve/serve.sh`: `SERVED_NAME`, `KVDTYPE=fp8`, `SPEC_EXTRA` on the MTP branch; `bench/sanity_stress.py THINK=1`.
+
+### Unchanged
+- 27B TP2 and Flash-Next TP4 re-validated on this tree (probe, BetterBench, soaks, strict sanity, comm tests,
+  single-GPU gates): within noise of v0.3.3.
+
 ## [0.3.3] - 2026-10-13
 
 Release notes with the validation record: [notes/release-v0.3.3.md](notes/release-v0.3.3.md).
@@ -400,7 +436,9 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.5...HEAD
+[0.3.5]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.4...v0.3.5
+[0.3.4]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.3...v0.3.4
 [0.2.2]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/bkvargyas/r9700-stack/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/bkvargyas/r9700-stack/compare/v0.1.0...v0.2.0
