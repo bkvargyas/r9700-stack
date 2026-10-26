@@ -40,7 +40,7 @@ exec env \
                                     # memory a card and 1.4 GiB of vLLM's activation estimate for no soak-measured
                                     # throughput (6677 vs 6726 prompt tok/s): +94k KV tokens at TP4 without them.
                                     # CGSIZES= for vLLM's default (max 512)` \
-  UTIL=${UTIL-$([ "${TP:-2}" = 4 ] && echo 0.98)} `  # TP4: 0.98 (soaked: 31.8 of 32.6 GB at the peak); TP2 keeps
+  UTIL=${UTIL-$([ "${TP:-2}" = 4 ] && echo 0.97)} `  # TP4: 0.97 (0.98 soaked at 31.8 of 32.6 GB on torch 2.12; torch 2.13 holds ~0.7 GiB per process at start, 0.98 no longer fits); TP2 keeps
                                     # serve.sh's 0.96 / 0.94` \
   R9K_HC_FP8=${R9K_HC_FP8-r9k} `    # the hyper-connection up GEMM + sigmoid-gated mean fused in fp8 from 256 rows
                                     # (268 vs 674 us a layer at 4096): +4% prefill, decode untouched; GSM8K paired

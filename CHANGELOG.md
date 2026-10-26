@@ -7,6 +7,20 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.7] - 2026-10-26
+
+Release notes with the validation record: [notes/release-v0.3.7.md](notes/release-v0.3.7.md).
+
+### Changed
+- **The image pin moves to the 2026-10-25 vLLM ROCm 10 nightly** (`nightly-rocm100-e4a5b553`, vLLM 0.32.1rc1.dev466,
+  torch 2.13.0+rocm10.0.0, the same ROCm 10.0 SDK): the 0.32 line. Five plugin-side fixes below made it serve all
+  three configurations at the v0.3.6 numbers ([notes/vllm-0.32.md](notes/vllm-0.32.md)).
+- **Known on this nightly:** GLM-5.3-Flash's 262k launch runs out of VRAM in stock's prefill indexer above ~75k tokens
+  of prompt (about 1.5 GiB a card less headroom than the pin; 216k retrieval was fine on v0.3.5's pin). The 32k
+  production recipe is unaffected. Details and the recipes tried: [notes/release-v0.3.7.md](notes/release-v0.3.7.md).
+
 ### Fixed
 - **GLM-5.3-Flash on the vLLM 0.32-era nightly (e4a5b553) died at the first prefill**: upstream gave sparse MLA
   layers a dense-MHA prefill path and the ROCm selector hands it the CK flash-attention backend, whose wheel has no
@@ -487,7 +501,8 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.7...HEAD
+[0.3.7]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.3...v0.3.4
