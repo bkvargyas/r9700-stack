@@ -18,9 +18,15 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
   advertises fp8 *query* input on gfx12 (`supports_quant_query_input`, formerly CUDA-only), so with the 27B's fp8 KV
   cache the attention layer quantized q before `forward` and our paged prefill kernel read the half-size fp8 buffer
   as bf16. `R9kTriton3DImpl` pins the flag to False and falls back to stock for any non-16-bit query or output.
-  Found by bisection: stock `TRITON_ATTN` served 0 bad of 440; GDN and the drafter were cleared first. Known gap on
-  that nightly: the compiled 27B serves correctly but accepts no DFlash drafts (1.0 tokens a step; eager accepts 4.49) --
-  not attention, not the plugin's fp8 drafter linears or lm-heads; under investigation ([notes/vllm-0.32.md](notes/vllm-0.32.md)).
+  Found by bisection: stock `TRITON_ATTN` served 0 bad of 440; GDN and the drafter were cleared first.
+- **27B on the 0.32-era nightly: every DFlash draft rejected under HIP graphs (1.0 tokens a step, 43 tok/s).** Those
+  nightlies let the speculator skip the per-step metadata build for attention backends that update draft metadata in
+  place inside the graph. Our backend declares kernel block 16 for the paged kernels, so vLLM remaps the hybrid model's
+  1808-token KV blocks into a kernel block table at build time, and nothing refreshed it under graph replay: the drafter
+  attended to stale blocks. `R9kTriton3DMetadataBuilder` now declines the in-place update (metadata rebuilt every step,
+  as before that feature): 217 tok/s mean, 4.46 tokens a step, 0 bad of 440 -- the pinned numbers. Bisected with
+  compiled runs: stock attention (both layouts) healthy, ours healthy without graphs, ours + graphs broken, ours +
+  graphs + rebuild healthy ([notes/vllm-0.32.md](notes/vllm-0.32.md)).
 - **Our Triton-attention builder no longer reports `max_query_len = 1` for small verify batches on nightlies whose
   `unified_attention` runs multi-query batches on its split-KV path itself (`MAX_3D_QUERY_LEN`)**: the new kernel sizes
   its query grid from that value. The paged prefill path is unchanged.

@@ -82,6 +82,8 @@ def _r4d_kernels():
         return None
 
 
+_VERIFY_3D_DEFAULT = "1"
+VERIFY_3D = os.environ.get("R9K_ATTN_VERIFY_3D", _VERIFY_3D_DEFAULT)
 _NATIVE_3D = None
 
 
@@ -132,6 +134,16 @@ class R9kTriton3DMetadataBuilder(TritonAttentionMetadataBuilder):
         self.softmax_segm_expsum = torch.empty_like(self.softmax_segm_max)
         logger.info_once("r9700: attention 3D split-KV for <= %d query tokens/seq (scratch %d tokens)", MAXQ,
                          self._cap_tokens)
+        if hasattr(self, "supports_draft_decode_metadata_update") and os.environ.get("R9K_DRAFT_META_UPDATE", "0") != "1":
+            # The 2026-10 nightlies let a speculator skip the per-step metadata build for backends that update their
+            # draft metadata in place inside the FULL graph (stock's Triton builder: a no-op, its metadata points at
+            # the live block table). Ours declares kernel block 16 for the paged kernels, so vLLM remaps a model's
+            # larger KV blocks (1808 tokens on the hybrid 27B) into a kernel block table AT BUILD TIME; nothing
+            # refreshes that table under graph replay, the drafter attends to stale blocks and every draft is
+            # rejected (1.0 tokens a step; 4.46 with this flag, 2026-10-26). Rebuild every step, as before the skip
+            # existed. R9K_DRAFT_META_UPDATE=1 opts back in (only correct once the remap happens in-graph).
+            self.supports_draft_decode_metadata_update = False
+            logger.info_once("r9700: draft decode metadata rebuilt every step (kernel block 16 under larger KV blocks)")
         self._r4d = None
         k = _paged_kernels() if (self.headdim == 256 and self.num_heads_q == 6 * self.num_heads_kv) else None
         if k is not None:
@@ -154,6 +166,10 @@ class R9kTriton3DMetadataBuilder(TritonAttentionMetadataBuilder):
         if (not _native_3d() and 1 < md.max_query_len <= MAXQ and md.num_actual_tokens <= self._cap_tokens
                 and num_seqs <= self.seq_threshold_3D):
             md.max_query_len = 1          # -> unified_attention's split-KV path (see module doc)
+        elif _native_3d() and md.max_query_len > 1 and VERIFY_3D == "0":
+            # R9K_ATTN_VERIFY_3D=0: keep multi-query (verify) batches on the 2D kernel; the split-KV path stays for
+            # single-token decode. Diagnostic for the 2026-10 nightlies' native multi-query split-KV kernel.
+            md.seq_threshold_3D = 0
         elif self._r4d is not None and md.max_query_len > MAXQ:
             md.r9k_r4d = (self._r4d, self._r4d_maxq, self._r4d_scratch,
                           _plan(common_attn_metadata.query_start_loc_cpu, common_attn_metadata.num_reqs),

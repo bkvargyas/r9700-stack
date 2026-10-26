@@ -9,7 +9,15 @@ VM100 overlay, run the integration gate and the kernel gates, then the three ser
 
 - **`vllm/vllm-openai-rocm:v0.32.0`** is, like v0.31.0, a ROCm 7.2-era image (classic `/opt/rocm`, no pip SDK):
   not the platform this stack targets. Pulled, not pursued.
-- **`nightly-rocm100-e4a5b553`** is the ROCm 10 nightly at the 0.32 release point: vLLM `0.32.1rc1.dev466+ge4a5b5537`,
+- **Where v0.32.0 sits on main:** the release branched at `fe341a53d` (2026-10-12 20:49 UTC), 62 commits after our
+  pin `fe4df3df`, and took 16 cherry-picks (CI, quantization, non-ROCm fixes). The ROCm 10 nightly closest to the
+  release is **`nightly-rocm100-5555a2d8f`** (2026-10-13: branch point + 18 commits, still torch 2.12, version string
+  `0.31.1rc1.dev376`); an exact v0.32.0 on ROCm 10 would need a source build on the `base-nightly-rocm100` image.
+  The daily ROCm 10 nightlies after it: 77154ca61 (10-14), 3f1bcfd82 (10-15), 49cb2bbf7 (10-16), 39983a5e7 (10-17),
+  da9134bc8 + 1b2a66639 (10-18), e68efc685 (10-19), df3bd094a (10-20), df6603f05 (10-22, first with torch 2.13),
+  83c078d95 (10-23), c50aca144 (10-24), e4a5b5537 (10-25). Plugin images were built for 5555a2d8f, da9134bc8,
+  df6603f05 (`~/build-nightly.sh SHA`, which no longer writes into a serving tree) alongside e4a5b553.
+- **`nightly-rocm100-e4a5b553`** is the ROCm 10 nightly 466 commits past the 0.32 branch point: vLLM `0.32.1rc1.dev466+ge4a5b5537`,
   **torch 2.13.0+rocm10.0.0** (from 2.12), triton 3.8.0 (same), aiter 0.1.26 (from 0.1.24.post1), the **same
   `rocm-sdk-core 10.0.0`** (build 6b0e43f3). This is the test target: `r9700/vllm:dev-e4a5b553`
   (`docker/Dockerfile`, `BASE=` that nightly; the plugin installs as `r9700-vllm 0.3.6`, libr9k builds unchanged).
@@ -105,23 +113,44 @@ D and E2, were void: `27b.sh`'s own env assignments beat the inherited knobs -- 
 arguments, `~/try032.sh ... ARGS27=`.)
 
 With the fix, eager (`EAGER=1`): 0 faults, 0 bad of 440, **4.49 tokens a step** (the pin: 4.48-4.51). Compiled, the
-production launch: 0 faults, 0 bad of 440, prefill 3,914 tok/s (pin 3,906), but **1.0 tokens a step -- every draft
-rejected -- so 43.6 tok/s single-stream instead of ~216**. Only the graphed path loses the drafts; what it is not
-(each a compiled run, same outcome): our max_query_len=1 verify trick (off on this kernel), our attention backend for
-the drafter (X1: `DRAFT_ATTN=TRITON_ATTN`), our attention anywhere (X2: both stock), our fp8 drafter linears (X3), our
-fp8 lm-heads (X5). GDN on stock (X4) ran out of VRAM under the fixed 9 GiB KV budget before measuring; forcing the
-drafter eager through the speculative config (X6) was ignored by this nightly. **Open:** the 0.32 speculator rebuilt
-its CUDA-graph path (`_prepare_graph_forward` / `_prepare_graph_replay` / `_store_hidden_states` with staged aux hidden
-states, and an `is_padding` row mask); the next probes are the GDN one-page record under graphs with a larger KV
-budget, and a dump of draft vs accepted tokens on one request.
+production launch: 0 faults, 0 bad of 440, but **1.0 tokens a step -- every draft rejected -- 43 tok/s instead of ~216**.
+
+**Second root cause (2026-10-26), found by compiled A/B runs on cards 6/7**, all 0 bad of 440:
+
+| run | what | tok/step | decode mean |
+|---|---|---|---|
+| C0b | production config (ours, HIP graphs + torch.compile) | 1.0 | 43 |
+| KV8b | same, KV budget 8 GiB instead of 9 | 1.0 | 43 |
+| X2b | stock `TRITON_ATTN` for target and drafter, NHD layout | 4.57 | 219 |
+| X10 | stock `TRITON_ATTN`, our LBHNC layout | 4.55 | 220 |
+| X7 | ours, HIP graphs, torch.compile off | 1.0 | 34 |
+| X8 | ours, torch.compile, HIP graphs off | 4.43 | 55 |
+| **FIX** | **ours, graphs + compile, draft metadata rebuilt every step** | **4.46** | **217** |
+
+So: our `CUSTOM` backend, only under graph replay, not the layout, not memory, not Inductor. The nightly (36f397281,
+2026-10-12) lets the speculator skip the per-step metadata build for backends whose builder claims
+`supports_draft_decode_metadata_update`; stock's Triton builder inherits True and its update is a no-op because its
+metadata points at the live block table. Ours inherits True too, but it declares kernel block 16 for the paged
+kernels, so vLLM remaps the hybrid 27B's 1808-token KV blocks into a *kernel block table* at build time
+(`worker/utils.py: map_to_kernel_block_table`) -- a copy nothing refreshes under graph replay. The drafter attended
+to stale blocks and the target rejected everything; eager mode rebuilt the table every step and was fine. **Fix:**
+`R9kTriton3DMetadataBuilder` sets `supports_draft_decode_metadata_update = False` (the behaviour before the skip
+existed; `R9K_DRAFT_META_UPDATE=1` opts back in). Result: 217 tok/s mean, 4.46 tokens a step, prefill 3,838 tok/s
+(our paged kernel; stock's 3,205), 8/16 streams 503/631. Follow-up for speed: declare `MultipleOf(16)` like stock and
+do the 16-token remap inside our prefill path, so the in-graph update can stay on.
+
+The Oct 13 (`5555a2d8f`, the v0.32.0 branch point + 18 commits, torch 2.12) and Oct 22 (`df6603f05`) nightlies showed
+the same 1.0 before the fix, so the whole 0.32 line needs it. (Earlier runs X1/X2/X5/X6 in this session were void: the
+long-wait launcher dropped the serve-script overrides; the table above is the valid set.)
 
 ## Verdict
 
 - The plugin builds and installs on the 0.32-era nightly; kernels, integration gate and overlay are fine.
 - **GLM-5.3-Flash TP8 and Flash-Next TP4 serve at the pinned numbers** after four plugin-side fixes (MLA prefill
   backend, int6 shard overlap, hyper-connection low-rank attribute, fp8-query pin) and one serving knob (`UTIL=0.97`).
-- **27B TP2 is correct but 5x slower than on the pin** until the draft-acceptance loss under CUDA graphs is understood.
-  The production pin stays `fe4df3df`; the fixes above are forward-compatible and go into the next release.
+- **27B TP2 at the pinned numbers** after a fifth plugin-side fix (draft metadata rebuilt every step; the in-graph
+  update left our remapped kernel block table stale). The production pin stays `fe4df3df` for now; all five fixes are
+  forward-compatible and go into the next release, which can then move the pin to the 0.32 line.
 - Retired on the way: the PLE short-conv prefill hook (stock's fused Triton kernel is bit-identical and 8x faster).
 
 ## PLE conv: ours vs stock's fused Triton kernel (card 4, dev-e4a5b553)

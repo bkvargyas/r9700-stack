@@ -87,6 +87,9 @@ UTIL=${UTIL:-$([ "${OFFLOAD_GB:-34}" != 0 ] && [ "${TP:-2}" = 2 ] && echo 0.96 |
 # padding costs more than it saves (GPU time passes the floor near 1.7k tokens). The graph pool costs KV cache
 # capacity, more so with larger sizes (4096: -20%).
 CC=()
+# CCMODE=NONE|STOCK_TORCH_COMPILE|DYNAMO_TRACE_ONCE|VLLM_COMPILE: torch.compile mode (vLLM's compilation_config.mode);
+# NONE with CGMODE=FULL = HIP graphs without Inductor, VLLM_COMPILE with CGMODE=NONE = Inductor without graphs (A/B).
+[ -n "$CCMODE" ] && CC+=("\"mode\": \"$CCMODE\"")
 [ -n "$CGMODE" ] && CC+=("\"cudagraph_mode\": \"$CGMODE\"")
 [ -n "$CGSIZES" ] && CC+=("\"cudagraph_capture_sizes\": [$CGSIZES], \"max_cudagraph_capture_size\": ${CGSIZES##*,}")
 [ ${#CC[@]} -gt 0 ] && ARGS+=(--compilation-config "{$(IFS=,; echo "${CC[*]}")}")

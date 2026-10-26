@@ -167,6 +167,17 @@ from r9700_vllm.attn.triton3d import R9kTriton3DImpl as _R3
 check("R9kTriton3DImpl pins supports_quant_query_input = False",
       "self.supports_quant_query_input = False" in inspect.getsource(_R3.__init__))
 
+# --- draft metadata: our builder must not claim in-place updates while it maps KV blocks to kernel block 16 -----
+from vllm.v1.attention.backends.triton_attn import TritonAttentionMetadataBuilder as _TMB
+from r9700_vllm.attn.triton3d import R9kTriton3DMetadataBuilder as _R3B
+check("stock Triton builder still exposes supports_draft_decode_metadata_update",
+      hasattr(_TMB, "supports_draft_decode_metadata_update"))
+check("R9kTriton3DMetadataBuilder rebuilds draft metadata every step by default",
+      "self.supports_draft_decode_metadata_update = False" in inspect.getsource(_R3B.__init__))
+from vllm.v1.worker import utils as _wu
+check("kernel block remap still happens at build time only (map_to_kernel_block_table)",
+      "map_to_kernel_block_table" in inspect.getsource(_wu))
+
 # --- kernels plugged into stock objects -----------------------------------------------------------------------
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_w4a4_mxfp4 import (
     CompressedTensorsW4A4Mxfp4)
