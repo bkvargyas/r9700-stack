@@ -325,3 +325,49 @@ BetterBench 197.0 vs 116.8, concurrency 180 / 308 / 428 / 600 vs 103 / 190 / 312
 "server error lines: 88" in the log is the word "default" matching `fault` again (0 real error lines in the
 container logs while they were up). Our 27B BetterBench had one 2.4 s TTFT p99 outlier at 4 streams (p50 122 ms).
 Evals `~/.r9keval/radiance140-{fn-tp4,27b-tp2}.json`, BetterBench logs `~/rad140-*.bb.log` and `~/ours27b-v032.bb.log`.
+## 1.13.0 against our v0.3.7 (2026-10-28)
+
+Brian, after rebooting the .100 host: "test the latest radiance server against Flash Next". The latest is 1.13.0 (tag
+2026-10-27, Docker Hub `1.13.0` = `latest`, 181 MB compressed): 500 commits on main since the 1.4.0 of 2026-10-12 and
+nine releases in between (1.5.0 on 10-13, 1.8.0 on 10-18, 1.10.0 on 10-20, 1.12.0 on 10-24). What they add, from the
+commit subjects and the new `--help` (still no kernel source read): the image is on ROCm 10.1; the on-disk prefix-cache
+tier is gone and `--prefix-cache-mib N` is one host-memory tier, so 1.4.0's `--prefix-cache-host-mib` /
+`--prefix-cache-dir` / `--prefix-cache-disk-mib` no longer parse and the compose file had to change; KV streaming from
+host memory through a VRAM ring (`--kv-resident`); a pipelined prefill past two ranks (on request,
+`RADIANCE_PREFILL_PIPELINE`) and `--tp-attn-split rows`, a row split of a prefill-sized step's attention "for the
+projections at full width on every card"; drafter knobs (`--draft-window adaptive`, `--draft-short-from N`,
+`--draft-coupling`); 4- and 6-bit KV (`--kv-cache-dtype fp8_v4 | k6_v4`), fp8 prefill attention
+(`--attn-prefill-fp8`), an f16 recurrent-state cache, `--weight-prefetch`, `--p2p`, `--prefill-interleave`, static YaRN,
+LoRA serving; eight-rank all-reduce work with GLM-5.3-Flash on eight cards (a 172 GiB MXFP4 container converted from
+AMD's Quark export) and a long list of other models (Gemma 4, Nemotron 3.5, Ornith, Sage, MiniMax, image / video /
+speech). Flash-Next's own recipe is unchanged: the README four-rank row is 1.4.0's flags, plus the compose file's
+`--prefix-cache-mib 4096`.
+
+Run on VM100 (the eight-card .100 box, 384 GiB guest, 210 W / -42 mV, right after the host reboot, nothing else on the
+cards): `~/radiance-compose-tp3/flashnext-tp4-1130.yaml` (HIP 0-3, :8010, `RADIANCE_IMAGE=stilldeadcode/radiance:1.13.0`),
+the same `.rad` file as every run before, the 1.4.0 checklist (`~/radtest1130.sh` -> `~/radtest1130.log`), clients from
+the deployed v0.3.7 tree. Our column is the v0.3.7 release gate on the same four cards two days earlier
+(`notes/release-v0.3.7.md`; same box, same power, 15-minute soak instead of 25) plus a same-day GSM8K / HumanEval of the
+deployed v0.3.7 (`~/oursfn-037.sh` -> `~/oursfn-037.log`).
+
+Boot: up in 60 s. At four ranks the whole expert plane is resident -- the boot log's budget: elastic 27.71 GiB a card,
+of it experts 14.83 GiB ("the whole expert plane is resident, so more would do nothing") and KV 11.59 GiB ("backs 8
+sequences all at 200000 tokens at once"), static weights 2.68 GiB, 31.1 GiB of VRAM used a card; the 47.68 GiB n-gram
+table and the 4 x 12.3 GiB host pool pinned in host RAM (121 GiB used while serving). "speculation: 'mtp' drafts 3
+token(s) a step in 3 serial pass(es); prompt lookup fills in for any sequence it declines"; "chained launches: off".
+
+| Flash-Next TP4 | radiance 1.13.0 | radiance 1.4.0 (10-12) | ours v0.3.7 (10-26) |
+|---|--:|--:|--:|
+| probe: decode / 8 conc / 16 conc / 8k prefill | 259 / 741 / 765 / 5,509 | 251 / 726 / 749 / 5,533 | 222 / 468 / 917 / 6,711 |
+| strict sanity (long prompts; conc N+1; conc 2N; after the soak) | 0 bad of 160 / 900 / 960 / 360 | 0 bad of 160 / 900 / 960 / 360 | 0 bad of 160 / 1,020 / 1,280 (N = 16) |
+| GSM8K 1,319, no thinking, conc 1 | 95.98% (1,266) | 95.83% (1,264) | 95.22% (1,256), same day |
+| HumanEval 164 | 160 | 160 | 161, same day |
+| BetterBench combined decode / update p99 | 213.4 / 13.3 ms | 213.7 / 13.0 | 182.6 / 15.1 ms |
+| BetterBench single-stream TTFT p50 (ms) | 45-56 | 75-84 | 75-80 |
+| concurrency 1 / 2 / 4 / 8 (aggregate tok/s) | 194 / 299 / 429 / 602 | 194 / 292 / 422 / 536 | 173 / 276 / 401 / 543 |
+| prefill 2k / 8k / 16k / 32k / 64k (tok/s) | 5,597 / 5,500 / 5,500 / 5,502 / 5,467 | 5,183 / 5,436 / 5,378 / 5,444 / 5,474 | 5,052 / 7,052 / 7,425 / 7,159 / (32k max) |
+| soak, 16 clients, 200-30k-token prompts | 414 ok in 1,537 s, 0 errors, 4,818 prompt tok/s (median prompt 17.7k) | 421 ok in 1,546 s, 0 errors, 4,078 | 364 ok in 904 s, 0 errors, 6,689 (median 17.1k) |
+
+Also tried, probe only (`~/rad1130-rows.sh`): the same launch with `--tp-attn-split rows`, the new row split of a prefill-sized step's attention. 1.13.0 refuses it for this model at startup -- "the 'qwen4exp_fp8' plugin does not split attention by rows for this model (heads does)" -- so the four-rank Flash-Next prefill path is the one measured above. Its startup report also warns `link-below-max` on all four cards ("the PCIe link at 0000:00:02.0 runs 2.5 GT/s x1 of its 32.0 GT/s x16"): that is the guest's emulated root port, which reports a token link width; the real Gen5 x16 links are on the host, and the numbers show no sign of a starved link.
+
+Reading it. **1.13.0 against 1.4.0**, sixteen days and 500 commits apart on the same recipe: decode is unchanged (BetterBench 213.4 vs 213.7, probe 259 vs 251 single, 741 vs 726 at eight), the eight-stream sweep is up 12% (602 vs 536 aggregate), time to first token is down a third (45-56 ms vs 75-84 ms single-stream p50; TTFT p50 86 ms at eight streams), the 2k prefill is up 8% (5,597 vs 5,183) and the rest of the prefill ladder is flat at 5.5k, and the soak carried 18% more prompt tokens a second (4,818 vs 4,078, on longer prompts: median 17.7k vs 15.0k) for the same request count (414 vs 421). Quality is the same (GSM8K 95.98 vs 95.83, McNemar p=0.86; HumanEval 160 both) while only 30% of the GSM8K outputs are identical, so the numerics changed under it (1.1.1 -> 1.2.0 -> 1.4.0 had been identical on 100%). Nothing broke: strict sanity 0 bad of 2,380, 0 errors in the soak, 0 error lines in the server log (the 1.4.0 run's "88" was the word "default"). **1.13.0 against our v0.3.7** on the same four cards: radiance decodes 17% faster single-stream (probe 259 vs 222; BetterBench 213.4 vs 182.6 with the lower update p99, 13.3 vs 15.1 ms), answers first tokens sooner (45-56 vs 75-80 ms) and now leads the whole 1-8 stream sweep (194 / 299 / 429 / 602 vs 173 / 276 / 401 / 543) and the eight-stream probe (741 vs 468); we lead at sixteen streams in the probe (917 vs 765), on prefill from 8k up by 28-35% (7,052 / 7,425 / 7,159 vs 5,500 / 5,500 / 5,502) and in the soak's prompt throughput (6,689 vs 4,818 prompt tok/s; 24 vs 16 requests a minute on the same prompt mix); radiance serves 200k contexts here (the 64k row ran), we stop at 32k on four cards. Quality is equal: HumanEval 161 vs 160; GSM8K 95.22% (1,256) for ours against 95.98% (1,266), McNemar p=0.13, no detectable difference, and only 3% of the outputs identical (two engines, two numerics). Our 95.22 is the lowest of our Flash-Next TP4 GSM8K records (95.75 on the v0.3.1 gate, 95.45 on the 10-07 fp8 run, 95.60-95.75 on v0.2.4-v0.3.2; p=0.28 against the best) and the first on the 0.32 pin -- inside the noise by the test, but a repeat run on the production pin is the way to know, so it is on the list. Our same-day probe on the deployed tree: 224 / 477 / 931 / 6,951 (3.1 tokens a step, KV 489,860 tokens on this second launch of the tree), matching the gate; the ad-hoc prefill ladder's 20k-word prompt was over our 32k limit (400) and its shorter rungs were lost to a `tail`, so the BetterBench ladder stands as the record. Radiance's four-rank Flash-Next is the configuration it says is "a capacity configuration" whose tiering flags are the two-rank recipe carried over; with the whole expert plane resident on four cards none of the tiering matters, and the 12 GiB host pool a rank (49 GiB pinned, plus the 47.7 GiB n-gram table) buys nothing we could see. Evals `~/.r9keval/radiance1130-fn-tp4.json` and `~/.r9keval/ours037-fn-tp4.json`, BetterBench `~/rad1130-fn-tp4.bb.log`, server logs `~/rad1130-fn-tp4.{boot,server}.log`, run logs `~/radtest1130.log`, `~/rad1130-rows.log`, `~/oursfn-037.log`, all on VM100.
