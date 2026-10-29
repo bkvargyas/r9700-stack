@@ -166,3 +166,34 @@ GSM8K (100 questions, four streams, medium reasoning) on the fp8-KV configuratio
 MTP works on this nightly with the stock proposer and the same hooks (no proposer patch, unlike the vLLM 0.24
 overlay). Open: more draft tokens, fp8 KV together with MTP, longer contexts, the next profile, HumanEval, and the
 QFN / 27B gates on the glm53 tree before any merge.
+
+## Production server through the full checklist (2026-10-29, v0.3.7, 32k recipe, in place)
+
+Brian: "Can we do some benchmarks of GLM while we wait?" (the DeepSeek-V4.1-Flash queue, notes/radiance-test-run.md). The production
+server as it ran: deployed v0.3.7 tree on `r9700/vllm:dev` (e4a5b553), the 32k recipe (RedHat NVFP4, TP8, MTP-3, fp8 KV, NSEQ 4,
+NBT 8192), KV cache 177,283 tokens, up 17 h, SCLK -500 MHz on all eight cards (the 120 V rule), 210 W / -42 mV. `~/glm-bench-1029.sh`
+-> `~/glm-bench-1029.log`, BetterBench `~/glm-bench-1029.bb.log`, evals `~/.r9keval/glm53-prod-1029.json`.
+
+| | production GLM 2026-10-29 | v0.3.7 gate (10-26) | v0.3.5 record |
+|---|--:|--:|--:|
+| probe: decode mean (code / prose / json / math) | **89.0** (90.5 / 75.8 / 94.4 / 95.4), 2.86 tokens a step | 75.0 | 79.6, 2.3 a step on a story |
+| probe: 8 / 16 streams (4 run at once), 8k prefill | 138 / 163, 3,148 tok/s | 157 at four, 2,466 on the needle | 158 |
+| strict sanity, thinking on: long prompts / 5 streams / 8 streams / after the soak | 0 bad of 160 / 300 / 320 / 200 | 0 of 780 | |
+| GSM8K, all 1,319, no thinking, conc 4 | **95.98%** (1,266) -- the first full run on GLM | 100-question samples 95-97 | |
+| HumanEval 164 (thinking) | 151 (92.1%) at the client's 3,072-token budget; **156 (95.1%) at 8,192** (`~/humaneval8k.py`, 22 min): five of the thirteen were cut off, eight remain (32, 38, 47, 50, 95, 97, 132, 145) against 2-4 for the Qwen models | | |
+| BetterBench combined / update p99 / TTFT p50 | 91.4 / 32.1 ms / 230 ms | | |
+| BetterBench 1 / 2 / 4 / 8 streams (aggregate) | 86.5 / 116.5 / 157.9 / 157.5 (8 queue behind NSEQ 4: TTFT p50 9.5 s) | | |
+| prompt processing 2k / 8k / 16k / 32k | 3,343 / 3,284 / 3,137 / 3,103 tok/s | | |
+| soak, 16 clients, 200-30k tokens, 977 s | 156 ok, 0 errors, 2,445 prompt tok/s, median prompt 15.6k, latency 98 s | 155 in 964 s | |
+| server errors; VRAM before / after | 0; 31.1-31.4 -> 32.2 GiB a card (the KV pool filled by the soak) | | |
+
+Reading it: the step is unchanged (~31 ms, BetterBench update p99 32.1 ms) and the gain over the gate is acceptance -- 2.86 tokens a
+step on the probe's code / json / math prompts against 2.3 on prose and stories; prose alone is 75.8, inside the old 70-80 band. Four
+streams give 1.8x one, eight give nothing more because NSEQ is 4 (and sized by the 32k context against the 177k-token pool); the
+server is bound by the per-layer all-reduce across the PLX switches, not by the cards (the -500 MHz offset is invisible). Quality:
+GSM8K 95.98 on the full set, the same number radiance's Flash-Next posts; HumanEval 151 against 160-162 for the Qwen models under the
+same client -- GLM reasons at length: at 8,192 tokens five of the thirteen pass and it lands at 156, four to six behind the Qwen models. Thermals under the
+run (ROCm telemetry inside the container; the guest's sysfs reads a flat 18 C through the passthrough): edge 43-52 C, junction 49-62
+C (chains C/D ~10 C warmer than A/B), memory 52-60 C, 134-135 W a card on decode, on-card fans 1,040-1,070 rpm; host BMC: inlet 41 C,
+CPU 68-70 C, chassis GPU fans 8,250-8,400 rpm, wall 1,500-1,560 W under the bench, 415 W idle; the BMC's "maximum during sampling
+period" of 2,960 W is the power-on inrush after the 10-28 reboot (not reached again).
