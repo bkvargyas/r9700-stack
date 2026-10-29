@@ -454,3 +454,17 @@ is measured on thinking tokens and radiance on answers. A controlled rerun (the 
 instruction on GSM8K) is the way to say which quant is better; the engine comparison above stands either way. Not available on
 radiance's GLM: fp8 KV (`glm5next` declares bf16 only) -- its 3.38 GiB pool is 13% of the budget and sized to 8 x 32k, so cache
 is not what bounds it. Production GLM relaunched by the script afterwards (KV 156,278 tokens this launch).
+
+**Four cards, one per switch (2026-10-29 21:42 UTC, `~/glm-rad/run-tp4.sh` -> `~/glm-rad/run-tp4.log`).** Brian: "Does radiance allow
+for a 4 card setup of GLM?" -- the plugin takes 1, 2, 4 or 8 ranks, so the same container on HIP 0,2,4,6 with `--tp 4 --placement
+expert_tiered --host-pool-mib 24576` and the rest of the eight-card flags. Up in 11 min (the tiered load): static 5.12 GiB a card,
+experts 18.20 GiB resident a card (72.8 of the ~162 GiB plane, 45%), KV 3.66 GiB, 31.6 GiB VRAM a card, 4 x 24 GiB pinned (host 120
+GiB used). Probe **42.6** single (code 35.5 / prose 35.5 / json 52.9 / math 46.4), **56 / 59** at 8 / 16 streams, 8k prefill 1,528;
+ladder 579 / 1,504 / 1,773 tok/s at 3.3k / 11k / 20k (the first rung pays the cold tier); strict sanity 0 bad of 360 at conc 9;
+4 clients on 6-11k prompts for 278 s: 15 served, 469 prompt tok/s, median latency 75 s; 0 error lines; wall power peak 1,150 W.
+Against the same engine on eight cards (152 / 405 / 422 / 2,432): 28% of the single-stream decode, 14% at eight streams, 63% of the
+8k prefill and 22% of the 4-client prompt throughput -- the 55% of the expert plane that streams from host RAM through the four Gen3
+uplinks is the step, and concurrency cannot hide it (56 at eight streams against 405). Against our own four-card GLM with experts in
+host RAM (8 tok/s, notes/glm53.md), radiance's tiering is 5x better, and it still leaves the other four cards free -- a GLM TP4 +
+Flash-Next TP4 box on radiance alone would serve both at 43 / 222-259 tok/s single-stream. Cards left idle afterwards (Brian: test
+box, no production relaunch).
