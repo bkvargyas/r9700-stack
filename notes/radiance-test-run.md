@@ -391,3 +391,16 @@ single-stream (160 vs 222), still lead at eight streams (547 vs 468), trail at s
 (2,670 vs 6,711); on a Gen5 root-port box their two cards reach 87% of our four single-stream and 1.3x at eight streams.
 Untested: the split pair (HIP 0,2, one card per switch) on radiance -- our stack gained 40% from it, theirs might too, at
 the cost of an all-reduce that crosses switches. Production GLM relaunched by the same script (KV 184,845 tokens this launch).
+
+**The split pair (2026-10-29 00:38 UTC, `~/rad1130-tp2split.sh` -> `~/rad1130-tp2split.log`, `flashnext-tp2-1130-split.yaml`
+= the same two-rank recipe on HIP 0,2, one card per PLX switch).** Same budget (experts 17.74 GiB resident a card, KV 8.53 GiB),
+up in 2 min. Probe **180 / 599 / 592 / 4,736** (code 162 / prose 127 / json 222 / math 207); prefill ladder 4,523 / 4,885 /
+4,992 / 4,805 tok/s at 4.7k / 19k / 39k / 78k tokens; 4 clients on 6-13k prompts for 240 s: 88 served, 3,422 prompt tok/s,
+median latency 11.0 s; strict sanity 0 bad of 360 at conc 9; 0 error lines. Against the same-switch pair: single-stream +12%,
+eight streams +10%, sixteen -6%, prefill +77% (4,736 vs 2,670), the 4-client test +59% (3,422 vs 2,156 prompt tok/s, 88 vs 56
+served) -- the expert stream now has an uplink per card, and the all-reduce crossing the switches costs a little at sixteen
+streams. That puts VM100's split pair at 93 / 96 / 91 / 79% of the VM 102 Gen5 root-port run (193 / 625 / 652 / 5,990) and the
+4-client test at 89% (3,836). So on this box, two-rank radiance against our four-rank v0.3.7: 81% of our single-stream decode
+(180 vs 222), 1.28x at eight streams (599 vs 468), 65% at sixteen (592 vs 917), 71% on 8k prefill (4,736 vs 6,711). Rule for
+any two-card expert-streaming server on the PLX box, theirs or ours: one card per switch. Production GLM relaunched by the
+script (KV 177,283 tokens).
