@@ -468,3 +468,14 @@ uplinks is the step, and concurrency cannot hide it (56 at eight streams against
 host RAM (8 tok/s, notes/glm53.md), radiance's tiering is 5x better, and it still leaves the other four cards free -- a GLM TP4 +
 Flash-Next TP4 box on radiance alone would serve both at 43 / 222-259 tok/s single-stream. Cards left idle afterwards (Brian: test
 box, no production relaunch).
+
+**2-bit experts on radiance's GLM: refused (2026-10-29 22:39 UTC).** Brian: "Run the IQ2_XXS version, I want to see the difference."
+Radiance's `ggml` quantiser takes every llama.cpp type (q2_K..q6_K, iq1_s, iq2_xxs, iq2_xs, iq2_s, iq3_xxs, iq3_s, iq4_nl, iq4_xs; the
+i-quants with an imatrix, and Unsloth's GLM-5.3-Flash imatrix fused for the gate_up experts by their `imatrix_merge.py`: 1,618 carried,
+168 fused for 42 layers), and a recipe with the routed experts at iq2_xxs (`~/glm-rad/glm53-iq2xxs.recipe`) is accepted by the
+quantiser -- but the GLM plugin's declare refuses it in the first minute: "the routed experts are served as block fp8
+(fp8_e4m3*bf16[128x128]), four-bit (i4*bf16[1x128], optionally /fwht128; or u4 codes into a 16-entry f32 table, /fwht128) or plain
+bf16; or the codebook at E4M3 scales a 64 or 32 of K under a fixed f32, or its 32-entry five-bit form at a 64, or OCP MXFP4". So
+GLM-5.3-Flash on radiance 1.14.0 is 4-bit or wider, and the 172 GiB container is as small as it gets (i4 with a bf16 scale per 128
+would save ~5 GiB); a resident four-card GLM is not available on radiance, and a GGUF cannot be read for this plugin either (it maps
+Quark's names). The i-quant kernels are the DeepSeek/Qwen plugins'. Unsloth's UD-IQ2_XXS GGUF (94.9 GiB) would need llama.cpp.
