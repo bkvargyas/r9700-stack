@@ -404,3 +404,53 @@ streams. That puts VM100's split pair at 93 / 96 / 91 / 79% of the VM 102 Gen5 r
 (180 vs 222), 1.28x at eight streams (599 vs 468), 65% at sixteen (592 vs 917), 71% on 8k prefill (4,736 vs 6,711). Rule for
 any two-card expert-streaming server on the PLX box, theirs or ours: one card per switch. Production GLM relaunched by the
 script (KV 177,283 tokens).
+
+## 1.14.0: GLM-5.3-Flash on eight cards, against our production server (2026-10-29)
+
+Brian: "Go ahead and run the radiance GLM test on our hardware for comparison." Radiance has served GLM-5.3-Flash at eight ranks
+since 1.13.0 (its `glm5next` plugin: 34 KDA + 11 sparse-MLA layers over four mHC residual streams, MXFP4 experts, block-FP8
+attention, the model's own MTP layer as the drafter, bf16 KV -- the only cache it declares). The container is converted from
+AMD's Quark export (`amd/GLM-5.3-Flash-Quark-MXFP4`, 172.4 GiB, 62 shards, downloaded at 11-79 MiB/s) with the tag's
+`data/recipes/glm53-mxfp4.recipe` (not in the image: fetched from the tag) -- 4 minutes, 12 weights recast, 26,131 kept as stored,
+172.4 GiB. Served with the shipped `glm53-flash.yaml` flags minus `--api-key` (`--tp 8 --placement all_vram --gpu-headroom-mib 1024
+--embedding-placement vram --max-num-seqs 8 --max-model-len 32768 --max-num-batched-tokens 4096 --prefill-span 4
+--checkpoint-interval 1024 --checkpoint-slots 64 --prefix-cache-mib 4096 --num-speculative-tokens 5 --draft-window adaptive
+--reasoning-effort low --reasoning-effort-map medium=high,xhigh=high`), on VM100's eight cards with the -500 MHz offset of the 120 V
+rule, 210 W / -42 mV; up in 2 min, 29.3 GiB a card (experts 19.67 GiB resident, KV 3.38 GiB = 262k tokens, 8 sessions at 32k),
+27 GiB host RAM. Ours is the production server as benchmarked two hours earlier the same day (notes/glm53.md "Production server
+through the full checklist": deployed v0.3.7, RedHat NVFP4, TP8, MTP-3, fp8 KV, NSEQ 4, 32k, the same offset). Same clients, same
+order: `~/glm-rad/run.sh` -> `~/glm-rad/run.log`, BetterBench `~/glm-rad/bb.log`, evals `~/.r9keval/rad-glm53-1029.json`.
+
+| GLM-5.3-Flash, eight R9700s, 32k | radiance 1.14.0 (Quark MXFP4) | ours v0.3.7 (RedHat NVFP4) | radiance README (their box) |
+|---|--:|--:|--:|
+| probe: decode mean (code / prose / json / math) | **152.1** (159 / 105 / 198 / 147) | 89.0 (90.5 / 75.8 / 94.4 / 95.4), 2.86 a step | 166 |
+| probe: 8 / 16 streams; 8k prefill | **405 / 422**; 2,432 | 138 / 163 (NSEQ 4); **3,148** | 426 at eight |
+| prefill ladder | 2,506 / 2,445 / 2,438 at 3.3k / 11k / 20k | 3,343 / 3,284 / 3,137 / 3,103 at 2k / 8k / 16k / 32k (BB) | 3,958 at 6k |
+| strict sanity, thinking on: long / N+1 / 2N / after soak | 0 bad of 160 / 540 / 640 / 360 | 0 of 160 / 300 / 320 / 200 | |
+| GSM8K 1,319, no thinking, conc 4 | 91.74% (1,210) | **95.98%** (1,266) | |
+| HumanEval 164 (thinking) | **161** in 1.3 min | 151 at 3k budget, 156 at 8k, 15-22 min | |
+| BetterBench combined / update p99 / TTFT p50 | **157.7** / 23.8 ms / 66-88 ms | 91.4 / 32.1 ms / 230 ms | |
+| BetterBench 1 / 2 / 4 / 8 streams | **138 / 214 / 302 / 401** | 86.5 / 116.5 / 158 / 158 | |
+| BetterBench reasoning share; stopped at max_tokens | 2-25%; 22% | 89-100%; 94% | |
+| soak 16 clients, 200-30k tokens, ~16 min | 156 ok, 0 err, 2,134 prompt tok/s, median prompt 13.2k, latency 98.8 s | 156 ok, 0 err, **2,445**, median 15.6k, 98.1 s | |
+| server errors; wall power peak (BMC, 20 s samples) | 0; **2,138 W** | 0; ~1,560 W | |
+
+Reading it. **Speed:** radiance decodes GLM 1.7x faster on one stream (152 vs 89; BetterBench 157.7 vs 91.4 with a 23.8 ms step
+against our 32.1) and 2.5-2.9x at concurrency (401 vs 158 at eight streams, 405 vs 138 on the probe), answers first tokens three
+times sooner (66-88 vs 230 ms), and runs eight sequences where we run four. Its README's 166 / 426 were taken without our clock
+offset; 152 / 405 here is the same engine 500 MHz down. We prefill 30% faster (3.1-3.3k vs 2.4k) and the soak moved 15% more prompt
+tokens through ours for the same 156 requests. The step time is the whole story: their eight-rank two-shot all-reduce and
+five-token adaptive draft window against our RCCL ring and three drafts, on the same PLX topology -- so our 31 ms step is the
+stack, not the hardware (task: the eight-rank collective). The cost is power: 2,138 W at the wall against ~1,560 for ours under
+the same clients, because radiance keeps all eight cards busy where ours wait on the collective; still under the 2,400 W ceiling
+with the offset on, and no alert in 125 samples.
+**Quality:** not like for like, and the two differences run opposite ways. GSM8K without thinking: radiance 91.74 vs ours 95.98,
+paired McNemar p < 0.001 (77 questions only ours gets right, 21 only radiance), 0% identical outputs. Its answers are one-liners
+(median 82 characters, "**70**  Gretchen has 70 gold coins ...") where ours work the problem in the visible answer (median 402)
+-- the `--reasoning-effort low` default and its template, and possibly AMD's Quark MXFP4 against RedHat's NVFP4; the run does not
+separate the two. HumanEval the other way: radiance 161 of 164 in 1.3 minutes, ours 151 (156 at an 8k budget) in 15-22 minutes --
+its GLM reasons 2-25% of the output (BetterBench's estimate) where ours reasons 89-100% and hits max_tokens on 94% of runs, so ours
+is measured on thinking tokens and radiance on answers. A controlled rerun (the same reasoning effort on both, a step-by-step
+instruction on GSM8K) is the way to say which quant is better; the engine comparison above stands either way. Not available on
+radiance's GLM: fp8 KV (`glm5next` declares bf16 only) -- its 3.38 GiB pool is 13% of the budget and sized to 8 x 32k, so cache
+is not what bounds it. Production GLM relaunched by the script afterwards (KV 156,278 tokens this launch).
