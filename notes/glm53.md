@@ -155,7 +155,9 @@ collectives, and only the even ranks ever send cross-chain.
 ## Knobs
 
 `KVDTYPE=fp8`, `R9K_SPARSE_MLA=auto|r9k|stock`, `R9K_SPARSE_MLA_SPLITS` (8), `R9K_INDEXER_MM=0`, `R9K_AR8=0`,
-`R9K_AR8_FP32=1` (exact, 45 us), `R9K_AG8=0`, `R9K_AG_MAX_KB` (2048 for the logits at 4 tokens),
+`R9K_AR8_FP32=1` (exact, 45 us), `R9K_AG8=0`, `R9K_AG_MAX_KB` (2048 for the logits at 4 tokens), `R9K_AR8_CROSS_HOST=0` (peer-write
+cross stage; default 1 = pinned host memory, below), `R9K_AR8_HOST_MIN_KB` (12) / `R9K_AR8_HOST_MAX_KB` (96) / `R9K_AR8_HOST_1S_KB` (128),
+`R9K_AR8_PAIR_1S_KB` (64), `R9K_AR8_HOST_AG=0` (logits all-gather on the peer path), `R9K_ARN_HOST=1` (every N-rank pool in host memory),
 `R9K_FP8_LINEARS=<regex>`, `R9K_NVFP4_MOE=mxfp4|native` (default converts; native = exact bits for VRAM-resident experts, offloaded experts
 always convert, the expert cache is MXFP4-only), `R9K_DISABLE=glm5next`. Everything keys on world size 8, the glm5next module path or
 checkpoint content the Qwen configurations do not have.
@@ -197,3 +199,67 @@ run (ROCm telemetry inside the container; the guest's sysfs reads a flat 18 C th
 C (chains C/D ~10 C warmer than A/B), memory 52-60 C, 134-135 W a card on decode, on-card fans 1,040-1,070 rpm; host BMC: inlet 41 C,
 CPU 68-70 C, chassis GPU fans 8,250-8,400 rpm, wall 1,500-1,560 W under the bench, 415 W idle; the BMC's "maximum during sampling
 period" of 2,960 W is the power-on inrush after the 10-28 reboot (not reached again).
+
+## The eight-rank collective through host memory (2026-10-30, master after v0.3.7)
+
+Brian: "Look into the eight-rank collective on our stack" -- radiance decodes this model at 152 tok/s on the same eight cards and
+the same PLX topology where ours did 86-89, with a 24 ms step against our 32. Method: a torch-profiler trace of a 256-token decode
+on the production recipe (vLLM's `--profiler-config {"profiler":"torch","torch_profiler_dir":"/prof"}` through `EXTRA=`, the
+old `VLLM_TORCH_PROFILER_DIR` env no longer exists on this build; `~/prof/analyze.py` sums kernel time by class, `~/prof/gaps.py`
+the GPU gaps), then `tests/test_ar8.py` sweeps on the idle box, then an A/B and the full gate from `~/r9700-build/repo-ar8`.
+
+**Where the step went (rank 2 of the peer-write build, 89 steps at 2.76 tokens a step):** GPU kernel time 25.7 ms a step of a
+29-32 ms step. Collectives 8.6 ms (33%): the sliced cross stage 361 one-shots x 10.8 us = 3.9 ms, the switch-local pair stage
+running as a 14 us two-shot twice an all-reduce (32 KB is over the 16 KB one-shot cap) 2.5 ms, the per-step logits all-gather
+(4 rows x 154,880 bf16, 1.24 MB a rank through the cross stage) 1.41 ms, RCCL for the 40 KB+ messages 0.5 ms. GEMMs 7.4 ms
+(29%: the Red Hat checkpoint's bf16 projections on `wvSplitK` at 25 us x 114 a step, our fp8 linears 0.9 ms, hipBLASLt 1 ms).
+MoE 4.9 ms (19%: `r9k_moe_mxfp4a8` 3.4, top-k 0.8). Glue 3.9 ms (the mHC mix 1.9, casts, copies). Attention 0.3 ms. The
+remaining 3-6 ms a step is GPU idle: launch gaps and the inter-step scheduler (the profiler itself stretches these; unprofiled the
+step is 29.4 ms on the code prompt, 94 tok/s).
+
+**The cross stage pays per kilobyte.** `tests/test_ar8.py` on the idle box, us an all-reduce under HIP graphs:
+
+| message | RCCL | flat two-shot | ar8, peer writes (production to v0.3.7) | ar8, cross stage through host memory |
+|---|--:|--:|--:|--:|
+| 8 KB (1 row) | 82 | 40 | **21.6** | 31.6 |
+| 16 KB (2 rows) | 87 | 133 | 41.6 | **35.9** |
+| 32 KB (4 rows, the MTP-3 verify step) | 120 | 244 | 71.7 | **47.4** |
+| 64 KB (8 rows) | 104 | 446 | 163 (RCCL in production) | **60.6** |
+| 128 KB (16 rows, four streams) | 109 | 872 | RCCL | 103 (one-shot) / 126 (two-shot) |
+| 256 KB | **128** | 1,982 | RCCL | 153 |
+
+The peer-write stage grows linearly with bytes because the four evens' stores cross four root complexes and stall past ~100 KB in
+flight (the cliff above); slicing into 8 KB one-shots only serialises the stall. The host path is the same one-shot / two-shot
+kernels with the exchange pools in pinned host memory: `R9kAllReduceN(host=True)` creates a `/dev/shm` file (scratch | flags),
+maps and pins it with `hipHostRegister(Portable | Mapped)` in every rank of the sub-group, and hands the device pointers to the
+kernels in place of the IPC-opened VRAM ones. A push is then one link to the host, a read one link back; nothing crosses a root
+complex; the bits are those of the peer path. It costs a ~10 us round trip, so 1-row messages keep the peer path; from 12 KB to
+96 KB the host stage carries the whole message in one shot; 128 KB and up stay on RCCL (103-148 there against RCCL's 109, and the
+four-stream probe lost 5-10% when the host stage took them). Two more changes rode along: the pair stage keeps its one-shot to
+64 KB (`R9K_AR8_PAIR_1S_KB`; switch-local, no cliff), and the logits all-gather goes through the host stage as well.
+
+**First try deadlocked.** The evens accepted messages to 128 KB on the new path while the odds still capped at 40 KB and ran RCCL:
+each pair sat in two different collectives waiting for the other, the first forward hung, and `py-spy dump` showed every worker
+spinning in `forward_mqa`'s stream sync. Rule, now in the code: every size decision reads group-wide state (`host_on`,
+`host_min`, `host_max`) agreed by `all_gather_object` at startup, never the evens' objects.
+
+**Gate (repo-ar8 = v0.3.7 + the two comm files, production recipe, `~/ar8-gate.sh` -> `~/ar8-gate.log`):**
+
+| GLM-5.3-Flash TP8 | peer writes (production bench 10-29 / A/B 10-30) | host-memory cross stage (gate 10-30) |
+|---|--:|--:|
+| probe: decode mean (code / prose / json / math), tokens a step | 89.0 (90 / 76 / 94 / 95), 2.86 / 86.5, 2.76 | **100.0** (105 / 84 / 108 / 103), 2.86; 100.4 and 101.8 on the two A/B launches |
+| probe: 8 / 16 streams; 8k prefill | 138 / 163; 150 / 156 | 129 / 156; 3,148 |
+| BetterBench combined / update p99 / TTFT p50 | 91.4 / 32.1 ms / 230 ms | **103.3** / **28.5 ms** / 258 ms |
+| BetterBench 1 / 2 / 4 / 8 streams | 86.5 / 116.5 / 157.9 / 157.5 | **94.6 / 127.3 / 161.1 / 160.4** |
+| prompt processing 2k / 8k / 16k / 32k | 3,343 / 3,284 / 3,137 / 3,103 | 3,361 / 3,289 / 3,140 / 3,102 |
+| strict sanity, thinking on | 0 bad of 980 | 0 bad of 980 |
+| GSM8K 1,319, no thinking, conc 4 | 95.98% | **95.98%**; paired 13 / 13 discordant, McNemar p = 1.0, 21% identical outputs |
+| HumanEval 164 (3k budget) | 151 | 152 |
+| soak, 16 clients, 200-30k tokens | 156 ok in 977 s, 0 errors, 2,445 prompt tok/s | 158 ok in 997 s, 0 errors, 2,453 |
+| server errors; VRAM after | 0; 32.2 GiB a card | 0; 32.1 GiB a card |
+
+So the step drops from 32 to 28.5 ms and single-stream decode gains 13-16% with identical acceptance and equal quality (the 21%
+identical outputs are the 40-96 KB messages that moved from RCCL's seven roundings to ar8's two; accuracy is the same to the
+question). The host stage is the default from this commit (`R9K_AR8_CROSS_HOST=0` restores peer writes); the production GLM recipe
+needs no new flag. What remains of the gap to radiance's 24 ms is the compute side: the bf16 skinny GEMMs (7.4 ms), MoE at four
+rows (4.9), the mHC glue (3.9), and the 3-6 ms the GPU waits on the CPU between launches.

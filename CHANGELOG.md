@@ -7,7 +7,19 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+- **Eight-rank all-reduce: the cross-switch stage exchanges through pinned host memory** (`comm/r9k_ar.py` `host=True`,
+  `comm/r9k_ar8.py`). The four even ranks pushed peer writes across four root complexes, where the stores stall past ~100 KB in
+  flight: 72 us for the 32 KB message a four-row MTP-3 verify step carries. The same kernels over pools mapped from `/dev/shm` and
+  pinned with `hipHostRegister` take 47 us (64 KB: 61 against RCCL's 107). Messages of 12-96 KB take the host stage whole, 1-row
+  messages keep the peer path, 128 KB and up stay on RCCL; the switch-local pair stage keeps its one-shot to 64 KB and the logits
+  all-gather goes through the host stage too. GLM-5.3-Flash TP8 single stream 86.5 -> 100 tok/s (step 32 -> 28.5 ms), BetterBench
+  91.4 -> 103.3, GSM8K equal (95.98, paired p = 1.0), soak and sanity clean (notes/glm53.md). Default on; `R9K_AR8_CROSS_HOST=0`
+  restores the peer-write stage. TP2 / TP4 paths are unchanged (world-size-8 code).
+
+### Fixed
+- Every size rule of the eight-rank object now reads group-wide state agreed at startup: an even rank taking a message on ar8
+  while its odd partner ran RCCL deadlocked the first forward.
 
 ## [0.3.7] - 2026-10-26
 

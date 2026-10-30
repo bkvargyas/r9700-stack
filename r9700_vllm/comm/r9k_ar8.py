@@ -58,7 +58,7 @@ class R9kAllReduce8:
         pair_1s = float(os.environ.get("R9K_AR8_PAIR_1S_KB", "64"))
         self.pair = R9kAllReduceN(pairs[self.rank // 2], device, one_shot_kb=pair_1s)
         # the odd quartet's group exists (new_group is collective) but never carries traffic
-        # R9K_AR8_CROSS_HOST=1: a second cross object whose exchange pools sit in pinned host memory, so the evens
+        # R9K_AR8_CROSS_HOST (default 1; 0 keeps peer writes): a second cross object whose pools sit in pinned host memory, so the evens
         # push over one link to the host each instead of across four root complexes, where the peer stores stall
         # (the cliff above). Measured 2026-10-30 (tests/test_ar8.py, us, whole message): 8 KB 31.6 (P2P 21.6),
         # 16 KB 35.9 (41.6), 32 KB 47.4 (71.7), 64 KB 60.3 (RCCL 107). So messages from R9K_AR8_HOST_MIN_KB (12) up
@@ -73,7 +73,7 @@ class R9kAllReduce8:
         self.host_min = int(float(os.environ.get("R9K_AR8_HOST_MIN_KB", "12")) * 1024)
         self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "96")) * 1024)
         self.host_on = False
-        if os.environ.get("R9K_AR8_CROSS_HOST", "0") == "1":
+        if os.environ.get("R9K_AR8_CROSS_HOST", "1") == "1":
             h1 = float(os.environ.get("R9K_AR8_HOST_1S_KB", "128"))
             ch = R9kAllReduceN(crosses[0], device, host=True, one_shot_kb=h1, max_kb=self.host_max / 1024) \
                 if self.pair_pos == 0 else None
