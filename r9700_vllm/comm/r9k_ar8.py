@@ -53,9 +53,39 @@ class R9kAllReduce8:
         crosses = [dist.new_group(ranks=[g[0], g[2], g[4], g[6]], backend="gloo"),
                    dist.new_group(ranks=[g[1], g[3], g[5], g[7]], backend="gloo")]
         self.pair_pos = self.rank % 2                      # 0 = even: the switch's cross-chain sender; 1 = odd
-        self.pair = R9kAllReduceN(pairs[self.rank // 2], device)
+        # R9K_AR8_PAIR_1S_KB (64): the pair stage is switch-local, where a 32-64 KB one-shot is fine; without it the
+        # 4-row verify step's 32 KB ran the pair stage as a 14 us two-shot twice an all-reduce (profile 2026-10-30).
+        pair_1s = float(os.environ.get("R9K_AR8_PAIR_1S_KB", "64"))
+        self.pair = R9kAllReduceN(pairs[self.rank // 2], device, one_shot_kb=pair_1s)
         # the odd quartet's group exists (new_group is collective) but never carries traffic
+        # R9K_AR8_CROSS_HOST=1: a second cross object whose exchange pools sit in pinned host memory, so the evens
+        # push over one link to the host each instead of across four root complexes, where the peer stores stall
+        # (the cliff above). Measured 2026-10-30 (tests/test_ar8.py, us, whole message): 8 KB 31.6 (P2P 21.6),
+        # 16 KB 35.9 (41.6), 32 KB 47.4 (71.7), 64 KB 60.3 (RCCL 107). So messages from R9K_AR8_HOST_MIN_KB (12) up
+        # take the host stage whole (one-shot to R9K_AR8_HOST_1S_KB, 128) up to R9K_AR8_HOST_MAX_KB (96): at 128 KB the
+        # host path (103-148 us) no longer beats RCCL (109) and four-stream steps (16 rows) lost 5-10% with it, so 128 KB
+        # and up stay on RCCL; 1-row messages keep P2P. GLM TP8 2026-10-30: 86.5 -> 100-102 tok/s single stream.
         self.cross = R9kAllReduceN(crosses[0], device) if self.pair_pos == 0 else None
+        # Every rank must route a message the same way (an even in the ar8 kernels while its odd runs RCCL is a
+        # deadlock -- 2026-10-30), so the host stage's existence and caps are agreed over the whole group and the
+        # size rules below read only group-wide state (host_on, host_min, host_max), never the evens' objects.
+        self.cross_host = None
+        self.host_min = int(float(os.environ.get("R9K_AR8_HOST_MIN_KB", "12")) * 1024)
+        self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "96")) * 1024)
+        self.host_on = False
+        if os.environ.get("R9K_AR8_CROSS_HOST", "0") == "1":
+            h1 = float(os.environ.get("R9K_AR8_HOST_1S_KB", "128"))
+            ch = R9kAllReduceN(crosses[0], device, host=True, one_shot_kb=h1, max_kb=self.host_max / 1024) \
+                if self.pair_pos == 0 else None
+            ok_h = ch is None or not ch.disabled
+            oks_h = [None] * self.world_size
+            dist.all_gather_object(oks_h, ok_h, group=group)
+            if all(oks_h):
+                self.cross_host = ch
+                self.host_on = True
+                self.max_kb = max(self.max_kb, self.host_max)
+            else:
+                logger.warning("r9700: ar8 host-memory cross stage unavailable on some rank; peer-write cross stage kept")
         ok = not self.pair.disabled and (self.cross is None or not self.cross.disabled)
         oks = [None] * self.world_size
         dist.all_gather_object(oks, ok, group=group)
@@ -93,7 +123,12 @@ class R9kAllReduce8:
         d = dim + x.dim() if dim < 0 else dim
         y = self.pair.all_gather(x, d)                      # [.., 2 v, ..] = [even, odd] of this pair
         if self.pair_pos == 0:
-            z = self.cross.all_gather(y, d)                  # [.., 8 v, ..] in TP rank order (pairs in order)
+            # R9K_AR8_HOST_AG=0 keeps the logits all-gather on the peer path (A/B knob; the eight-stream probe moved
+            # 150 -> 129-140 with the host stage on, and the all-gather is the one message that grows with the batch)
+            ch = self.cross_host if (self.host_on and os.environ.get("R9K_AR8_HOST_AG", "1") == "1"
+                                     and y.numel() * y.element_size() >= self.host_min
+                                     and self.cross_host.should_ag(y, d)) else self.cross
+            z = ch.all_gather(y, d)                          # [.., 8 v, ..] in TP rank order (pairs in order)
             full = self.pair.all_gather(z, d)                # [.., 16 v, ..]: [evens' z | odd's zeros]
         else:
             full = self.pair.all_gather(self._zero_like(y, d, 4), d)
@@ -114,7 +149,10 @@ class R9kAllReduce8:
         if n == 0 or n % 16:
             return False
         nw = x.numel() * (4 if self.fp32 else x.element_size())      # bytes of the working copy
-        cap = self.pair.max_bytes if self.cross is None else min(self.pair.max_bytes, self.cross.max_bytes)
+        if self.host_on and nw >= self.host_min:
+            cap = min(self.pair.max_bytes, self.host_max)           # the same rule on evens and odds
+        else:
+            cap = self.pair.max_bytes if self.cross is None else min(self.pair.max_bytes, self.cross.max_bytes)
         return nw <= cap and n <= self.pair.max_bytes
 
     def should(self, x: torch.Tensor) -> bool:
@@ -134,6 +172,8 @@ class R9kAllReduce8:
         that is 128 KB, inside the measured cliff (tests/test_ar8.py: 95 us at 4 rows against 41 at 2). R9K_AR8_CROSS_KB
         (0 = off) caps the bytes a sender has in flight by running the stage over consecutive slices."""
         n = y.numel() * y.element_size()
+        if self.host_on and n >= self.host_min and n <= self.host_max:
+            return self.cross_host.all_reduce(y)              # whole: no cliff on the host path
         if not self.cross_kb or n <= self.cross_kb:
             return self.cross.all_reduce(y)
         per = max(16, (self.cross_kb // y.element_size() // 8) * 8)    # elements a slice (16-byte multiples)

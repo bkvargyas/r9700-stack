@@ -23,6 +23,33 @@ logger = init_logger("vllm." + __name__)
 _DTYPE = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
 
 
+_HIP = None
+
+
+def _hip():
+    """The HIP runtime torch already loaded (host registration is not in libr9k)."""
+    global _HIP
+    if _HIP is None:
+        import glob
+        import sys
+        cands = ["libamdhip64.so"]
+        for p in sys.path:
+            cands += glob.glob(os.path.join(p, "_rocm_sdk_libraries", "lib", "libamdhip64.so*"))
+        for c in cands:
+            try:
+                _HIP = ctypes.CDLL(c)
+                break
+            except OSError:
+                continue
+        if _HIP is None:
+            raise RuntimeError("libamdhip64 not found")
+        _HIP.hipHostRegister.restype = ctypes.c_int
+        _HIP.hipHostRegister.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint]
+        _HIP.hipHostGetDevicePointer.restype = ctypes.c_int
+        _HIP.hipHostGetDevicePointer.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_void_p, ctypes.c_uint]
+    return _HIP
+
+
 def _lib():
     from ..kernels import moe as KM
     L = KM.lib()
@@ -248,10 +275,15 @@ class R9kAllReduceN:
      128 tok  640 KB   142.1 / 252.0 / 139.9
     1024 tok    5 MB   770.1 /1965.3 /1140.7   (the switch uplinks are the limit; RCCL's ring spreads it better)"""
 
-    def __init__(self, group, device):
+    def __init__(self, group, device, host: bool = False, one_shot_kb: float | None = None, max_kb: float | None = None):
         self.disabled = True
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
+        # host=True (or R9K_ARN_HOST=1): the exchange buffers live in pinned host memory shared through /dev/shm
+        # instead of each card's VRAM, so a push crosses one PCIe link to the host instead of two root complexes
+        # (the cross-switch stage of comm/r9k_ar8.py). Same kernels, same bits; only the pointers differ.
+        self._host = host or os.environ.get("R9K_ARN_HOST", "0") == "1"
+        self._host_maps: list = []
         L = _lib()
         if not hasattr(L, "r9k_ar_oneshot_nrank"):
             logger.warning("r9700: libr9k.so has no r9k_ar_oneshot_nrank; TP=%d stays on RCCL", self.world_size)
@@ -276,9 +308,10 @@ class R9kAllReduceN:
         self.device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
         torch.cuda.set_device(self.device)
         kb = lambda k, d: (int(float(os.environ.get(k, d)) * 1024) // 16) * 16
-        self.max1 = kb("R9K_ARN_1S_KB", "16")
-        self.max_bytes = max(self.max1, kb("R9K_ARN_MAX_KB", "512")) if hasattr(L, "r9k_ar_twoshot_nrank") \
-            else self.max1
+        # one_shot_kb / max_kb: a caller's own caps (the host-exchange cross stage of comm/r9k_ar8.py) over the env ones
+        self.max1 = kb("R9K_ARN_1S_KB", "16") if one_shot_kb is None else (int(one_shot_kb * 1024) // 16) * 16
+        mx = kb("R9K_ARN_MAX_KB", "512") if max_kb is None else (int(max_kb * 1024) // 16) * 16
+        self.max_bytes = max(self.max1, mx) if hasattr(L, "r9k_ar_twoshot_nrank") else self.max1
         self.max_nb = min(int(os.environ.get("R9K_ARN_MAX_BLOCKS", "16")), L.r9k_ar_max_blocks())
         self.words_per_block = int(os.environ.get("R9K_ARN_WPB", "512"))
         self.min_nb = int(os.environ.get("R9K_ARN_MIN_BLOCKS", "2"))
@@ -336,6 +369,8 @@ class R9kAllReduceN:
 
     def _share(self, group, scratch_bytes, flag_bytes):
         """Allocate fine-grained scratch + flags, exchange IPC handles, open every peer's. Collective."""
+        if self._host:
+            return self._share_host(group, scratch_bytes, flag_bytes)
         L, N = self.L, self.world_size
         hsz = L.r9k_ar_ipc_handle_size()
 
@@ -367,6 +402,60 @@ class R9kAllReduceN:
         dist.all_gather_object(goods, good, group=group)
         if not all(goods):
             return None
+        return (ctypes.c_long * N)(*sp), (ctypes.c_long * N)(*fp)
+
+    def _share_host(self, group, scratch_bytes, flag_bytes):
+        """The same pools in pinned host memory: every rank creates a /dev/shm file (scratch | flags), maps it, pins it
+        with hipHostRegister, and every peer maps and pins the same file; the device pointers go to the kernels in
+        place of the IPC-opened VRAM ones. Collective (names and outcomes are exchanged over the group)."""
+        import mmap
+        import uuid
+        N = self.world_size
+        H = _hip()
+        page = mmap.PAGESIZE
+        sb = (scratch_bytes + page - 1) // page * page
+        fb = (flag_bytes + page - 1) // page * page
+        total = sb + fb
+        name = f"/dev/shm/r9k_ar_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+        fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+        os.ftruncate(fd, total)                              # zero pages: flags start at 0
+        names = [None] * N
+        dist.all_gather_object(names, name, group=group)
+        sp, fp, good, maps = [0] * N, [0] * N, True, []
+        for q in range(N):
+            try:
+                fq = fd if q == self.rank else os.open(names[q], os.O_RDWR)
+                m = mmap.mmap(fq, total, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+                if q != self.rank:
+                    os.close(fq)
+                addr = ctypes.addressof(ctypes.c_char.from_buffer(m))
+                rc = H.hipHostRegister(ctypes.c_void_p(addr), ctypes.c_size_t(total), 3)   # Portable | Mapped
+                if rc != 0:
+                    logger.warning("r9700: hipHostRegister failed (%d) for %s", rc, names[q])
+                    good = False
+                    break
+                dp = ctypes.c_void_p()
+                if H.hipHostGetDevicePointer(ctypes.byref(dp), ctypes.c_void_p(addr), 0) != 0 or not dp.value:
+                    logger.warning("r9700: hipHostGetDevicePointer failed for %s", names[q])
+                    good = False
+                    break
+                maps.append(m)
+                sp[q], fp[q] = dp.value, dp.value + sb
+            except OSError as e:
+                logger.warning("r9700: host scratch mapping failed: %s", e)
+                good = False
+                break
+        goods = [None] * N
+        dist.all_gather_object(goods, good, group=group)
+        os.close(fd)
+        try:
+            os.unlink(name)                                  # every peer has mapped it; the mappings outlive the name
+        except OSError:
+            pass
+        if not all(goods):
+            return None
+        self._host_maps += maps
+        logger.info("r9700: r9k %d-rank all-reduce exchange in pinned host memory (%d KiB a rank)", N, total >> 10)
         return (ctypes.c_long * N)(*sp), (ctypes.c_long * N)(*fp)
 
     def should(self, x: torch.Tensor) -> bool:
