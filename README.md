@@ -5,12 +5,12 @@ cards (gfx1201 / RDNA4) on **stock vLLM and stock ROCm**. No fork, no patched so
 re-quantised weights: everything loads at runtime through vLLM's own extension points, so vLLM and ROCm update
 underneath it.
 
-Current release: **v0.3.7** (2026-10-26, the vLLM 0.32 line), [release notes](notes/release-v0.3.7.md),
+Current release: **v0.3.8** (2026-10-31, the vLLM 0.32 line), [release notes](notes/release-v0.3.8.md),
 [CHANGELOG.md](CHANGELOG.md).
 
-![r9700-stack v0.3.7: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.3.7.svg)
+![r9700-stack v0.3.8: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.3.8.svg)
 
-## What v0.3.7 gives you
+## What v0.3.8 gives you
 
 - **Stock vLLM 0.32 on stock ROCm 10.** Pinned to the 2026-10-25 ROCm 10 nightly (vLLM 0.32.1rc1, torch 2.13); the
   plugin registers through vLLM's platform, quantization, model and attention-backend entry points and carries its
@@ -31,8 +31,8 @@ Current release: **v0.3.7** (2026-10-26, the vLLM 0.32 line), [release notes](no
     on an 8k prompt, 367k-token KV cache.
   - Qwen3.8-Flash-Next TP4: **210-225 tok/s** (MTP-3), 913-944 tok/s at 16 streams, 6.8-7.5k tok/s on an 8k prompt,
     70-80 ms to first token, ~480k-token KV cache.
-  - GLM-5.3-Flash TP8: **75-80 tok/s** (MTP-3), 157 tok/s at four streams, 2.4-2.8k tok/s prompt processing at depth,
-    needles found at 12.7k / 30k / 67k tokens on this nightly (216k on the previous pin).
+  - GLM-5.3-Flash TP8: **100 tok/s** (MTP-3; 75-80 before v0.3.8's host-memory collective), 161 tok/s at four streams,
+    3.1-3.4k tok/s prompt processing at 2k-32k, needles found at 12.7k / 30k / 67k tokens on this nightly (216k on the previous pin).
 - **Speculative decoding on both families:** MTP-3 for Flash-Next and GLM, the DFlash2 drafter for the 27B, all on the
   same kernels, with the draft metadata, indexer logits and all-reduces inside the HIP graphs.
 - **Multi-card communication over plain PCIe:** P2P one-shot / two-shot all-reduce and all-gather for 2 and 4 cards,
@@ -68,7 +68,7 @@ multi-rank communication tests and the kernel unit gates. v0.3.2 kernels (unchan
 p = 1.00 against v0.3.1), HumanEval 162 / 164; v0.3.3 validation: 0 bad answers in 5,060 strict-sanity checks,
 0 errors in 1,224 soak requests.
 
-## Speed (210 W with a -42 mV offset, 32k context; the v0.3.7 gate numbers are in the release notes)
+## Speed (210 W with a -42 mV offset, 32k context; the v0.3.8 gate numbers are in the release notes)
 
 **Qwen3.8-Flash-Next (MXFP4 experts, fp8 dense), four cards, TP4, MTP-3**
 

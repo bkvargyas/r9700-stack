@@ -16,7 +16,7 @@ Only engages on ROCm. R9K_DISABLE=quant,models,mtp turns individual pieces off (
 """
 import os
 
-__version__ = "0.3.7"
+__version__ = "0.3.8"
 
 
 def _disabled(name: str) -> bool:

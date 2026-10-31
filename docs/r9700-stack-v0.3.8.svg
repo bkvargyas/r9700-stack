@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="610" viewBox="0 0 1200 610" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif" role="img" aria-label="r9700-stack v0.3.7 overview">
+<title>r9700-stack v0.3.8: vLLM plugin and HIP/Triton kernels for AMD Radeon AI PRO R9700</title>
+<rect width="1200" height="610" fill="#0f172a"/>
+<text x="30" y="50" font-size="30" fill="#f8fafc" font-weight="700" text-anchor="start" >r9700-stack</text>
+<text x="240" y="49" font-size="16" fill="#94a3b8" font-weight="400" text-anchor="start" >LLM inference on AMD Radeon AI PRO R9700</text>
+<rect x="820" y="24" width="350" height="34" rx="17" fill="#0b2a2a" stroke="#2dd4bf" stroke-width="1.2"/>
+<text x="995.2" y="46" font-size="14" fill="#2dd4bf" font-weight="600" text-anchor="middle" >v0.3.8  ·  2026-10-31  ·  vLLM 0.32 line</text>
+<rect x="16" y="74" width="1168" height="96" rx="10" fill="#131d33" stroke="#24324d" stroke-width="1"/>
+<rect x="16" y="88" width="3" height="68" rx="1.5" fill="#2dd4bf"/>
+<text x="34" y="106" font-size="13" fill="#2dd4bf" font-weight="700" text-anchor="start" letter-spacing="1.5">01</text>
+<text x="34" y="126" font-size="13" fill="#e2e8f0" font-weight="700" text-anchor="start" letter-spacing="1.2">WHAT IT IS</text>
+<text x="150" y="110" font-size="19" fill="#e2e8f0" font-weight="600">vLLM plugin + HIP/Triton kernels for AMD Radeon AI PRO R9700 <tspan fill="#94a3b8" font-weight="400">(gfx1201, RDNA4)</tspan></text>
+<rect x="150" y="126" width="332" height="28" rx="14" fill="#0b2a2a" stroke="#2dd4bf" stroke-opacity="1" stroke-width="1"/>
+<text x="315.88" y="145" font-size="13" fill="#2dd4bf" font-weight="600" text-anchor="middle" >stock vLLM · nightly e4a5b553 · torch 2.13</text>
+<rect x="492" y="126" width="121" height="28" rx="14" fill="#0b2a2a" stroke="#2dd4bf" stroke-opacity="1" stroke-width="1"/>
+<text x="552.08" y="145" font-size="13" fill="#2dd4bf" font-weight="600" text-anchor="middle" >stock ROCm 10</text>
+<rect x="622" y="126" width="77" height="28" rx="14" fill="none" stroke="#2dd4bf" stroke-opacity="0.55" stroke-width="1"/>
+<text x="660.8800000000001" y="145" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="middle" >no fork</text>
+<rect x="709" y="126" width="164" height="28" rx="14" fill="none" stroke="#2dd4bf" stroke-opacity="0.55" stroke-width="1"/>
+<text x="791.5200000000001" y="145" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="middle" >no patched binaries</text>
+<rect x="884" y="126" width="186" height="28" rx="14" fill="none" stroke="#2dd4bf" stroke-opacity="0.55" stroke-width="1"/>
+<text x="976.7600000000002" y="145" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="middle" >unmodified checkpoints</text>
+<rect x="16" y="180" width="1168" height="212" rx="10" fill="#131d33" stroke="#24324d" stroke-width="1"/>
+<rect x="16" y="194" width="3" height="184" rx="1.5" fill="#fbbf24"/>
+<text x="34" y="212" font-size="13" fill="#fbbf24" font-weight="700" text-anchor="start" letter-spacing="1.5">02</text>
+<text x="34" y="232" font-size="13" fill="#e2e8f0" font-weight="700" text-anchor="start" letter-spacing="1.2">WHAT RUNS</text>
+<text x="34" y="252" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >models,</text>
+<text x="34" y="270" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >formats,</text>
+<text x="34" y="288" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >card counts</text>
+<rect x="150" y="192" width="328" height="188" rx="8" fill="#0f1a2e" stroke="#fbbf24" stroke-opacity="0.45" stroke-width="1"/>
+<text x="166" y="219" font-size="17" fill="#f8fafc" font-weight="700" text-anchor="start" >Qwen3.8-27B-NVFP4</text>
+<text x="166" y="239" font-size="13" fill="#fbbf24" font-weight="500" text-anchor="start" >dense + DFlash2-FP8 block drafter</text>
+<line x1="166" y1="250" x2="462" y2="250" stroke="#24324d" stroke-width="1"/>
+<circle cx="169" cy="266" r="2" fill="#fbbf24"/>
+<text x="178" y="270" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >NVFP4 weights → MXFP4 at load</text>
+<circle cx="169" cy="285" r="2" fill="#fbbf24"/>
+<text x="178" y="289" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >fp8 KV cache</text>
+<circle cx="169" cy="304" r="2" fill="#fbbf24"/>
+<text x="178" y="308" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >fp8 drafter (block speculation)</text>
+<rect x="166" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="181" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<text x="204" y="355" font-size="14" fill="#fbbf24" font-weight="700" text-anchor="start" >TP2 · 2 cards</text>
+<rect x="495" y="192" width="328" height="188" rx="8" fill="#0f1a2e" stroke="#fbbf24" stroke-opacity="0.45" stroke-width="1"/>
+<text x="511" y="219" font-size="17" fill="#f8fafc" font-weight="700" text-anchor="start" >Qwen3.8-Flash-Next</text>
+<text x="511" y="239" font-size="13" fill="#fbbf24" font-weight="500" text-anchor="start" >MoE · 288 experts</text>
+<line x1="511" y1="250" x2="807" y2="250" stroke="#24324d" stroke-width="1"/>
+<circle cx="514" cy="266" r="2" fill="#fbbf24"/>
+<text x="523" y="270" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >MXFP4 experts · fp8 dense layers</text>
+<circle cx="514" cy="285" r="2" fill="#fbbf24"/>
+<text x="523" y="289" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >int6 per-layer-embedding table</text>
+<text x="523" y="308" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >in pinned host RAM</text>
+<circle cx="514" cy="323" r="2" fill="#fbbf24"/>
+<text x="523" y="327" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >MTP-3 speculative decoding</text>
+<rect x="511" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="526" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="541" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="556" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<text x="579" y="355" font-size="14" fill="#fbbf24" font-weight="700" text-anchor="start" >TP4 · 4 cards</text>
+<text x="511" y="375" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >or 2 cards, experts streamed from host RAM</text>
+<rect x="840" y="192" width="328" height="188" rx="8" fill="#0f1a2e" stroke="#fbbf24" stroke-opacity="0.45" stroke-width="1"/>
+<text x="856" y="219" font-size="17" fill="#f8fafc" font-weight="700" text-anchor="start" >GLM-5.3-Flash</text>
+<text x="856" y="239" font-size="13" fill="#fbbf24" font-weight="500" text-anchor="start" >sparse MLA + indexer</text>
+<line x1="856" y1="250" x2="1152" y2="250" stroke="#24324d" stroke-width="1"/>
+<circle cx="859" cy="266" r="2" fill="#fbbf24"/>
+<text x="868" y="270" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >RedHat NVFP4 checkpoint + MTP layer</text>
+<circle cx="859" cy="285" r="2" fill="#fbbf24"/>
+<text x="868" y="289" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >NVFP4 experts → MXFP4 at load</text>
+<circle cx="859" cy="304" r="2" fill="#fbbf24"/>
+<text x="868" y="308" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >fp8 KV cache · MTP-3</text>
+<circle cx="859" cy="323" r="2" fill="#fbbf24"/>
+<text x="868" y="327" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >262k context</text>
+<rect x="856" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="871" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="886" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="901" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="916" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="931" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="946" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<rect x="961" y="342" width="11" height="16" rx="2" fill="#fbbf24" fill-opacity="0.9"/>
+<text x="984" y="355" font-size="14" fill="#fbbf24" font-weight="700" text-anchor="start" >TP8 · 8 cards</text>
+<rect x="16" y="402" width="1168" height="166" rx="10" fill="#131d33" stroke="#24324d" stroke-width="1"/>
+<rect x="16" y="416" width="3" height="138" rx="1.5" fill="#a78bfa"/>
+<text x="34" y="434" font-size="13" fill="#a78bfa" font-weight="700" text-anchor="start" letter-spacing="1.5">03</text>
+<text x="34" y="454" font-size="13" fill="#e2e8f0" font-weight="700" text-anchor="start" letter-spacing="1.2">HOW FAST</text>
+<text x="34" y="474" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >210 W cap</text>
+<text x="34" y="492" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >per card</text>
+<text x="340" y="426" font-size="13" fill="#94a3b8" font-weight="600" text-anchor="start" >single-stream decode, tok/s</text>
+<text x="820" y="426" font-size="13" fill="#94a3b8" font-weight="600" text-anchor="start" >aggregate · prefill · context</text>
+<text x="150" y="452" font-size="15" fill="#e2e8f0" font-weight="600" text-anchor="start" >Qwen3.8-27B</text>
+<text x="150" y="468" font-size="12" fill="#a78bfa" font-weight="600" text-anchor="start" >TP2 · 2 cards</text>
+<rect x="340" y="439" width="375" height="16" rx="3" fill="#1e2a44"/>
+<rect x="340" y="439" width="324.0" height="16" rx="3" fill="#a78bfa"/>
+<text x="725.0" y="453" font-size="16" fill="#f8fafc" font-weight="700">216 <tspan font-size="13" fill="#94a3b8" font-weight="400">tok/s</tspan></text>
+<text x="340" y="471" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >4.5 tokens per step (DFlash2 drafter)</text>
+<text x="820" y="452" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >503–548 tok/s @ 8 streams · 631–658 @ 16</text>
+<text x="820" y="471" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prefill 3,838–3,906 tok/s (8k prompt)</text>
+<text x="150" y="496" font-size="15" fill="#e2e8f0" font-weight="600" text-anchor="start" >Flash-Next</text>
+<text x="150" y="512" font-size="12" fill="#a78bfa" font-weight="600" text-anchor="start" >TP4 · 4 cards</text>
+<rect x="340" y="483" width="375" height="16" rx="3" fill="#1e2a44"/>
+<rect x="340" y="483" width="315.0" height="16" rx="3" fill="#a78bfa"/>
+<text x="725.0" y="497" font-size="16" fill="#f8fafc" font-weight="700">210 <tspan font-size="13" fill="#94a3b8" font-weight="400">tok/s</tspan></text>
+<text x="340" y="515" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >probe mean · MTP-3</text>
+<text x="820" y="496" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >913–933 tok/s @ 16 streams</text>
+<text x="820" y="515" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prefill 6,771–6,830 tok/s · KV 477k–494k tok</text>
+<text x="150" y="540" font-size="15" fill="#e2e8f0" font-weight="600" text-anchor="start" >GLM-5.3-Flash</text>
+<text x="150" y="556" font-size="12" fill="#a78bfa" font-weight="600" text-anchor="start" >TP8 · 8 cards</text>
+<rect x="340" y="527" width="375" height="16" rx="3" fill="#1e2a44"/>
+<rect x="340" y="527" width="119.4" height="16" rx="3" fill="#a78bfa"/>
+<text x="725.0" y="541" font-size="16" fill="#f8fafc" font-weight="700">100 <tspan font-size="13" fill="#94a3b8" font-weight="400">tok/s</tspan></text>
+<text x="340" y="559" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >MTP-3 · fp8 KV</text>
+<text x="820" y="540" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >161 tok/s @ 4 streams</text>
+<text x="820" y="559" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >needles found to 67k tokens (216k on the prior pin)</text>
+<text x="30" y="594" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >210 W/card · VM with emulated PCIe switches · measured 2026-10</text>
+<text x="1170" y="594" font-size="13" fill="#94a3b8" font-weight="600" text-anchor="end" >github.com/bkvargyas/r9700-stack</text>
+</svg>

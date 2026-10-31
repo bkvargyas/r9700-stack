@@ -1,4 +1,4 @@
-# v0.3.8 -- the eight-rank collective through host memory (DRAFT until tagged)
+# v0.3.8 -- the eight-rank collective through host memory (2026-10-31)
 
 Same pin as v0.3.7 (`nightly-rocm100-e4a5b553`, vLLM 0.32 line, torch 2.13); one change, measured on 8x R9700 in VM100 (384 GiB
 guest, 210 W / -42 mV, the -500 MHz offset on eight-card runs).

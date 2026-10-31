@@ -7,6 +7,12 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.8] - 2026-10-31
+
+Release notes with the validation record: [notes/release-v0.3.8.md](notes/release-v0.3.8.md).
+
 ### Changed
 - **Eight-rank all-reduce: the cross-switch stage exchanges through pinned host memory** (`comm/r9k_ar.py` `host=True`,
   `comm/r9k_ar8.py`). The four even ranks pushed peer writes across four root complexes, where the stores stall past ~100 KB in
@@ -513,7 +519,8 @@ R9700 with stock vLLM and stock ROCm 10.
   NVFP4 → MXFP4 conversion.
 - Registration entirely through vLLM's extension points; Apache-2.0 with one carve-out (see `NOTICE`).
 
-[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.8...HEAD
+[0.3.8]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.7...v0.3.8
 [0.3.7]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/bkvargyas/r9700-stack/compare/v0.3.4...v0.3.5
