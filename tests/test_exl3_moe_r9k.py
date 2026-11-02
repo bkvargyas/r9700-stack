@@ -26,8 +26,22 @@ import exllamav3_ext as ext  # noqa: E402
 from r9700_vllm.moe import exl3_decode as XD  # noqa: E402
 from r9700_vllm.quant import exl3_moe as M  # noqa: E402
 
+# R9K_TEST_EP: expert-parallel width of the simulated rank (8 = 48 local experts; 96 = 4, for a < 1 GiB run beside a
+# server: the f32 reference holds 141 MB an expert). R9K_TEST_BENCH_EP: the same for the timing layer, which keeps no
+# reference (24 = 16 experts, 212 MB at K = 3).
+EP = int(os.environ.get("R9K_TEST_EP", 8))
+BENCH_EP = int(os.environ.get("R9K_TEST_BENCH_EP", EP))
+
+
+def set_ep(ep):
+    global E
+    TM.EP, TM.E = ep, TM.G // ep
+    E = TM.E
+
+
 DEV = TM.DEV
-G, E, TOPK, H, I = TM.G, TM.E, TM.TOPK, TM.H, TM.I
+G, TOPK, H, I = TM.G, TM.TOPK, TM.H, TM.I
+set_ep(EP)
 
 
 def check_decode():
@@ -71,7 +85,35 @@ def routing(T, kind, g):
                                   for t in range(T)]).to(DEV, torch.int32)
         w = torch.rand((T, TOPK), device=DEV, generator=g) + 0.05
         return (w / w.sum(1, keepdim=True) * 1.5).float(), ids
+    if kind == "all-local" and E < TOPK:    # fewer local experts than picks: every one of them, the rest elsewhere
+        w, ids = TM.routing(T, False, g)
+        ids[:, :E] = torch.stack([torch.randperm(E, generator=torch.Generator().manual_seed(int(t) + 7))
+                                  for t in range(T)]).to(DEV, torch.int32)
+        ids[:, E:] = torch.where(ids[:, E:] < E, ids[:, E:] + E, ids[:, E:])
+        return w, ids
     return TM.routing(T, {"random": False, "all-local": True, "none": "none"}[kind], g)
+
+
+def check_scratch():
+    """reserve() footprint for the default decode rows (24) and 32: sized once, no allocator growth."""
+    ok = True
+    dev = DEV
+    for rows in (24, 32):
+        XD._bufs.clear()
+        torch.cuda.empty_cache()
+        r0 = torch.cuda.memory_reserved()
+        XD.reserve(dev, rows, TOPK, H, I)
+        for t in range(1, rows + 1):        # every call size reuses it
+            XD._scratch(dev, t, TOPK, H, I)
+        mib = XD.scratch_bytes(dev) / 2**20
+        pool = (torch.cuda.memory_reserved() - r0) / 2**20
+        good = mib <= 256 and pool <= mib + 4
+        ok &= good
+        print(f"  reserve({rows} tokens x {TOPK}): {mib:.1f} MiB of scratch, {pool:.1f} MiB taken from the allocator "
+              f"{'ok' if good else '<-- FAIL'}")
+    XD._bufs.clear()
+    torch.cuda.empty_cache()
+    return ok
 
 
 def check_numerics(layer, ref, K, Ts=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32), tol=2e-3):
@@ -221,21 +263,34 @@ if __name__ == "__main__":
     if not only or "dq" in only:
         print("-- trellis decode vs ext.reconstruct")
         allok &= check_decode()
+    if not only or "scratch" in only:
+        print("-- decode scratch")
+        allok &= check_scratch()
     M.DECODE = "r9k"
     synth = [] if only == "real" else [(3, 1), (2, 18), (4, 40)]
     for K, seed in synth:
-        layer, ref = TM.make_layer(K, seed)
-        if not only or "num" in only:
-            print(f"-- numerics K={K} synthetic")
-            allok &= check_numerics(layer, ref, K)
-        if not only or "graph" in only:
-            print(f"-- HIP graph K={K}")
-            allok &= check_graphs(layer, K)
+        if not only or "num" in only or "graph" in only:
+            layer, ref = TM.make_layer(K, seed)
+            print(f"   ({E} local experts, EP {EP})")
+            if not only or "num" in only:
+                print(f"-- numerics K={K} synthetic")
+                allok &= check_numerics(layer, ref, K)
+            if not only or "graph" in only:
+                print(f"-- HIP graph K={K}")
+                allok &= check_graphs(layer, K)
+            del layer, ref
+            torch.cuda.empty_cache()
         if (not only or "bench" in only) and K in (3, 2):
-            print(f"-- timing K={K}, graph replay, us a layer")
+            set_ep(BENCH_EP)
+            wf = TM.weight_f32
+            TM.weight_f32 = lambda t, su, sv: torch.zeros(1, device=t.device)    # timing only: no reference
+            layer, _ = TM.make_layer(K, seed)
+            TM.weight_f32 = wf
+            print(f"-- timing K={K}, graph replay, us a layer ({E} local experts)")
             bench(layer, K)
-        del layer, ref
-        torch.cuda.empty_cache()
+            del layer
+            torch.cuda.empty_cache()
+            set_ep(EP)
     real_dir = os.environ.get("EXL3_REAL_DIR", "/ds41/exl3/kerneltest/real")
     if not only or only == "real" or "num" in only:
         for K, f in ((3, "l0-sample.safetensors"), (2, "l18-sample.safetensors")):

@@ -515,7 +515,7 @@ struct Args
     const int64_t* g2l;       // [G] global -> local id (outside [0, E) = not on this rank)
     const int64_t* tab[9];    // pointer tables [E]: gate trellis/suh/svh, up ..., down ...
     float* part1;             // [S, KS1, 2, I]
-    float* part2;             // [S, KS2, H]
+    float* part2;             // [S, KS2, H]  (may alias part1: k_dn starts after k_gu and never reads part1)
     half* a_rot;              // [S, I]
     float* out_slot;          // [S, H]
     int* ctr;                 // S * (I/128) + S * (H/128) + T * (H/128), zero between launches
@@ -880,7 +880,8 @@ int launch_k(int K, const Args& a, int P, hipStream_t st)
 
 }  // namespace
 
-// Scratch the caller provides (bytes): part1 4*S*ks1*2*I, part2 4*S*ks2*H, a_rot 2*S*I, out_slot 4*S*H, and
+// Scratch the caller provides (bytes): part1 4*S*ks1*2*I, part2 4*S*ks2*H (one buffer may serve both), a_rot 2*S*I,
+// out_slot 4*S*H, and
 // r9k_moe_exl3_ctr_ints(T, topk, H, I) int32 counters, zeroed once at allocation (each launch leaves them zero).
 extern "C" int r9k_moe_exl3_ctr_ints(int T, int topk, int H, int I)
 {

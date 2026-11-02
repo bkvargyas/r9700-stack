@@ -58,7 +58,7 @@ ATOMIC = os.environ.get("R9K_EXL3_MOE_ATOMIC", "0") == "1"
 #   fused  the exl3_moe fused tier as for prefill
 DECODE = os.environ.get("R9K_EXL3_MOE_DECODE", "r9k")
 DECODE_ROWS = int(os.environ.get("R9K_EXL3_MOE_MGEMM_M", 16))
-R9K_ROWS = int(os.environ.get("R9K_EXL3_MOE_R9K_M", 32))
+R9K_ROWS = int(os.environ.get("R9K_EXL3_MOE_R9K_M", 24))   # 4 streams x a 6-token verify
 MAX_BSZN = 8          # exllamav3_ext/libtorch/blocksparse_mlp.h: exl3_moe_coop scratch bound
 MGEMV_SLOTS = 128     # exl3_mgemv_try_launch: bszm <= 128
 MOE_ACT_SILU = 0  # exllamav3_ext/quant/exl3_moe_common.cuh

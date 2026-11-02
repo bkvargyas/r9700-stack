@@ -77,31 +77,57 @@ def split_for(T: int, H: int, I: int) -> tuple[int, int]:
     return ks1, ks2
 
 
-def _scratch(dev: torch.device, S: int, T: int, topk: int, H: int, I: int, ks1: int, ks2: int):
-    """Process-wide per device, grown to the largest call (layers run one after another on one stream; the arrival
-    counters are zero between launches)."""
-    need = {"p1": S * ks1 * 2 * I, "p2": S * ks2 * H, "ar": S * I, "os": S * H,
-            "ctr": lib().r9k_moe_exl3_ctr_ints(T, topk, H, I)}
+def _need(T: int, topk: int, H: int, I: int) -> dict:
+    """Element counts covering every call of up to T tokens at the splits split_for() picks. One f32 partial buffer
+    serves both kernels (k_gu's partials are dead once k_dn starts: same stream, k_dn never reads them)."""
+    need = {"part": 0, "ar": 0, "os": 0, "ctr": 0}
+    for t in range(1, T + 1):
+        S = t * topk
+        ks1, ks2 = split_for(t, H, I)
+        need["part"] = max(need["part"], S * ks1 * 2 * I, S * ks2 * H)
+        need["ar"] = max(need["ar"], S * I)
+        need["os"] = max(need["os"], S * H)
+        need["ctr"] = max(need["ctr"], lib().r9k_moe_exl3_ctr_ints(t, topk, H, I))
+    return need
+
+
+def _scratch(dev: torch.device, T: int, topk: int, H: int, I: int):
+    """Process-wide per device (layers run one after another on one stream; the arrival counters are zero between
+    launches). Sized once for the largest call -- reserve() before capture -- never grown step by step: every
+    superseded set would stay in the caching allocator's pool (that cost ~1 GiB a rank at 32 rows)."""
     b = _bufs.get(dev.index)
-    if b is None or any(b[k].numel() < v for k, v in need.items()):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("exl3 decode: scratch must be sized before graph capture (warm the decode sizes)")
-        old = b or {}
-        need = {k: max(v, old[k].numel() if k in old else 0) for k, v in need.items()}
-        b = _bufs[dev.index] = {
-            "p1": torch.empty(need["p1"], dtype=torch.float32, device=dev),
-            "p2": torch.empty(need["p2"], dtype=torch.float32, device=dev),
-            "ar": torch.empty(need["ar"], dtype=torch.float16, device=dev),
-            "os": torch.empty(need["os"], dtype=torch.float32, device=dev),
-            "ctr": torch.zeros(need["ctr"], dtype=torch.int32, device=dev),
-        }
+    if b is not None and b["T"] >= T and b["topk"] >= topk and b["H"] == H and b["I"] == I:
+        return b
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("exl3 decode: scratch must be sized before graph capture (reserve() the decode sizes)")
+    need = _need(T, topk, H, I)
+    if b is not None:
+        need = {k: max(v, b[k].numel()) for k, v in need.items()}
+        T, topk = max(T, b["T"]), max(topk, b["topk"])
+        _bufs.pop(dev.index)
+        del b
+    # one allocation carved into 256-byte aligned views (separate mid-size tensors each round up to an allocator segment)
+    layout = (("part", torch.float32), ("os", torch.float32), ("ar", torch.float16), ("ctr", torch.int32))
+    offs, n = {}, 0
+    for k, dt in layout:
+        offs[k] = n
+        n += (need[k] * torch.empty((), dtype=dt).element_size() + 255) // 256 * 256
+    raw = torch.zeros(n, dtype=torch.uint8, device=dev)
+    b = _bufs[dev.index] = {"T": T, "topk": topk, "H": H, "I": I, "raw": raw}
+    for k, dt in layout:
+        sz = torch.empty((), dtype=dt).element_size()
+        b[k] = raw[offs[k]:offs[k] + need[k] * sz].view(dt)
     return b
 
 
 def reserve(dev: torch.device, T: int, topk: int, H: int, I: int):
-    """Size the scratch for up to T tokens (every split choice) before capture."""
-    for t in range(1, T + 1):
-        _scratch(dev, t * topk, t, topk, H, I, *split_for(t, H, I))
+    """Size the scratch for every call of up to T tokens, before capture."""
+    _scratch(dev, T, topk, H, I)
+
+
+def scratch_bytes(dev: torch.device) -> int:
+    b = _bufs.get(dev.index)
+    return 0 if b is None else b["raw"].numel()
 
 
 class Tables:
@@ -130,7 +156,7 @@ def moe_decode(x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tens
     w = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
     w = w.contiguous()
     ks1, ks2 = split_for(T, H, I)
-    b = _scratch(dev, S, T, topk, H, I, ks1, ks2)
+    b = _scratch(dev, T, topk, H, I)
     y_f32 = out_f32 or x.dtype != torch.bfloat16
     y = torch.empty((T, H), dtype=torch.float32 if y_f32 else torch.bfloat16, device=dev)
     R = rows_for(T)
@@ -138,7 +164,7 @@ def moe_decode(x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tens
     rc = lib().r9k_moe_exl3_decode(
         x.data_ptr(), int(x.dtype == torch.float16), ids.data_ptr(), w.data_ptr(), g2l.data_ptr(), g2l.numel(), E,
         T, topk, H, I, ctypes.addressof(tables.arr), K, cb, act_limit,
-        b["p1"].data_ptr(), b["p2"].data_ptr(), b["ar"].data_ptr(), b["os"].data_ptr(), b["ctr"].data_ptr(),
+        b["part"].data_ptr(), b["part"].data_ptr(), b["ar"].data_ptr(), b["os"].data_ptr(), b["ctr"].data_ptr(),
         y.data_ptr(), int(y_f32), R, P, ks1, ks2, torch.cuda.current_stream(dev).cuda_stream)
     if rc != 0:
         raise RuntimeError(f"r9k_moe_exl3_decode failed ({rc}): T={T} topk={topk} H={H} I={I} K={K} cb={cb} "
