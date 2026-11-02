@@ -232,3 +232,17 @@ prefix, prefix cache off) shows top-1 agreement 14-20/24 with |dlogprob| 0.6-1.3
 through the prefill path) -> correct**: 511-token essay with a proper ending, clean LRU code, 17*23=391, agreement 22-24/24
 at |dlogprob| 0.02-0.18. So the defect is in the decode-only attention path (SWA ragged decode kernel over the fp8 record,
 decode compressor, decode indexer), not in EXL3 / MoE / graphs / Engram slot cache / our GLM hooks. Next split: bf16 KV.
+
+**ROOT CAUSE (09:40 UTC): stock vLLM's ROCm sparse-MLA decode on non-gfx942/950 GPUs.** `rocm_sparse_attn_decode` takes
+`inv_rope_positions` so the split-K reduce kernel can fold the attention output's inverse RoPE into its epilogue and
+reports the rows as rotated; the caller (`forward_mqa`) un-rotates only the remaining rows. The "fallback path for un-tuned
+architectures" (everything but gfx942/gfx950) runs the single-pass ragged kernel, which has no such epilogue, yet the
+wrapper still reports every row as rotated -> decode attention outputs reach wo_a with the RoPE rotation still on their
+64 rope dims. Prefill rows take the standalone pass and are right. Diagnosed with `divergence.py` (greedy decode vs fresh
+prefill of each prefix) and bisected by relaunch: EXL3 decode tiers / graphs / GLM hooks / bf16 KV / Engram all
+exonerated; ALL-PREFILL correct; dumping the decode kernel's slot lists showed them correct; dropping
+`inv_rope_positions` (standalone inverse RoPE for decode rows) fixed it: agreement 23-24/24, |dlogprob| 0.02-0.13.
+Fix: `models/deepseek_v41_rdna4.py` `decode:inverse-rope-unfused`, default on RDNA4 (R9K_DSV41_FUSED_INVROPE=1 opts
+out). Worth an upstream report (any ROCm GPU outside gfx942/gfx950 serving DeepSeek V4/V4.1 decodes wrong).
+With the fix (graphs, no drafter): single stream 45.7 tok/s, 4 streams 104 tok/s aggregate, warm prefill 3.4k tok/s;
+thinking-mode answers correct (Paris; 17*23=391 with the 340+51 explanation; clean Fibonacci; train problem 8pm).
