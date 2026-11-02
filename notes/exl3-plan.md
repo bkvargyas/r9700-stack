@@ -318,3 +318,13 @@ Integration: the owner relaunches `serve/ds41-exl3.sh` with the new tiers, runs 
   fallback kernel cost 180 us a layer at SWA 128 + top-k 512 (P3's table), the split-K path 19 us.
 - Remaining step time is in the MoE decode tier (P1), the collectives (P2, also the >9-token steps), the hyper-connection
   kernels and the EXL3 GEMV launch count.
+
+### Phase 2 results, all four packages integrated (2026-11-02 19:00 UTC, commits d67dd59 a807cd4 6ad1c94 + P2)
+Eight cards, graphs, KVMEM 1, drafter on (default). Divergence 22-24/24 at |dlogprob| 0.04-0.10. **Single stream 70.4 tok/s
+(morning: 50.7), 4 streams 161.9 tok/s aggregate (117), code 137 tok/s (97; the Sparks: 118), prose essay 61 tok/s (42; Sparks
+80.7), decode after long prefills 81.8 / 80.0 / 74.5 tok/s at 2k / 16k / 28k context, prefill 3.4k tok/s (Sparks 2.1k).**
+Drafter acceptance 2.4-2.5 on the probe prompt. VRAM 30.7-30.9 GiB a card (the r9k tier reserves ~1.2 GiB of scratch a rank;
+headroom ~1 GiB). Lesson: the tree sync preserves source mtimes, so serve.sh's "kernel newer than libr9k.so" rebuild check
+missed P1's kernel once (the first "P1" integration measured the old tier); exl3-sync.sh now touches changed kernel sources.
+Launches a step with the drafter: ~810 (51,932 over 64 steps) vs ~2,550 before.
+Remaining gap to the Sparks is prose single-stream (61-82 vs 80.7); code and four-stream aggregate are at or above parity.
