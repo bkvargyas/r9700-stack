@@ -7,9 +7,13 @@ is Triton or torch and runs here.
   (v1/attention/ops/rocm_aiter_mla_sparse.py rocm_aiter_sparse_attn_indexer) is Triton k-quant/cache-insert, the paged
   logits (our tiled kernel through models/glm5next.py's hook on this GPU), torch fallbacks for the prefill logits and
   the top-k. On RDNA4 we take that op directly.
-* Decode attention output: the launcher's un-tuned-architecture fallback never applies the fused inverse RoPE it
-  reports, so the decode rows reach wo_a still rotated (see _install_no_fused_invrope). We pass no inv_rope_positions and
-  let the caller's standalone pass handle every decode row.
+* Decode attention: stock's launcher sends every GPU but gfx942/gfx950 to a serial one-workgroup-per-query fallback
+  (~180 us a layer at SWA 128 + top-k 512 on an R9700) that also never applies the fused inverse RoPE it reports, so
+  decode rows reached wo_a still rotated. R9K_DSV41_DECODE selects: ``splitk`` (default) -- attn/dsv4_decode.py runs
+  stock's split-K partial + reduce kernels with RDNA4 tuning and the reduce's fused inverse RoPE, reporting rotated rows
+  truthfully (_install_splitk_decode); ``ragged`` -- stock's fallback kernel with no inv_rope_positions, so the caller's
+  standalone pass un-rotates every decode row (_install_no_fused_invrope, the 2026-11-02 workaround); ``stock`` -- untouched
+  (wrong on RDNA4; R9K_DSV41_FUSED_INVROPE=1 is the old spelling).
 * Prefill indexer logits: ``rocm_fp8_mqa_logits`` (same module) takes aiter's Triton ``fp8_mqa_logits`` only under the
   same aiter gates and otherwise runs ``fp8_mqa_logits_torch``, which materializes [heads, M, N] scores in bf16 and f32 --
   32 x 2048 x 2048 x 4 B = 512 MiB for a 2k prompt against 2k of context (OOM at ~31 GiB used), 16 GiB for a 4k chunk
@@ -95,7 +99,7 @@ def _install_debug_decode() -> bool:
 
     def wrap(name):
         orig = getattr(O, name)
-        if getattr(orig, "__r9k_patch__", None):
+        if getattr(orig, "__r9k_patch__", None) == "dsv41_debug_decode":
             return
         sig = inspect.signature(orig)
 
@@ -166,6 +170,34 @@ def _install_no_fused_invrope() -> bool:
     return True
 
 
+def _install_splitk_decode() -> bool:
+    """Route `rocm_sparse_attn_decode` (fp8_ds_mla, the DeepSeek-V4.1 path) and `rocm_sparse_attn_decode_bf16` to
+    attn/dsv4_decode.py's split-K launcher. Installed over the stock module's names before vLLM imports the model's
+    ROCm module; modules that already imported the names by value are re-pointed too."""
+    import sys
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
+    from r9700_vllm.attn import dsv4_decode as D
+    for name in ("rocm_sparse_attn_decode", "rocm_sparse_attn_decode_bf16"):
+        orig = getattr(O, name)
+        if getattr(orig, "__r9k_patch__", None) == "dsv41_splitk_decode":
+            continue
+        fn = getattr(D, name)
+
+        def wrapped(*args, __fn=fn, **kwargs):
+            return __fn(*args, **kwargs)
+
+        wrapped.__r9k_patch__ = "dsv41_splitk_decode"
+        wrapped.__r9k_orig__ = orig
+        wrapped.__wrapped__ = orig
+        setattr(O, name, wrapped)
+        for mod in ("vllm.models.deepseek_v41.amd.rocm", "vllm.models.deepseek_v4.amd.rocm",
+                    "vllm.v1.attention.backends.mla.rocm_aiter_mla_sparse"):
+            m = sys.modules.get(mod)
+            if m is not None and getattr(m, name, None) is orig:
+                setattr(m, name, wrapped)
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -184,10 +216,18 @@ def patch() -> bool:
             done.append("prefill-logits:aiter-triton")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
-    if os.environ.get("R9K_DSV41_FUSED_INVROPE", "0") != "1":
+    mode = os.environ.get("R9K_DSV41_DECODE", "stock" if os.environ.get("R9K_DSV41_FUSED_INVROPE") == "1" else "splitk")
+    if mode == "splitk":
+        try:
+            if _install_splitk_decode():
+                done.append("decode:split-k+fused-inverse-rope")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 split-K decode not installed (%s); falling back to ragged", e)
+            mode = "ragged"
+    if mode == "ragged":
         try:
             if _install_no_fused_invrope():
-                done.append("decode:inverse-rope-unfused")
+                done.append("decode:ragged+inverse-rope-unfused")
         except Exception as e:  # pragma: no cover
             logger.warning("r9700: dsv41 no-fused-invrope hook not installed (%s)", e)
     if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
