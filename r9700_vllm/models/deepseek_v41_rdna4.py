@@ -102,26 +102,25 @@ def _install_debug_decode() -> bool:
                 rank0 = get_tensor_model_parallel_rank() == 0
             except Exception:
                 rank0 = True
-            if rank0 and state["calls"] < 160:
-                b = sig.bind(*args, **kwargs).arguments
+            b = sig.bind(*args, **kwargs).arguments
+            pos = b.get("inv_rope_positions")
+            real = pos is not None and int(pos.max()) >= 10          # skip the profile / warm-up batches
+            if rank0 and real and state["calls"] < 90:
                 i = state["calls"]; state["calls"] += 1
-                parts = [f"[dsv41-decode #{i} {name}]"]
-                for k, v in b.items():
-                    if isinstance(v, torch.Tensor):
-                        if v.dtype in (torch.int32, torch.int64) and v.numel() <= 1_000_000 and v.dim() == 1:
-                            x = v.detach().cpu()
-                            if "indptr" in k:
-                                d = (x[1:] - x[:-1])
-                                parts.append(f"{k}={tuple(v.shape)} lens={d[:8].tolist()}")
-                            else:
-                                n = int(x.numel())
-                                parts.append(f"{k}={tuple(v.shape)} min={int(x.min()) if n else 0} max={int(x.max()) if n else 0}")
-                                if i % 40 == 0:
-                                    parts.append(f"{k}[:150]={x[:150].tolist()}")
-                        else:
-                            parts.append(f"{k}={tuple(v.shape)}/{str(v.dtype).replace('torch.', '')}")
-                    elif isinstance(v, (int, float, bool)):
-                        parts.append(f"{k}={v}")
+                parts = [f"[dsv41-decode #{i} {name}] pos={pos.detach().cpu().tolist()[:4]} swa_only={b.get('swa_only')}"]
+                for seg in ("swa", "topk"):
+                    ri, rp = b.get(f"{seg}_ragged_indices"), b.get(f"{seg}_ragged_indptr")
+                    if ri is None or rp is None:
+                        continue
+                    rp = rp.detach().cpu(); lens = (rp[1:] - rp[:-1]).tolist()
+                    n0 = int(lens[0]) if lens else 0
+                    sl = ri.detach().cpu()[:min(n0, 140)].tolist()
+                    parts.append(f"{seg}: lens={lens[:4]} slots[:{len(sl)}]={sl}")
+                tl_ = b.get("topk_lens"); sl_ = b.get("swa_lens")
+                if sl_ is not None: parts.append(f"swa_lens={sl_.detach().cpu().tolist()[:4]}")
+                if tl_ is not None: parts.append(f"topk_lens={tl_.detach().cpu().tolist()[:4]}")
+                kc = b.get("kv_cache"); sk = b.get("swa_k_cache")
+                parts.append(f"swa_cache={tuple(sk.shape) if sk is not None else None} extra_cache={tuple(kc.shape) if kc is not None else None}")
                 print(" ".join(parts), flush=True)
             return orig(*args, **kwargs)
 
