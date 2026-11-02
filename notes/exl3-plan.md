@@ -254,3 +254,7 @@ over 6 queries), so prose breaks even and code doubles. Multi-token decode MoE i
 **196/200 = 98.0 %**, 0 truncations, 5.2 min at ~140 tok/s aggregate (4 streams; drafter acceptance 3.2-3.6 on math).
 Needles 3/3 at 8k, 16k and 28k tokens (prefill 2.5 / 6 / 8.6-11.5 s). Strict 8-way sanity after 24k-token prefills:
 0 bad of 80 (10 rounds). Soak: 8 clients x 10 min, 10k-28k prompts -- see below.
+Soak (8 clients, 641 s, prompts 10.3k-30.6k tokens, median 21k): 85 requests, 0 errors, 0 rejections, 2,744 prompt tok/s,
+median latency 59 s; VRAM settled at 30.7-31.0 GiB a card (allocator growth under long prefills; no OOM). Probe after the soak
+(usage-based, DSpark on): single stream 50.7 tok/s, 4 streams 117 tok/s aggregate, warm prefill 3.4k tok/s.
+Server left running on VM100 (container ds41, port 8080) for Brian's check-in.
