@@ -12,8 +12,9 @@ expert's arrival (shapes come from the checkpoint, so the parameters themselves 
 addresses: process_weights_after_loading turns each buffer into an int64 pointer table, one entry per local expert.
 
 Forward (as exllamav3's BlockSparseMLP.forward, ROCm defaults): topk ids -> local ids (E = not on this rank, the
-sentinel bin). Up to DECODE_ROWS tokens the decode tier (exl3_mgemm over the picked experts, see DECODE) runs every
-local (token, pick) slot without sorting. Above it, expert_count / token_sorted / weight_sorted in exllamav3's layout
+sentinel bin). Up to R9K_ROWS (r9k) / DECODE_ROWS tokens the decode tier (see DECODE: r9k = kernels/r9k_moe_exl3.hip,
+two launches; mgemv = exllamav3's exl3_mgemm) runs every local (token, pick) slot without sorting. Above it,
+expert_count / token_sorted / weight_sorted in exllamav3's layout
 on the device for the exl3_moe fused kernel: up to FUSED_ROWS tokens no expert can hold more rows than its temp buffers,
 so the call stays device-only (HIP-graph safe); above that the counts come back to the host once (one sync a layer,
 prefill only) and experts with more than RECON_ROWS rows take the reconstruct tier (dequantize the expert's three
@@ -47,14 +48,17 @@ FUSED_ROWS = int(os.environ.get("R9K_EXL3_MOE_FUSED_ROWS", 512))
 # (measured on gfx1201, random routing: 8k tokens 27.0 -> 22.9 ms a layer, 16k 50.3 -> 29.5 ms; no gain below 128)
 RECON_ROWS = min(int(os.environ.get("R9K_EXL3_MOE_RECON_ROWS", 128)), FUSED_ROWS)
 ATOMIC = os.environ.get("R9K_EXL3_MOE_ATOMIC", "0") == "1"
-# Decode tier for up to DECODE_ROWS tokens:
+# Decode tier for up to DECODE_ROWS tokens (R9K_ROWS for r9k):
+#   r9k    kernels/r9k_moe_exl3.hip (moe/exl3_decode.py): two launches a layer, local slots compacted on device,
+#          slots sharing an expert decoded together, deterministic; falls back to mgemv when unavailable
 #   mgemv  exl3_mgemm over the picked experts (the RDNA multi-matrix GEMV, exl3_mgemv_rdna.cu): gate, up, down as one
 #          launch each over every local (token, pick) slot, compacted in-kernel; up to 128 slots (the kernel's
 #          compaction capacity), 2.5-3.5x faster than coop / the fused tier at decode sizes on gfx1201
 #   coop   exl3_moe_coop (BC_BlockSparseMLP.run_bszN, exllamav3's own decode path), up to MAX_BSZN tokens
 #   fused  the exl3_moe fused tier as for prefill
-DECODE = os.environ.get("R9K_EXL3_MOE_DECODE", "mgemv")
+DECODE = os.environ.get("R9K_EXL3_MOE_DECODE", "r9k")
 DECODE_ROWS = int(os.environ.get("R9K_EXL3_MOE_MGEMM_M", 16))
+R9K_ROWS = int(os.environ.get("R9K_EXL3_MOE_R9K_M", 32))
 MAX_BSZN = 8          # exllamav3_ext/libtorch/blocksparse_mlp.h: exl3_moe_coop scratch bound
 MGEMV_SLOTS = 128     # exl3_mgemv_try_launch: bszm <= 128
 MOE_ACT_SILU = 0  # exllamav3_ext/quant/exl3_moe_common.cuh
@@ -252,8 +256,11 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             return
         dev, H, topk = layer._exl3.device, layer._exl3.H, self.moe.experts_per_token
         local = (layer.exl3_g2l < layer._exl3.E).nonzero().flatten()[:topk].to(torch.int32)
-        sizes = sorted({t for t in (1, 2, 3, 4, 6, 8, 12, 16, DECODE_ROWS) if 0 < t <= DECODE_ROWS} |
-                       {DECODE_ROWS + 1, 64})
+        rows = self._decode_rows()
+        if DECODE == "r9k" and self._r9k_ready(layer):
+            from ..moe import exl3_decode as XD
+            XD.reserve(dev, rows, topk, H, layer._exl3.I)
+        sizes = sorted({t for t in (1, 2, 3, 4, 6, 8, 12, 16, 24, rows) if 0 < t <= rows} | {rows + 1, 64})
         for T in sizes:
             x = torch.zeros((T, H), dtype=torch.bfloat16, device=dev)
             ids = local.expand(T, -1).contiguous()
@@ -261,6 +268,28 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.apply(layer, x, w, ids)
         torch.cuda.synchronize(dev)
         _warmed.add(key)
+
+    def _decode_rows(self) -> int:
+        return R9K_ROWS if DECODE == "r9k" else DECODE_ROWS
+
+    def _r9k_ready(self, layer) -> bool:
+        """The r9k tier takes this layer: libr9k has the kernel, one K for the three roles (2-6), mul1 or mcg."""
+        ok = getattr(layer, "_exl3_r9k", None)
+        if ok is None:
+            from ..moe import exl3_decode as XD
+            ok = XD.available() and len(set(self.K)) == 1 and 2 <= self.K[0] <= 6 and (self.mul1 or self.mcg)
+            if ok:
+                layer._exl3_r9k_tab = XD.Tables(layer)
+            elif DECODE == "r9k":
+                logger.warning_once("exl3 moe: r9k decode tier unavailable (libr9k without r9k_moe_exl3_decode, "
+                                    "or K %s / codebook unsupported): mgemv decode", tuple(self.K))
+            layer._exl3_r9k = ok
+        return ok
+
+    def _apply_r9k(self, layer, x, topk_weights, topk_ids):
+        from ..moe import exl3_decode as XD
+        return XD.moe_decode(x, topk_weights, topk_ids, layer.exl3_g2l, layer._exl3.E, layer._exl3_r9k_tab,
+                             self.K[0], 2 if self.mul1 else 1, self.act_limit, layer._exl3.I)
 
     def _run_fused(self, layer, x16, out, count, token_sorted, weight_sorted, num_active, scratch, base, hi):
         L = layer
@@ -350,8 +379,10 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # shared_experts: the runner runs them (moe_kernel is None, so mk_can_overlap_shared_experts is False)
         E = layer._exl3.E
         T, H = x.shape
+        if DECODE == "r9k" and 0 < T <= R9K_ROWS and T * topk_ids.shape[1] <= 256 and self._r9k_ready(layer):
+            return self._apply_r9k(layer, x, topk_weights, topk_ids)
         if 0 < T <= DECODE_ROWS:
-            if DECODE == "mgemv" and topk_ids.numel() <= MGEMV_SLOTS:
+            if DECODE in ("mgemv", "r9k") and topk_ids.numel() <= MGEMV_SLOTS:
                 return self._apply_mgemv(layer, x, topk_weights, topk_ids)
             if DECODE == "coop" and T <= MAX_BSZN:
                 return self._apply_coop(layer, x, topk_weights, topk_ids)

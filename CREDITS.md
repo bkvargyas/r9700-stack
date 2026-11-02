@@ -1,6 +1,6 @@
 # Credits
 
-Almost everything here is original work, licensed Apache-2.0 (see [LICENSE](LICENSE)). Two pieces are other
+Almost everything here is original work, licensed Apache-2.0 (see [LICENSE](LICENSE)). A few pieces are other
 people's and are acknowledged below; [NOTICE](NOTICE) is the authoritative statement of what the licence does
 and does not cover.
 
@@ -9,6 +9,7 @@ and does not cover.
 | What | Source | Used in | License |
 |---|---|---|---|
 | Device-side expert LRU cache kernels (vendored unmodified) | davetha -- https://github.com/davetha/r9700-lru-expert-cache (3743f13) | `kernels/third_party/davetha/` | **Apache-2.0** -- its own LICENSE and NOTICE are preserved in that directory |
+| EXL3 trellis decode (lane plan, codebook pair decoder) and the RDNA "tiles" GEMV dot core, 128-point Hadamard warp shuffle (copied, adapted: integer K only, per-row offsets) | turboderp -- https://github.com/turboderp-org/exllamav3 (v1.6.6) | `kernels/r9k_moe_exl3.hip` (sections marked EXLLAMAV3) | **MIT** |
 | Chat template `qwen-fixed-v22.3.jinja` (copied verbatim) | GGZ14/vllm-mxfp4 -- https://github.com/GGZ14/vllm-mxfp4 (92eed82) | `serve/templates/` | used with the author's permission, with credit; no upstream LICENSE file |
 
 The chat template is worth about +14% speculative-decoding acceptance over the checkpoint's own template. It is
