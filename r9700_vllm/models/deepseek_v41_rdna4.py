@@ -7,6 +7,9 @@ is Triton or torch and runs here.
   (v1/attention/ops/rocm_aiter_mla_sparse.py rocm_aiter_sparse_attn_indexer) is Triton k-quant/cache-insert, the paged
   logits (our tiled kernel through models/glm5next.py's hook on this GPU), torch fallbacks for the prefill logits and
   the top-k. On RDNA4 we take that op directly.
+* Decode attention output: the launcher's un-tuned-architecture fallback never applies the fused inverse RoPE it
+  reports, so the decode rows reach wo_a still rotated (see _install_no_fused_invrope). We pass no inv_rope_positions and
+  let the caller's standalone pass handle every decode row.
 * Prefill indexer logits: ``rocm_fp8_mqa_logits`` (same module) takes aiter's Triton ``fp8_mqa_logits`` only under the
   same aiter gates and otherwise runs ``fp8_mqa_logits_torch``, which materializes [heads, M, N] scores in bf16 and f32 --
   32 x 2048 x 2048 x 4 B = 512 MiB for a 2k prompt against 2k of context (OOM at ~31 GiB used), 16 GiB for a 4k chunk
@@ -134,9 +137,18 @@ def _install_debug_decode() -> bool:
 
 
 def _install_no_fused_invrope() -> bool:
-    """R9K_DSV41_NO_FUSED_INVROPE=1: the decode launcher gets no inv_rope_positions, so its reduce epilogue does not
-    fold the inverse RoPE in; it reports 0 rotated rows and the caller runs the standalone inverse-RoPE pass the prefill
-    rows use. Isolates the fused epilogue (decode-only code) from the rest of the decode path."""
+    """The decode-path fix (default on RDNA4; R9K_DSV41_FUSED_INVROPE=1 opts back into stock behaviour).
+
+    Stock's `rocm_sparse_attn_decode` (v1/attention/ops/rocm_aiter_mla_sparse.py) takes `inv_rope_positions` so that the
+    split-K reduce kernel can fold the inverse RoPE of the attention output into its epilogue (FUSE_INV_ROPE), and
+    reports to the caller how many rows came back rotated; the caller (deepseek_v41/amd/rocm.py forward_mqa) runs the
+    standalone inverse-RoPE pass only on the rest. On GPUs that are neither gfx942 nor gfx950 the launcher takes its
+    "fallback path for un-tuned architectures" -- the single-pass ragged kernel, which has no such epilogue -- yet the
+    wrapper still reports the rows as rotated, so the decode attention output keeps the RoPE rotation on its 64 rope
+    dims per head and wo_a sees it. Prefill rows are unaffected. The effect is a per-token error at decode only:
+    coherent text that doubles words and loops within a few dozen tokens (found with the EXL3 pack, 2026-11-02;
+    divergence.py decode-vs-prefill top-1 agreement 14-20/24 -> 23-24/24 with this fix). Passing no inv_rope_positions
+    makes the wrapper report 0 rotated rows and the caller un-rotates every decode row itself."""
     from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
     orig = O.rocm_sparse_attn_decode
     if getattr(orig, "__r9k_patch__", None) == "dsv41_no_fused_invrope":
@@ -172,10 +184,10 @@ def patch() -> bool:
             done.append("prefill-logits:aiter-triton")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
-    if os.environ.get("R9K_DSV41_NO_FUSED_INVROPE", "0") == "1":
+    if os.environ.get("R9K_DSV41_FUSED_INVROPE", "0") != "1":
         try:
             if _install_no_fused_invrope():
-                done.append("decode:no-fused-invrope")
+                done.append("decode:inverse-rope-unfused")
         except Exception as e:  # pragma: no cover
             logger.warning("r9700: dsv41 no-fused-invrope hook not installed (%s)", e)
     if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
