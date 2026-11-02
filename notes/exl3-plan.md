@@ -188,3 +188,21 @@ Placeholder stubs for all three live in the repo (branch `exl3`) so imports reso
 
 - M1 wheel + kernel gates (K). M2 quant method + loader mapping, dense and MoE numerics (L, M, N). M3 eight-card load, first
   tokens, Engram in host RAM, then DSpark (owner). M4 attention path work if needed; sanity, GSM8K, HumanEval, soak; release.
+
+## Bring-up log
+
+**2026-11-02 01:10-01:35 UTC, dummy weights (`--load-format dummy`, R9K_EXL3_DUMMY=1), eight cards, TP8 + EP.** Four launches:
+1. `dequant_f32` built its Hadamard constant with the default dtype, which vLLM sets to bf16 -> f32/bf16 matmul error. Fixed.
+2. Stock `SparseAttnIndexer.forward_hip` raises on gfx12 ("requires AITER or gfx950/gfx11"); its ROCm op is Triton/torch
+   underneath. `models/deepseek_v41_rdna4.py` opens the gate on RDNA4 (+ `patch:dsv41_rdna4` in register()).
+3. Up, eager: load 25.5 GiB a rank in 19 s, KV 2 GiB = 234,740 tokens (fp8_ds_mla, block 128, BLHNC), backends
+   ROCM_FLASHMLA_SPARSE_DSV41 / DEEPSEEK_SPARSE_SWA / DEEPSEEK_V41_INDEXER / CompressorBackend, 30.2-31.0 GiB used a card.
+   A 2k-token prefill OOMed in `fp8_mqa_logits_torch` (stock's prefill indexer logits: [32 heads, M, N] bf16 + f32 scores,
+   512 MiB at 2k x 2k, 16 GiB for a 4k chunk against 32k). The image's aiter carries the Triton kernel with gfx1201
+   configs; the same module now routes `rocm_fp8_mqa_logits` to it on RDNA4.
+4. Up with HIP graphs (EAGER=0, KVMEM=1, NBT=2048): graph capture 7 s (piecewise 4 + full 3 + decoder replay; torch warns
+   "CUDA Graph is empty" for some segments), 28.2-28.7 GiB used a card. Timing probe (`~/ds41/exl3/tprobe.py`, random
+   weights so the routing and top-k are random too): **single stream 47.3 tok/s (21 ms a step), 4 streams 114 tok/s
+   aggregate (30 a stream), prefill 3,030 tokens 0.8-4.3 s (first prefill JIT-compiles four Triton kernels: compact ragged,
+   cp_gather indexer cache, fp8_mqa_logits, block_scores)**. No DSpark yet. Memory: weights ~25 GiB + KV 1 GiB + graphs leaves
+   ~3.3 GiB a card; the real pack's footprint should match (the dummy run synthesized K=5 attention, K=3 experts).
