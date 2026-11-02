@@ -1,98 +1,190 @@
 # DeepSeek-V4.1-Flash at EXL3 2.9 bpw on r9700-stack -- architecture brief (2026-11-02)
 
-Brian: "Lets do a 3-bit / 2.9-bit EXL3 version" of DeepSeek-V4.1-Flash on OUR stack, resident on the eight R9700s. This file is the
-brief the implementing agents work from; the owner (Claude Fable) reviews every piece against it.
+Brian: "Lets do a 3-bit / 2.9-bit EXL3 version" of DeepSeek-V4.1-Flash on OUR stack, resident on the eight R9700s. This is the
+brief the implementing agents work from; the owner (Claude Fable, this session) reviews every piece against it and does the
+eight-card integration. Agents: read this whole file first, then the files named in your package. Do not commit; the owner
+commits. Own only the files listed under your package; anything else you need changed, write it up in your report.
 
 ## Why this shape
 
-- The official release (deepseek-ai/DeepSeek-V4.1-Flash-1017) is MXFP4 experts + FP8 attention + FP8 Engram tables: 292 GiB of
-  device weights with the Engram tables in host RAM -- does not fit 8 x 32 GiB. Streaming a fifth of the experts over the PLX
-  uplinks is the slow path we measured (GLM four-card: 8-43 tok/s).
-- The published pack **LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw** (196.3 GiB, 43 safetensors shards, MIT) fits resident with
-  ~55 GiB to spare. Same pack two DGX Sparks serve at 73 tok/s single / 136 at four (TensorFold, 2026-10-18), eval 97.1.
-- EXL3 is ExLlamaV3's trellis format (QTIP-style). **exllamav3 (MIT, github.com/turboderp-org/exllamav3, v1.6.6) builds on ROCm**:
-  setup.py detects torch.version.hip, uses the pip ROCm SDK devel (our image has hipcc at
-  /usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin/hipcc), links hipBLAS, ptx_portable.cuh replaces inline PTX, and
-  `exllamav3/exllamav3_ext/rocm/quant/` holds RDNA (WMMA) kernels: exl3_gemm_inner_rdna, exl3_gemv_*_rdna, exl3_mgemv_rdna,
-  exl3_moe_inner_rdna. It also has its own DeepSeek-V4.1 architecture (exllamav3/architecture/deepseek_v41*.py, modules/dsv4.py,
-  mla_attn.py, qsa_indexer.py, ngram_embedding.py) and a tensor-parallel mode (-tp). So the kernels exist; our job is glue in the
-  plugin plus whatever the attention path needs on gfx1201.
-- Rules that still hold: r9700-stack runs as a plugin on STOCK vLLM (our pin: r9700/vllm:dev = nightly-rocm100-e4a5b553, vLLM
-  0.32.1rc1.dev466, torch 2.13.0+rocm10.0.0) with unmodified published checkpoints. exllamav3 is a third-party library we may link
-  against and read. libr4d (radiance) source is never read.
+- The official checkpoint (deepseek-ai/DeepSeek-V4.1-Flash-1017: MXFP4 experts, FP8 attention) is 292 GiB of device weights
+  and does not fit 8 x 32 GiB (probe OOMed at load, VM100 2026-11-01). Streaming experts over the PLX uplinks is the slow path we
+  measured on GLM four-card (8-43 tok/s).
+- **LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw** (196.3 GiB, 43 shards, MIT) fits resident with ~55 GiB to spare. Two DGX
+  Sparks serve this exact pack at 73 tok/s single / 136 at four users (TensorFold TP2, 2026-10-18), tool eval 97.1.
+- EXL3 is ExLlamaV3's trellis format. **exllamav3 v1.6.6 (MIT) builds on ROCm and ships RDNA kernels**; the gfx1201 wheel is built:
+  VM100 `~/ds41/exl3/dist/exllamav3-1.6.6-cp312-cp312-linux_x86_64.whl` (built inside r9700/vllm:dev, PYTORCH_ROCM_ARCH=gfx1201).
+  exllamav3 also has its own DeepSeek-V4.1 architecture (exllamav3/architecture/deepseek_v41*.py, modules/dsv4.py, mla_attn.py,
+  qsa_indexer.py, ngram_embedding.py, block_sparse_mlp.py) -- a second reference for how the pack's tensors are consumed.
+- Rules: r9700-stack is a plugin on STOCK vLLM (pin r9700/vllm:dev = nightly-rocm100-e4a5b553, vLLM 0.32.1rc1.dev466, torch
+  2.13.0+rocm10.0.0, hip 7.15) serving unmodified published checkpoints. Load-time transforms (dequantize a tensor to bf16 while
+  loading, re-layout) are fine; patching vLLM/ROCm source or binaries or rewriting the checkpoint on disk is not. exllamav3 is a
+  third-party library we link against and read freely. libr4d (radiance) source is never read.
 
-## The checkpoint, as read from the shard headers
+## The checkpoint (read from every shard header: `pack-tensors.json`, summarized in `pack-summary.txt`; base in `base-*`)
 
+config.json (pack): architectures ["DeepseekV41ForCausalLM"], model_type deepseek_v41, text_config: 40 layers, hidden 5120,
+**every layer is MoE** (384 routed experts + 1 shared, 6 a token, moe_intermediate_size 2304, scoring sqrtsoftplus, noaux_tc,
+routed_scaling_factor 1.5, swiglu_limit 10.0), 64 heads x head_dim 512, one KV head, qk_rope 64, q_lora_rank 1280, o_lora_rank 1024,
+o_groups 8, sliding_window 128, compress_ratios (2 on layers 2-19, 1 on 20-39), kv_source_layer_ids [2,8,14,20], indexer 32 heads x
+128, index_topk 512, hc_mult 4 (hyper-connections: the residual stream is 4 x 5120 wide), engram_layer_ids [1,14] (tables of 384.0M
+and 384.0M rows x 256, fp8 + e8m0 scales -- in the BASE checkpoint's shards 47/48 only, ~197 GB), num_nextn_predict_layers 3 with
+the DSpark drafter (block 5, 128 experts, 3 a token, markov rank 256), yarn rope factor 16 to 1,048,576 positions, vocab 129280.
 quantization_config: {"quant_method": "exl3", "version": "1.6.2", "avg_bits": 2.9, "head_bits": 6, "codebook": "mul1",
-"out_scales": "always", "mtp_bits": 4, "original_quantization_config": {fp8 / fp4 experts}}. Config: 40 layers, hidden 5120, 384
-routed experts + 1 shared a layer (first_k_dense_replace 3), 6 experts a token, intermediate 2048 (the pack's expert matrices are
-5120 x 2304: 2304 = 18 x 128, so the quantizer padded 2048 -> 2304 -- confirm against exllamav3's padding rule), MLA with one KV
-head (head_dim 512, qk_rope 64, q_lora 1280, o_lora 1024), compress_ratios 2 on layers 2-19, kv_source_layer_ids [2,8,14,20],
-index_source_layer_ids [2,8,14,20,24,28,32,36], index_topk 512, sliding_window 128, engram layers [1,14] (~197B params, the
-tables come from the BASE checkpoint's shards 47/48, ~203 GB, not in the pack), num_nextn_predict_layers 3 (DSpark: block 5,
-128 experts, 3 a token, target layers 37-39; the pack's `mtp.0.*` tensors at 4-6 bpw).
+"out_scales": "always", "mtp_bits": 4}. `exl3_k_map.json`: routed-expert bits per layer (3, except layers 18-22 at 2).
+The pack has config.json, chat_template.jinja, README.md, exl3_k_map.json, encoding/ (tokenizer code); tokenizer.json +
+tokenizer_config.json come from the base checkpoint (~/ds41/hf/DeepSeek-V4.1-Flash-1017).
 
-Per quantized linear the pack holds four tensors (exllamav3 naming, NOT Hugging Face naming):
-- `<name>.trellis`  int16  [in/16, out/16, 16*K]   (K = bits: 48 -> 3, 32 -> 2 on layers 18-22, 80 -> 5, 64 -> 4, 96 -> 6)
-- `<name>.suh`      f16    [in]    input-side sign/scale vector (applied with the Hadamard rotation of the input)
-- `<name>.svh`      f16    [out]   output-side vector
-- `<name>.mul1`     int32  scalar  codebook marker (mul1 = codebook 2; `mcg` would be codebook 1)
-Examples: `layers.N.ffn.experts.E.w1|w2|w3.*` (w1 = gate, w3 = up: [320,144,K16] i.e. in 5120, out 2304; w2 = down: [144,320,K16]),
-`layers.N.ffn.shared_experts.w1|w2|w3.*`, `layers.N.ffn.gate.weight` f16 [384,5120] + `gate.bias` f16 + `gate.bias_vl` f32,
-`layers.N.ffn_norm.weight` bf16, `embed.weight` bf16 [129280,5120], `mtp.0.ffn.experts.E.*` (128 experts). The attention tensors
-(`layers.N.attn.*`, 5 bpw; indexer `wk` 8 bpw) and the head (6 bpw) are in shards 1 and 43: read their headers before coding.
+**Names are the Hugging Face names** (no `model.` prefix; identical in pack and base) with each quantized linear's `.weight`
+replaced by four tensors, exllamav3 style:
+- `<name>.trellis` int16 [in/16, out/16, 16*K]  K = bits (tile width 48 -> 3, 32 -> 2, 64 -> 4, 80 -> 5, 96 -> 6, 128 -> 8)
+- `<name>.suh` f16 [in]   input-side sign vector (applied with the blockwise 128-point Hadamard rotation of the input)
+- `<name>.svh` f16 [out]  output-side sign/scale vector (applied with the 128-point Hadamard on the output side)
+- `<name>.mul1` int32 []  codebook marker (present = codebook mul1; an `mcg` tensor would mean the other codebook)
+Reconstruction: W = de-Hadamard(trellis-decode) with suh/svh; `ext.reconstruct(unpacked_f16[in,out], trellis, K, mcg, mul1)` is
+the exact dequant (exllamav3/modules/quant/exl3.py `_reconstruct_inner` / `reconstruct_had_slice`). Tiles (16 in x 16 out) decode
+independently; the Hadamard blocks are 128 inputs / 128 outputs, so **any split of a matrix must fall on 128-multiples of the
+split dimension** (and 16 for the tile index).
 
-## Design
+Per layer N (0-39), pack shapes as [in -> out, K]; shard = model-000NN-of-00043:
+- attention (K=5; layer 39's wq_a/wkv at K=6): `attn.wq_a` 5120->1280, `attn.wq_b` 1280->32768 (64 heads x 512), `attn.wkv`
+  5120->512, `attn.wo_a.slice.{0..7}` eight slices 4096->1024 (one per o-group: 8 heads x 512 -> o_lora 1024; the base stores
+  `attn.wo_a.weight` [8192, 4096] = the eight [1024, 4096] slices stacked), `attn.wo_b` 8192->5120; `attn.q_norm.weight` bf16 [1280],
+  `attn.kv_norm.weight` bf16 [512], `attn.attn_sink` f32 [64]; `attn_norm.weight`, `ffn_norm.weight` bf16 [5120]
+- indexer (layers in index_source_layer_ids [2,8,14,20,24,28,32,36]): `attn.indexer.wq_b` 1280->4096 (K=5), `attn.indexer.wk`
+  512->128 (K=8; layers 2,8,14,20 only), `attn.indexer.k_norm.weight` bf16 [128], `attn.indexer.weights_proj.weight` f16 [32, 5120]
+- compressor (kv_source layers 2,8,14,20): `attn.compressor.wkv` 5120->512 (K=5), `attn.compressor.wgate` 5120->512 (K=5; 3 layers),
+  `attn.compressor.norm.weight` bf16 [512]
+- routed experts: `ffn.experts.{0..383}.w1|w3` 5120->2304, `.w2` 2304->5120, K=3 (K=2 on layers 18-22); w1 = gate, w3 = up, w2 = down
+- shared expert: `ffn.shared_experts.w1|w3` 5120->2304, `.w2` 2304->5120, K=5 (21 layers) or 4 (19 layers)
+- router: `ffn.gate.weight` f16 [384, 5120], `ffn.gate.bias` f16 [384], `ffn.gate.bias_vl` f32 [384]
+- hyper-connections f32: `hc_attn_fn` / `hc_ffn_fn` [24, 20480], `hc_attn_base` / `hc_ffn_base` [24], `hc_attn_scale` / `hc_ffn_scale` [3]
+- engram (layers 1, 14): `engram.wkv` 6144->25600 (K=5 / 4), `engram.k_weight`, `engram.q_weight` f32 [4, 5120]; the tables
+  `engram.embed.weight` f8_e4m3 [384M, 256] + `engram.embed.scale` f8_e8m0 [384M, 8] exist only in base shards 47 and 48
+- top level: `embed.weight` bf16 [129280, 5120], `head` 5120->129280 at K=6 (trellis [320, 8080, 96]), `norm.weight` bf16
+- DSpark drafter `mtp.{0,1,2}.*`: attention like a main layer at K=6, `ffn.experts.{0..127}` at K=4, shared expert K=6, `ffn.gate.*`
+  [128, ...], `hc_*`; `mtp.0.main_proj` 15360->5120 (K=6), `mtp.0.main_norm.weight`, `mtp.0.markov_head.embed.weight` bf16
+  [129280, 256], `mtp.0.markov_head.head.weight` f16 [129280, 256], `mtp.0.confidence_head.proj.weight` f16 [1, 5376], `mtp.0.norm.weight`
+- vision tower + aligner (`vision.*`, `aligner.*`, `image_*`) bf16 -- loaded as-is or dropped; text serving does not run them.
 
-1. **Quant method `exl3`** in `r9700_vllm/quant/exl3.py`, registered like our `R9kCompressedTensorsConfig` (see
-   r9700_vllm/__init__.py and r9700_vllm/quant/ for the registration mechanism vLLM uses in this pin). `Exl3Config.from_config`
-   reads the fields above. `get_quant_method`: LinearBase -> `Exl3LinearMethod`; FusedMoE -> `Exl3MoEMethod`; embeddings stay bf16;
-   the LM head gets the linear method with K = head_bits.
-2. **Linear forward** = exllamav3's `ext.exl3_gemm(x_f16, trellis, suh, svh, out, K, mcg, mul1, ...)` -- take the exact call from
-   exllamav3/modules/linear.py (the forward around lines 580-600 and 1010-1020) and its temp-buffer handling; vLLM hands bf16
-   activations: cast to f16 at the boundary (or check whether the kernel has a bf16 path) and cast the output back.
-   Tensor parallel: the output dimension splits by 16-column tiles (trellis dim 1, svh); the INPUT dimension carries the Hadamard
-   rotation in blocks (find the block size in exllamav3 -- 128 is the usual) so a row-parallel split must be a multiple of that
-   block (5120/8 = 640 ok; check every row-parallel input dim of this model at TP8). Where a dim does not divide, replicate that
-   layer across ranks instead of sharding it.
-3. **MoE** = `ext.exl3_moe(...)` exactly as exllamav3/modules/block_sparse_mlp.py calls it (lines ~1300-1345): per-expert pointer
-   tables (trellis/suh/svh device-pointer tensors for gate/up/down), K per matrix, mcg/mul1 flags, the routing in exllamav3's sorted
-   layout (expert_count, token_sorted, weight_sorted) built from vLLM's topk_ids / topk_weights, the temp buffers it sizes. Run the
-   experts **expert-parallel** (vLLM `--enable-expert-parallel`): each rank holds whole experts (384 / 8 = 48 a layer), so no expert
-   matrix is ever split and the Hadamard blocks stay whole; FusedMoE's EP path gives each rank its local experts and reduces the
-   outputs. The shared expert (one a layer, 4-5 bpw) is replicated or sharded by output tiles -- replicate first. Per-rank memory at
-   TP8+EP: experts 48 x 40 x 25.2M params x 3 bits ~ 18 GiB, shared ~0.6 GiB, attention shard ~0.6 GiB, embed/head ~1.8 GiB ->
-   ~21 GiB + KV + activations, inside 32 GiB.
-4. **Loader**: translate exllamav3 names to the vLLM `DeepseekV41ForCausalLM` parameter names (read vLLM's model file in the image:
-   `docker run --rm --entrypoint python3 r9700/vllm:dev -c "import inspect, vllm.model_executor.models.deepseek_v41 as m; print(inspect.getsource(m))"`
-   or wherever this pin keeps it; also its `load_weights` / stacked-params mapping), deliver the four tensors of each linear to the
-   right parameter, handle `mtp.*` for the DSpark drafter and the Engram tables from the base checkpoint (the vLLM engram loader
-   expects the release's names: point `--model` at a directory that holds the pack AND symlinks to the base shards 47/48 with a
-   merged safetensors index, or load them in a second pass). `embed.weight` bf16 maps to the embedding; the head is EXL3 at 6 bits.
-5. **Numerics**: exllamav3 ships `reconstruct` (dequant to f16). Tests: for a dense layer, `x @ reconstruct(W).T` vs
-   `exl3_gemm(x, W)` within f16 tolerance; for the MoE, a one-token routing to a known expert vs the dequantized SiLU-MLP. Then a
-   layer-0 forward of the model on one rank against a CPU/dequantized reference.
-6. **Attention on gfx1201**: whatever the stock DeepseekV41 model does on ROCm; the probe (`~/ds41/probe-stock.sh` on VM100) shows
-   the backend it picks and where it fails; fixes go in our platform plugin the way the GLM MLA prefill fix did
-   (r9700_vllm/platform.py `get_mla_prefill_backend_cls`). Engram offload (`--engram-config {"cpu_offload":true}`) and DSpark
-   (`--speculative-config {"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}` -- AMD must disable
-   adaptive verification) are stock features to verify, not to write.
+## How the pinned vLLM serves this model (source copy: `$TMP/ds41/vllm-src/`, see Paths)
+
+`DeepseekV41ForCausalLM` -> `vllm/models/deepseek_v41/amd/vl_model.py` on ROCm, wrapping `amd/model.py:DeepseekV41LLMForCausalLM`
+(DeepseekV4Model, DeepseekV4DecoderLayer, DeepseekV4MoE(DeepseekV4MoEBase), attention from `attention.py` + `amd/rocm.py`
+(DeepseekV41ROCMAiterMLAAttention, indexer classes), compressor.py, common/engram.py (ParallelEngramEmbedding, cpu_offload through
+`--engram-config '{"cpu_offload": true}'`), the DSpark drafter in `amd/dspark.py` through `--speculative-config
+'{"method": "dspark", ...}'`). The quant config today is `quant_config.py:DeepseekV4FP8Config` (fp8 + fp4 experts) -- every place
+that assumes it is a touch point for us. Loader: `amd/model.py` load_weights (~line 1013: stacked_params_mapping fuses `wq_a`+`wkv`
+-> `fused_wqa_wkv` and `compressor.wkv`+`wgate` -> `compressor.fused_wkv_wgate`; `pad_shared_expert` ~1053; experts through
+`fused_moe_make_expert_params_mapping(..., ckpt_down_proj_name="w2", ...)` ~1168 so `experts.{e}.w1.<t>` -> `experts.w13_<t>` with
+expert_id e and shard "w1"), `_make_deepseek_v4_weights_mapper` ~1211 (regex renames incl. `engram.embed.scale` ->
+`engram.embed_tokens.weight_scale_inv`, `.shared_experts.w2` -> `.down_proj`), `packed_modules_mapping` ~1328, `lm_head =
+ParallelLMHead(..., quant_config)` ~1349. The stock probe of the fp8 checkpoint on VM100 (`~/ds41/probe-stock.sh`, container log
+excerpt in `~/ds41/probe-stock.log` if present) came up through model init on 8 workers with our plugin's glm5next/sparse-MLA
+patches engaged and died loading weights (OOM) -- so the ROCm attention path at least constructs on gfx1201.
+
+## Design decisions (owner)
+
+1. **Quant method `exl3`** registered with `register_quantization_config("exl3")` (a new name; vLLM picks it from the pack's
+   config.json `quant_method`). `Exl3Config.get_quant_method(layer, prefix)`: LinearBase -> `Exl3LinearMethod`; the MoE experts
+   layer -> `Exl3MoEMethod`; `embed_tokens` (VocabParallelEmbedding, bf16) -> stock UnquantizedEmbeddingMethod; `lm_head`
+   (ParallelLMHead) -> **dequantize at load**: `ext.reconstruct` the 6-bit head to f16 [5120, 129280], transpose, take the rank's
+   vocab slice, store as a bf16 ParallelLMHead weight (165 MB a rank; 129280/8 = 16160 is not a 128-multiple so the EXL3 head cannot
+   be vocab-sharded directly, and replicating it costs 0.5 GB a rank plus a redundant 0.5 GB read a step).
+2. **Tensor parallel 8 + expert parallel** (`--enable-expert-parallel`): each rank holds 48 whole routed experts a layer (384/8),
+   no expert matrix is ever split. Attention: `wq_b` column-split by heads (4096 outputs a rank = 32 x 128), `wo_a` rank r = slice r
+   whole (the o_groups=8 design is TP8), `wo_b` row-split (1024 inputs a rank = 8 x 128; output transform per partial then the
+   all-reduce -- linear, so exact), `wq_a` / `wkv` / indexer / compressor replicated (as vLLM already does for MLA). Where vLLM
+   fuses two matrices into one layer (`fused_wqa_wkv`, `fused_wkv_wgate`) the EXL3 method keeps **one sub-matrix per shard** and
+   runs one gemm per shard into the output slice: tiles concatenate along the output dimension, but `suh` is per matrix.
+   **Shared experts**: 2304/8 = 288 is not a 128-multiple -> dequantize at load to bf16 and let stock shard them (8.8 MB a layer a
+   rank, 350 MB a rank total; cheaper in memory and bandwidth than replicating EXL3) -- unless the AMD path fuses the shared expert
+   into the routed experts (`pad_shared_expert`, `DeepseekV4HeterogeneousSharedRoutedExperts`), in which case agent N decides.
+   `engram.wkv`: follow how vLLM shards it (25600/8 = 3200 = 25 x 128 is split-safe).
+3. **Linear forward** (`Exl3LinearMethod.apply`): x bf16 -> f16 (kernel takes kHalf A), `ext.exl3_gemm(A, trellis, C, suh, A_had,
+   svh, force_shape_idx=-1, mcg, mul1, force_num_sms=-1)` with C f16 or f32 (`exllamav3_ext/quant/exl3_gemm.cuh/.cu`; A_had is the
+   caller-provided buffer for the Hadamard-rotated input when suh is given -- read how `linear_bc.h` / `LinearEXL3.bc` fills it),
+   -> bf16. Above exllamav3's AUTO_RECONSTRUCT_THRESHOLD rows (prefill) it dequantizes and runs an f16 GEMM
+   (`reconstruct_hgemm`): mirror that (reconstruct_had_slice / had_r_128 + torch.matmul), threshold from K's microbench. Keep
+   every buffer static and avoid host syncs: vLLM captures decode under HIP graphs; the gemm autotunes shapes on first call, so
+   warm the decode shapes in `process_weights_after_loading` or rely on vLLM's dummy runs (verify).
+4. **MoE forward** (`Exl3MoEMethod.apply`): `ext.exl3_moe(hidden f16, out, expert_count, token_sorted, weight_sorted, temp buffers,
+   act_fn, K_gate, K_up, K_down, nine pointer tables (gate=w1, up=w3, down=w2; int64 device pointers per local expert), six
+   codebook flags, act_limit (swiglu_limit 10.0), num_active, scratch, tables, count_lo, count_hi, m_tile)` exactly as
+   `exllamav3/modules/block_sparse_mlp.py` ~1240-1350 calls it, including its tiering (fused kernel for experts with <= fused_rows
+   tokens, batched reconstruct groups + `exl3_moe_gather` above) and `FusedBuffers` sizing (~740-760); pointer tables built like
+   `modules/multilinear.py`. Routing in: vLLM's topk_ids / topk_weights (global expert ids, 6 a token) -> this rank's local experts
+   (expert_map) -> exllamav3's sorted layout. Output: this rank's partial sums; the FusedMoE layer all-reduces (naive EP).
+5. **Loader** (`r9700_vllm/models/deepseek_v41_exl3.py`): a thin subclass of the stock ROCm model registered for
+   "DeepseekV41ForCausalLM" (ModelRegistry.register_model, the mechanism in `r9700_vllm/models/qwen4_exp.py`), engaged only when the
+   quant config is exl3. Its load_weights renames `attn.wo_a.slice.{g}.<t>` to what the vLLM `wo_a` parameter expects (shard g),
+   passes `<name>.trellis|suh|svh|mul1` through the stock name mapping to parameters named `trellis|suh|svh|mul1` on the target
+   layer (so the stacked mapping delivers `fused_wqa_wkv.trellis` with shard_id 0/1 and the expert mapping delivers
+   `experts.w13_trellis` with expert_id / shard_id), accepts from the base shards only `engram.embed.*`, and drops or forwards
+   `vision.*` / `aligner.*` / `image_*`. Weight loaders stash the per-shard / per-expert tensors (shapes differ per shard, so the
+   named Parameter is a placeholder) and `process_weights_after_loading` builds the contiguous device tensors and pointer tables.
+   The model directory is composed, not copied: `~/models/DeepSeek-V4.1-Flash-1017-EXL3/` = symlinks to the pack's 43 shards,
+   config.json, chat_template.jinja, exl3_k_map.json + base shards 47/48 + base tokenizer.json / tokenizer_config.json
+   (`~/ds41/exl3/compose-model-dir.sh`, idempotent; vLLM globs *.safetensors, so no index file is needed -- verify).
+6. **Numerics gates** before any eight-card run: (a) dense: `x @ reconstruct(W)` vs `exl3_gemm` within f16 tolerance for every
+   distinct (in, out, K) in the model and M in {1, 2, 4, 8, 16, 64, 512, 4096}; (b) MoE: 48 local experts, random routing, vs a
+   per-expert dequantized SiLU-gated MLP reference in f32; (c) the loader's parameter mapping covers every pack tensor name (a dry
+   run over `pack-tensors.json` names: each maps to exactly one parameter or an explicit skip list).
+7. **Attention / Engram / DSpark are stock features to verify, not to write**: Engram host offload, the ROCm sparse MLA + indexer
+   on gfx1201 (our glm5next patch already engages), DSpark with `enable_adaptive_verification: false` (AMD). Fixes, if any, go in
+   `r9700_vllm/platform.py` / `models/glm5next.py` the way the GLM MLA prefill fix did.
+
+## Work packages (parallel; each agent owns only its files)
+
+- **K -- kernels** (VM100 card 7; owns `~/ds41/exl3/kerneltest/`, the derived image `r9700/vllm:exl3`, `notes/exl3-kernels.md`):
+  derived image = r9700/vllm:dev + the wheel (pip install --no-deps; add exllamav3's python deps only if the quantizer is needed
+  for synthetic test tensors); confirm `import exllamav3_ext` and that gfx1201 took the RDNA WMMA path and not an emulation
+  (`rocm/rdna_wmma.cuh` vs `rdna_wmma_emu.cuh`: how does exllamav3 pick for gfx12? RDNA4 WMMA operand layouts differ from RDNA3);
+  numerics gate 6(a) for every (in, out, K) above; `exl3_moe` gate 6(b) at M = 1..64 tokens with 48 experts; timing table (us a
+  call, effective GB/s against the trellis bytes) for decode shapes M = 1, 2, 4, 8 and prefill 512 / 4096; `g_get_num_sms`,
+  `exl3_moe_max_concurrency`, smem; `had_r_128` / `reconstruct` behavior; the AUTO_RECONSTRUCT_THRESHOLD crossover measured.
+- **L -- linear** (card 6; owns `r9700_vllm/quant/exl3.py`, `tests/test_exl3_linear.py`): design 1-3 and 5's placeholder/stash
+  parameter scheme for LinearBase layers (Replicated / ColumnParallel / RowParallel / Merged-stacked), the lm_head dequant path,
+  TP slicing rules with 128-alignment assertions, the gemm + reconstruct_hgemm forward; test on one card with synthetic or real
+  pack tensors (shard 2 holds layers 0-1) against `reconstruct`, including a simulated TP8 split (sum of row-partials == whole).
+- **M -- moe** (card 5; owns `r9700_vllm/quant/exl3_moe.py`, `tests/test_exl3_moe.py`): design 4 and 5's expert stash on this
+  pin's FusedMoE / FusedMoEMethodBase (`vllm-src/model_executor/layers/fused_moe/`), EP local-expert mapping, routing conversion,
+  buffers, prefill tiering; test against the dequantized reference with 48 experts, K=3 and K=2, M = 1..4096.
+- **N -- model** (no GPU until integration; owns `r9700_vllm/models/deepseek_v41_exl3.py`, `~/ds41/exl3/compose-model-dir.sh`,
+  `serve/ds41-exl3.sh`, `notes/exl3-layer-map.md`): the layer map (every linear / MoE / embedding the ROCm model builds, with
+  prefix pattern, in/out, how it is sharded at TP8, and which quant method it asks for), every DeepseekV4FP8Config-specific touch
+  point in `vllm-src/models/deepseek_v41/**` and `deepseek_v4/**` that an exl3 config must satisfy or route around (attributes
+  read off quant_config, isinstance checks, `.weight_scale_inv` reads in indexer/compressor/engram/mono paths, the shared-expert
+  fusion), the loader subclass (design 5) with the name dry run (gate 6c) over `pack-tensors.json`, the composed model dir, the
+  serve recipe (TP=8, EP, engram cpu_offload, DSpark off first, `--max-model-len 32768`, OVERLAYS=emulated-switch, GPUS=0..7,
+  clock offset -500) and how the DSpark drafter would load its `mtp.*` EXL3 tensors.
+
+Interfaces between packages: L exposes `Exl3Config` (registered name "exl3", `from_config`, `get_quant_method`, attributes
+`avg_bits`, `head_bits`, `codebook`, `k_map`), `Exl3LinearMethod`, and helpers `reconstruct_f16(trellis, suh, svh, K, mul1, mcg)
+-> f16 [in, out]`, `k_of(trellis) -> int`, `exl3_gemm_f16(A_f16, trellis, suh, svh, K, mul1, mcg, out_f32: bool) -> C`; M exposes
+`Exl3MoEMethod(moe_config, quant_config)`; N exposes `ARCHS` for `__init__.py` and may ask L/M for hooks through the owner.
+Placeholder stubs for all three live in the repo (branch `exl3`) so imports resolve from the start.
+
+## Paths
+
+- Mgmt VM (this machine, user devops): repo `/home/devops/r9700-stack` on branch `exl3`; `$TMP` = `/home/devops/.claude/jobs/5e4e947f/tmp`:
+  `$TMP/ds41/vllm-src/` (the pin's `vllm` package, .py only), `$TMP/ds41/pack-tensors.json` + `pack-summary.txt` (pack headers),
+  `base-tensors.json` + `base-summary.txt`, `$TMP/ds41/exl3/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw/` (pack config/README/k_map),
+  `$TMP/ds41/hf/DeepSeek-V4.1-Flash-1017/` (base config, index, tokenizer), `$TMP/exl3/exllamav3/` (exllamav3 v1.6.6 source).
+  `~/ds41-tools/exl3-sync.sh` copies the working tree to VM100 `~/r9700-exl3/` (no rsync here; it tars over ssh).
+- VM100 = `devops@192.168.0.123` (ssh BatchMode works; sudo without password; docker). The eight-card box. `~/r9700-build/repo` is
+  the PRODUCTION deploy copy -- never touch it; use `~/r9700-exl3` (synced) with `REPO=~/r9700-exl3`. `~/ds41/exl3/`: pack dir
+  (downloading, ~7 MB/s, marker EXL3_DOWNLOAD_DONE in download.log; shards land as `model-000NN-of-00043.safetensors`), `dist/`
+  (the wheel), `src/exllamav3` (source, hipified in place by the build), `build-full.log`, `tensor-meta.py`. Base checkpoint
+  `~/ds41/hf/DeepSeek-V4.1-Flash-1017` (complete). Images: `r9700/vllm:dev` (serving pin), `r9700/vllm:exl3` once K builds it.
+  `~/ds41/exl3/gpu-run.sh <card> <cmd...>` runs a command in the image on one card with the repo and ~/ds41 mounted (owner-provided).
+  GPU etiquette: K card 7, L card 6, M card 5; cards 0-4 free for the owner; never run on a card someone else owns; an
+  eight-card run needs `bash ~/gpu-offset.sh -500` first (120 V feed). pkill rules: never `pkill -f` a pattern that also appears in
+  your own ssh command line (it kills your shell); use `pkill -f "hf downloa[d]"`-style patterns.
+- Serving: `serve/serve.sh` (knobs in its header; `MODEL=/models/<dir>` with `~/models` mounted; `EXTRA=` appends engine args;
+  `DOCKER_ARGS=` extra docker args; `IMG=`, `REPO=`). `~/probe.py` on VM100 is the chat probe; `bench/` in the repo.
 
 ## Milestones
 
-- M1: exllamav3 wheel for gfx1201 built in the image; its kernel tests pass on an R9700; exl3_gemm / exl3_moe timed at decode shapes.
-- M2: `exl3` quant method loads the pack (TP8 + EP) with the four-tensor mapping; dense and MoE numerics match reconstruct.
-- M3: end-to-end forward (whatever attention stock gives), Engram in host RAM, first tokens; then DSpark; probe numbers.
-- M4: gfx1201 attention path if stock's is slow or absent; sanity, GSM8K, HumanEval, soak; release.
-
-## Where things are (VM100 = devops@192.168.0.123, the eight-card box; the mgmt VM holds the repo at ~/r9700-stack)
-
-- Pack: ~/ds41/exl3/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw (downloading; marker EXL3_DOWNLOAD_DONE in ~/ds41/exl3/download.log).
-- Base checkpoint (Engram shards 47/48): ~/ds41/hf/DeepSeek-V4.1-Flash-1017 (complete, 476 GiB).
-- exllamav3 source: ~/ds41/exl3/src/exllamav3 (v1.6.6); build script ~/ds41/exl3/build-exl3.sh -> ~/ds41/exl3/build.log, wheel dir
-  ~/ds41/exl3/dist. On the mgmt VM a read-only clone sits in the job tmp (exl3/exllamav3).
-- Serving image r9700/vllm:dev (torch 2.13.0+rocm10.0.0, hip 7.15, vLLM 0.32.1rc1.dev466); serve script serve/serve.sh (knobs in
-  its header; EXTRA= appends engine args; DOCKER_ARGS= extra docker args; MODEL=/models/<dir> with ~/models mounted -- bind-mount
-  anything outside ~/models through DOCKER_ARGS). Our test tools: ~/probe.py, bench/ in the repo.
-- GPU etiquette on the shared box: the probe owns cards 0-3 (TP4 launches); kernel tests use card 7 (HIP_VISIBLE_DEVICES=7);
-  never two servers on the same cards; the eight-card clock offset is `bash ~/gpu-offset.sh -500` (0 for four-card Qwen work).
+- M1 wheel + kernel gates (K). M2 quant method + loader mapping, dense and MoE numerics (L, M, N). M3 eight-card load, first
+  tokens, Engram in host RAM, then DSpark (owner). M4 attention path work if needed; sanity, GSM8K, HumanEval, soak; release.
