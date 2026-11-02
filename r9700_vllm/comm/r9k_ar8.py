@@ -19,7 +19,7 @@ fp32 cross step doubles the bytes in flight) -- opt-in; the quality gates (GSM8K
 Since 2026-10-30 the cross step goes through pinned host memory (R9K_AR8_CROSS_HOST, below) from 12 KB.
 
 Large messages (2026-11-02, DeepSeek-V4.1's [tokens, 5120] bf16 at 10-200 tokens a step), above R9K_AR8_SPLIT_KB (32)
-and up to R9K_AR8_HOST_MAX_KB (1536) -- the SPLIT path, one fused kernel (kernels/r9k_ar.hip r9k_ar8_fused):
+and up to R9K_AR8_HOST_MAX_KB (2048) -- the SPLIT path, one fused kernel (kernels/r9k_ar.hip r9k_ar8_fused):
   1. pair reduce-scatter: each member of a pair ends with the pair sum of its half (even: first, odd: second)
   2. each quartet (evens / odds) all-reduces its half through its host pools: write, reduce our quarter, pull
   3. pair all-gather of the two halves
@@ -68,7 +68,7 @@ class R9kAllReduce8:
         # R9K_AR8_PAIR_1S_KB (64): the pair stage is switch-local, where a 32-64 KB one-shot is fine; without it the
         # 4-row verify step's 32 KB ran the pair stage as a 14 us two-shot twice an all-reduce (profile 2026-10-30).
         pair_1s = float(os.environ.get("R9K_AR8_PAIR_1S_KB", "64"))
-        self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "1536")) * 1024)
+        self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "2048")) * 1024)
         # R9K_AR8_PAIR_MAX_KB: the pair stage's two-shot cap; by default it covers every message the host stage takes
         # (x2 for the fp32 working copy), else those sizes would fall to the flat 8-rank kernel.
         pair_max = float(os.environ.get("R9K_AR8_PAIR_MAX_KB", "0")) or \
@@ -88,7 +88,7 @@ class R9kAllReduce8:
         # every DeepSeek-V4.1 step above ~9 tokens on RCCL at 1-2 ms an all-reduce. Since 2026-11-02: one-shot to
         # R9K_AR8_HOST_1S_KB (96), above it the host-memory two-shot (each even writes its own pool, reduces its quarter
         # from the peers' pools, publishes it, pulls the other three: 2.5 S of PCIe a rank) up to R9K_AR8_HOST_MAX_KB
-        # (1536: at 1.28 MB the split path ties RCCL, at 2 MB it loses 4 %); larger messages (prefill) stay on RCCL.
+        # (2048; at 1.28 MB the split path ties RCCL and at 2 MB loses 4 %, not worth a second rule); larger messages (prefill) stay on RCCL.
         # SPLIT (R9K_AR8_SPLIT_KB, 32: the quiet-box sweep of 2026-11-02 -- 8 tokens 78 -> 47 us, 6 tokens 37 us; 64 and 96 lose on 60-90 KB): above it the two pair stages are a pair REDUCE-SCATTER and a pair ALL-GATHER
         # (each moves half the message once instead of the whole message's all-reduce), and the cross stage runs on
         # the halves in BOTH quartets at once -- evens the first half, odds the second, each through its quartet's

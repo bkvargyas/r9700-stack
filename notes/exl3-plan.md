@@ -348,5 +348,5 @@ sweep decides whether the 96 KB defaults move down.
 | 128 | 1280 | 281 | RCCL | 281 | -- |
 | 200 | 2000 | 402 | RCCL | 419 | -- |
 SPLIT_KB 32 and 48 tie (6 tokens 37 us, 8 tokens 47.5); 64 loses at 60 KB (58.5); HOST_1S_KB=48 loses at 80-90 KB (61-66).
-Defaults moved to SPLIT_KB 32 and HOST_MAX_KB 1536 (the split path ties RCCL at 1.28 MB and loses 4 % at 2 MB); the
+Defaults moved to SPLIT_KB 32; HOST_MAX_KB stays 2048 (the split path ties RCCL at 1.28 MB and loses 4 % at 2 MB -- not worth a rule; a 1.5 MB ceiling also sent the test burst's 2 MB message into the flat collective, which has no 4-rank fallback object -- that stray-oversize case now goes to RCCL); the
 three-kernel variant (R9K_AR8_FUSED=0) is 10-45 % slower than the fused kernel at every size.

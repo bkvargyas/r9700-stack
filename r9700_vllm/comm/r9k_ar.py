@@ -564,6 +564,9 @@ class R9kAllReduceN:
         every kernel reads an element of `in` before the same lane writes it, and blocks own disjoint ranges)."""
         nbytes = x.numel() * x.element_size()
         if mode is None and nbytes > self.max_bytes:
+            if self.ar4 is None:                   # callers check should() first; a stray oversize call goes to RCCL
+                dist.all_reduce(x, group=self.group)
+                return x
             return self.ar4.all_reduce(x)
         out = torch.empty_like(x) if out is None else out
         two = (nbytes > self.max1) if mode is None else mode == 2
