@@ -314,7 +314,7 @@ def t_graph(E, cfg, fused):
         fresh = finish(_load_new(ColumnParallelLinear, 2048, 24576, cfg, t))
     for layer, k in ((fresh, 2048), (fused, 5120)):
         ok = True
-        for m in list(range(1, 9)) + [16, 33, 64, 144]:
+        for m in list(range(1, 9)) + [16, 24, 32, 33, 64, 144, 512, 1100]:
             xs = X(m, k, 1000 + m)
             g = torch.cuda.CUDAGraph()
             with torch.cuda.graph(g):
@@ -324,11 +324,12 @@ def t_graph(E, cfg, fused):
                 g.replay()
                 torch.cuda.synchronize()
                 ok &= torch.equal(yg, layer.quant_method.apply(layer, xs))
-        check(f"graph replay == eager (bit-exact) {layer.prefix} M=1..8,16,33,64,144", ok)
+        check(f"graph replay == eager (bit-exact) {layer.prefix} M=1..8,16,24,32,33,64,144,512,1100", ok)
 
 
 def t_graph_unwarmed(E):
-    """Negative control (informational): a never-tuned shape at M=32 captured cold."""
+    """Negative control (informational): why apply never sends 9+ rows to one exl3_gemm -- a single 32-row call on a
+    never-tuned shape takes the autotuned WMMA GEMM, whose first call host-syncs inside the capture."""
     t = make_exl3(3072, 1536, 4, seed=6)
     p = E.Exl3Part(t["trellis"].cuda(), t["suh"].cuda(), t["svh"].cuda(), 4, False, True, 0, 1536)
     a = X(32, 3072, 1).half()
@@ -336,7 +337,8 @@ def t_graph_unwarmed(E):
     g = torch.cuda.CUDAGraph()
     try:
         with torch.cuda.graph(g):
-            y = p.gemm(a, ah)
+            y = torch.empty((32, 1536), dtype=torch.float32, device="cuda")
+            E.ext().exl3_gemm(a, p.trellis, y, p.suh, ah, p.svh, -1, False, True, 0)
         g.replay()
         torch.cuda.synchronize()
         e = rel(y, a.float() @ ref_weight(E, t))
@@ -358,24 +360,62 @@ def bench(fn, it=50):
     return a.elapsed_time(b) * 1000 / it
 
 
+def bench_graph(fn, calls=10, it=20):
+    """us a call with `calls` calls captured in one HIP graph (the GPU cost a graphed decode step sees)."""
+    fn()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(calls):
+            fn()
+    g.replay()
+    torch.cuda.synchronize()
+    a, b = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    a.record()
+    for _ in range(it):
+        g.replay()
+    b.record()
+    torch.cuda.synchronize()
+    del g
+    return a.elapsed_time(b) * 1000 / (it * calls)
+
+
 def t_timing(E, shapes):
-    print("[timing] us a call (one card); gemm f32 C / f16 C; reconstruct+matmul", flush=True)
-    rows = []
+    """apply's paths under a HIP graph: GEMV in 8-row chunks (f32 C) at M <= 64 and the prefill path at M > 8 (plain
+    rotated-basis reconstruct + Hadamards, 1024-row matmul chunks), us a call."""
+    print("[timing] graph, us a call: gemv8 (8-row GEMV chunks) | recon (plain reconstruct + had + chunked mm)",
+          flush=True)
     for (k, n, K) in shapes:
         t = make_exl3(k, n, K, seed=1)
         p = E.Exl3Part(t["trellis"].cuda(), t["suh"].cuda(), t["svh"].cuda(), K, False, True, 0, n)
-        for m in (1, 2, 4, 8, 16, 64, 128, 144, 256, 512, 1024, 4096):
+        cells = []
+        for m in (1, 8, 16, 24, 32, 64, 4096):
             a = X(m, k, m).half()
             ah = torch.empty_like(a)
-            g32 = bench(lambda: p.gemm(a, ah))
-            g16 = bench(lambda: E.exl3_gemm_f16(a, p.trellis, p.suh, p.svh, K, True, False, False, ah)) if m <= 64 \
-                else 0
-            rc = bench(lambda: a @ p.dequant(), it=20)
-            gbs = k * n * K / 8 / (g32 * 1e-6) / 1e9
-            rows.append((k, n, K, m, g32, g16, rc, gbs))
-            print(f"    {k:5d}->{n:5d} K{K} M={m:4d}: gemm f32C {g32:8.1f}  f16C {g16:8.1f}  recon {rc:8.1f}  "
-                  f"({gbs:6.1f} GB/s trellis)", flush=True)
-    return rows
+            g = bench_graph(lambda: p.gemm(a, ah)) if m <= 64 else float("nan")
+            r = bench_graph(lambda: p.recon_mm(a), calls=4 if m > 64 else 10) if m > 8 else float("nan")
+            cells.append(f"M={m} {g:.1f}|{r:.0f}")
+        gbs = k * n * K / 8 / (float(cells[0].split()[1].split("|")[0]) * 1e-6) / 1e9
+        print(f"    {k:5d}->{n:5d} K{K}: " + "  ".join(cells) + f"  (M=1 {gbs:.0f} GB/s trellis)", flush=True)
+
+
+def t_fused(E, shapes):
+    """Prefill crossover plain vs fused reconstruct (both with 1024-row matmul chunks), graph, us a call."""
+    print("[fused] graph, us a call: plain | fused", flush=True)
+    keep = E.FUSED_M, E.FUSED_M_WIDE
+    for (k, n, K) in shapes:
+        t = make_exl3(k, n, K, seed=1)
+        p = E.Exl3Part(t["trellis"].cuda(), t["suh"].cuda(), t["svh"].cuda(), K, False, True, 0, n)
+        cells = []
+        for m in (128, 256, 384, 512, 1024, 2048, 4096):
+            a = X(m, k, m).half()
+            E.FUSED_M = E.FUSED_M_WIDE = 1 << 30
+            pl = bench_graph(lambda: p.recon_mm(a), calls=2, it=10)
+            E.FUSED_M = E.FUSED_M_WIDE = 0
+            fu = bench_graph(lambda: p.recon_mm(a), calls=2, it=10)
+            cells.append(f"M={m} {pl:.0f}|{fu:.0f}")
+        print(f"    {k:5d}->{n:5d} K{K}: " + "  ".join(cells), flush=True)
+    E.FUSED_M, E.FUSED_M_WIDE = keep
 
 
 def t_streams(E):
@@ -412,18 +452,20 @@ def main():
     cfg = E.Exl3Config.from_config({"quant_method": "exl3", "version": "1.6.2", "avg_bits": 2.9, "head_bits": 6,
                                     "codebook": "mul1", "out_scales": "always"})
     shapes = [(5120, 1280, 5), (1280, 32768, 5), (8192, 5120, 5), (5120, 2304, 3)]
-    Ms = [1, 8, 64, 4096]
+    Ms = [1, 8, 13, 32, 64, 1100, 4096]
     print(f"device {torch.cuda.get_device_name()}  RECON_M {E.RECON_M}", flush=True)
     t0 = time.time()
     t_had(E)
     t_reconstruct(E, shapes + [(512, 128, 8), (6144, 25600, 4)])
     t_layers(E, cfg, shapes, Ms)
     t_tp8(E, cfg, Ms)
-    fused = t_stacked(E, cfg, [1, 8, 64, 4096])
+    fused = t_stacked(E, cfg, Ms)
     t_lm_head(E, cfg)
     t_graph(E, cfg, fused)
     if not QUICK:
         t_timing(E, [(5120, 1280, 5), (1280, 4096, 5), (1024, 5120, 5), (4096, 1024, 5), (5120, 512, 5)])
+        t_fused(E, [(5120, 1280, 5), (5120, 2304, 3), (2304, 5120, 3), (1280, 4096, 5), (1280, 32768, 5),
+                    (8192, 5120, 5)])
         t_streams(E)
         print("[graph-cold] negative control", flush=True)
         t_graph_unwarmed(E)
@@ -437,22 +479,33 @@ if __name__ == "__main__":
 
 
 # ------------------------------------------------------------------------------------------------------ numbers
-# VM100 card 6, r9700/vllm:exl3 + exllamav3 1.6.6 wheel, 2026-11-02 (29 checks pass, 16 s):
-#   reconstruct_f16 (f32 rotations) vs reference: 2.1e-4 relative (the f16 rounding); the fused reconstruct_had_slice
-#     kernel the prefill path uses: 9.1e-4.
-#   apply vs x @ W (f32), every layer type / shape / M in {1, 8, 64, 4096}: 1.7e-3 (GEMV, M <= 8) and 1.9e-3
-#     (reconstruct + f16 GEMM); identical for the TP8 column concat / row partial sums, both fused_wqa_wkv shards,
-#     wo_a slices and the shared expert dequantized at TP8. lm_head rows (bf16): 1.7e-3.
-#   HIP graph: capture straight after load replays bit-identical to eager at M = 1..8, 16, 33, 64, 144; a cold
-#     (never-tuned) shape captured at M = 32 invalidates the capture -- the load-time warm-up is required.
-#   Two streams: 0-36 of 3200 concurrent GEMV results wrong (M = 4; rare at M = 1) -- the shared per-device GEMV
-#     parameter block; EXL3 linears must not run on two streams at once.
-#   us a call (gemm f32 C | f16 C | fused reconstruct + matmul); C f32 costs nothing over f16:
-#     5120->1280 K5  M=1 16.7 | 16.5 | 77   M=8 22.9 | 22.8 | 74   M=16 59 | 56 | 73   M=64 254 | 71   M=4096 recon 1604
-#     1280->4096 K5  M=1 14.9 | 15.4 | 55   M=8 20.0 | 19.7 | 55   M=16 45 | 42 | 53   M=64 152 | 57   M=4096 recon 399
-#     1024->5120 K5  M=1 15.9 | 14.4 | 52   M=2 32.7 (GEMV anomaly; M=4 16.8)  M=8 19.8  M=16 44 | 51  M=64 194 | 51
-#     4096->1024 K5  M=1 15.2 | 14.5 | 58   M=8 18.9 | 18.6 | 58   M=16 44 | 42 | 55   M=64 144 | 55   M=4096 recon 506
-#     5120->512  K5  M=1 15.3 | 15.2 | 51   M=8 16.4 | 16.3 | 52   M=16 38 | 39 | 51   M=64 129 | 50   M=4096 recon 183
-#   crossover (gemm | fused recon | plain recon + 2x had_r_128): M=9..16 the cooperative GEMM (41-56 us) still edges the
-#     reconstruct (51-72); M=20 doubles it (67-149) -> RECON_M = 16. engram.wkv's 6144->3200 shard loses already at M=9
-#     (213 vs 157) and its f16 GEMM at M=4096 is slow (11 ms; hipBLASLt on n=3200).
+# VM100 card 6, r9700/vllm:exl3, 2026-11-02, after K's thresholds (RECON_M 32, 8-row GEMV chunks, FUSED_M 1024 /
+# FUSED_M_WIDE 384, 1024-row matmul chunks); 29 checks pass, 13 s:
+#   reconstruct_f16 (f32 rotations) vs reference: 2.1e-4 relative; fused reconstruct_had_slice kernel: 9.1e-4.
+#   apply (bf16 output) vs x @ W in f32, every layer type / shape, M = 1, 8, 13, 32 (GEMV chunks), 64, 1100 (plain
+#     reconstruct), 4096 (fused): 1.7e-3 / 1.7e-3 / 1.9e-3 -- the bf16 output rounding dominates (K measures 2-3e-4
+#     on the f32/f16 C before the cast). Same for TP8 column concat / row partial sums, fused_wqa_wkv (K5 + K6),
+#     wo_a slices, TP8 shared expert (dense). lm_head rows (bf16): 1.7e-3.
+#   HIP graph: capture straight after load replays bit-identical to eager at M = 1..8, 16, 24, 32, 33, 64, 144, 512,
+#     1100. Warm-up = one eager exl3_gemm per part at 1..8 rows (asserting the GEMV took it: tags 90-92). Negative
+#     control: one 32-row exl3_gemm on a cold shape (the autotuned GEMM) invalidates the capture.
+#   Two streams: 0-36 of 3200 concurrent GEMV results wrong (varies by run) -- shared per-device GEMV parameter block.
+#   graph, us a call: 8-row GEMV chunks (f32 C) | plain reconstruct + had_r_128 + chunked matmul
+#                    M=1    M=8    M=16       M=24       M=32       M=64        M=4096
+#     5120->1280 K5  14.3   21.4   41.7 | 53  61.3 | 51  79.4 | 51  157 | 52    - | 628
+#     1280->4096 K5  12.2   18.2   35.6 | 39  51.8 | 38  67.9 | 38  134 | 68    - | 450
+#     1024->5120 K5  12.1   18.0   35.4 | 35  51.2 | 34  67.6 | 34  133 | 35    - | 473
+#     4096->1024 K5  11.4   16.9   33.3 | 44  47.4 | 42  63.0 | 42  125 | 69    - | 572
+#     5120->512  K5   9.6   14.8   29.1 | 43  41.1 | 44  54.6 | 44  109 | 44    - | 249
+#     (M=1: 170-290 GB/s of trellis, cache-assisted.) On these <= 4 MB TP8 shards reconstruct already wins at 24
+#     rows; RECON_M stays 32 (owner's default; R9K_EXL3_RECON_M=16 is the per-shape optimum here).
+#   prefill crossover, graph, us a call, plain | fused (both with 1024-row matmul chunks):
+#                     M=256      M=384      M=512      M=1024       M=2048       M=4096
+#     5120->1280 K5   69 | 82    86 | 96    105 | 112  189 | 177    393 | 326    844 | 639
+#     5120->2304 K3  103 | 136  123 | 152   162 | 191  298 | 316    654 | 619   1417 | 1225
+#     2304->5120 K3  104 | 134  133 | 163   172 | 205  309 | 339    661 | 661   1445 | 1268
+#     1280->4096 K5   99 | 108   83 | 90    101 | 107  138 | 127    294 | 236    644 | 483
+#     1280->32768 K5 448 | 455  606 | 525   815 | 657  2073 | 1044  5591 | 1911 16155 | 3527
+#     8192->5120 K5  377 | 481  446 | 542   539 | 663  1179 | 1192  2532 | 2052  5395 | 3961
+#     -> fused from 1024 rows (even at 1024, fused at 2048+), from 384 rows on 16384+ wide outputs (had_r_128 over the
+#     wide output is the cost). 5120->1280 at 4096 rows: 628 us now vs 1604 unchunked / fused before.

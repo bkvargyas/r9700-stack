@@ -14,10 +14,14 @@ shape check applies. ``process_weights_after_loading`` turns the stash into one 
 rank split is not a 128-multiple (shared experts at TP8: 2304/8 = 288) is dequantized at load to a bf16 ``weight`` and
 runs the stock unquantized GEMM.
 
-Forward (decode, M <= RECON_M): x -> f16, one ``exl3_gemm`` per part into an f32 C, cast into the bf16 output slice.
-RDNA routes M = 1..8 to exllamav3's multi-row GEMV and M > 8 to its cooperative GEMM, which autotunes per (M bucket, k,
-n, K) on first call -- ``process_weights_after_loading`` runs every bucket once so HIP graph capture never autotunes.
-Above RECON_M: dequantize the part to f16 (fused Hadamard reconstruct) + one f16 GEMM, exllamav3's reconstruct_hgemm.
+Forward (decode, M <= RECON_M): x -> f16, ``exl3_gemm`` per part in 8-row chunks into an f32 C, cast into the bf16
+output slice. Rows 1..8 are exllamav3's RDNA multi-row GEMV; a 9+ row call would take its autotuned WMMA trellis GEMM,
+1.4-2.6x slower than 8-row GEMV chunks on gfx1201 and host-syncing on its first call at a new M (which kills a HIP graph
+capture), so it is never called. Above RECON_M (exllamav3's reconstruct_hgemm, notes/exl3-kernels.md): dequantize the
+part to f16 and run hipBLAS in 1024-row chunks (unchunked 4096-row f16 GEMMs fall to 15-31 TFLOPS on some shapes vs
+84-92 chunked) -- the plain decode with the two Hadamards on the activations below FUSED_M rows, exllamav3's fused
+reconstruct_had_slice (original-basis weight, no activation Hadamards) from FUSED_M, and from FUSED_M_WIDE on outputs of
+16384+ columns, where had_r_128 over the wide output is the cost.
 
 Not stream-safe: the RDNA GEMV hands its pointers to the dot kernel through one per-device parameter block, so two EXL3
 GEMMs must never be in flight on two streams of one device (the ROCm DeepSeek-V4 attention's execute_in_parallel
@@ -46,13 +50,15 @@ from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbed
 
 logger = init_logger("vllm.r9700_vllm.exl3")
 
-# Rows above which a linear dequantizes and runs an f16 GEMM. exllamav3 uses 144 (AUTO_RECONSTRUCT_THRESHOLD, tuned on
-# CUDA); on gfx1201 the cooperative GEMM behind M > 8 costs 2-3x the 8-row GEMV and is overtaken by dequant + GEMM above
-# M = 16 on every attention shape (tests/test_exl3_linear.py numbers).
-RECON_M = int(os.environ.get("R9K_EXL3_RECON_M", "16"))
-# One run per exl3_gemm autotune bucket up to RECON_M (exl3_gemm.cu gemm_autotune_hash: pow2 up to 16, then 16-steps
-# capped at 64); 1 and 8 take the GEMV and only allocate its per-device parameter block.
-_WARM_M = (1, 8, 16, 32, 48, 64)
+# Rows above which a linear dequantizes and runs an f16 GEMM (exllamav3's AUTO_RECONSTRUCT_THRESHOLD = 144 is a CUDA
+# number; on gfx1201 8-row GEMV chunks lose to dequant + GEMM from 24-48 rows: notes/exl3-kernels.md "crossover").
+RECON_M = int(os.environ.get("R9K_EXL3_RECON_M", "16"))  # two GEMV chunks still beat the dequant; three do not
+# Rows from which the prefill path takes the fused reconstruct (all widths / outputs >= 16384 wide): measured crossover,
+# tests/test_exl3_linear.py numbers.
+FUSED_M = int(os.environ.get("R9K_EXL3_FUSED_M", "1024"))
+FUSED_M_WIDE = int(os.environ.get("R9K_EXL3_FUSED_M_WIDE", "384"))
+_GEMV_ROWS = 8          # exl3_gemm takes the RDNA GEMV for 1..8 rows (tags 90-92) and the autotuned GEMM above
+_MM_ROWS = 1024         # hipBLAS f16 GEMM row chunk
 _FIELDS = ("trellis", "suh", "svh")
 _DTYPES = {"trellis": torch.int16, "suh": torch.float16, "svh": torch.float16, "mul1": torch.int32, "mcg": torch.int32}
 
@@ -116,15 +122,18 @@ def reconstruct_f16(trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor,
 
 def exl3_gemm_f16(a_f16: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, svh: torch.Tensor, K: int, mul1: bool,
                   mcg: bool = False, out_f32: bool = False, a_had: torch.Tensor | None = None) -> torch.Tensor:
-    """One trellis GEMM: a_f16 [m, in] contiguous -> [m, out] (f16, or f32 when out_f32). ``a_had`` is the kernel's
-    scratch for the rotated input (same shape as a_f16; allocated here when not given)."""
+    """Trellis GEMM through the RDNA GEMV, 8 rows a launch: a_f16 [m, in] contiguous -> [m, out] (f16, or f32 when
+    out_f32). ``a_had`` is the kernel's scratch for the rotated input (same shape as a_f16; allocated when not given).
+    Meant for decode row counts; above RECON_M rows dequantize instead (Exl3Part.recon_mm)."""
     assert K == k_of(trellis) and a_f16.dtype == torch.float16 and a_f16.is_contiguous()
     m = a_f16.shape[0]
     c = torch.empty((m, trellis.shape[1] * 16), dtype=torch.float32 if out_f32 else torch.float16, device=a_f16.device)
     if a_had is None:
         a_had = torch.empty_like(a_f16)
-    # force_num_sms 0 = device default (BC_LinearEXL3 passes 0; a negative value would reach the grid size)
-    ext().exl3_gemm(a_f16, trellis, c, suh, a_had, svh, -1, mcg, mul1, 0)
+    for i in range(0, m, _GEMV_ROWS):
+        j = min(m, i + _GEMV_ROWS)
+        # force_num_sms 0 = device default (-1 would skip the GEMV and the autotuner and set num_sms = -1)
+        ext().exl3_gemm(a_f16[i:j], trellis, c[i:j], suh, a_had[i:j], svh, -1, mcg, mul1, 0)
     return c
 
 
@@ -144,11 +153,31 @@ class Exl3Part:
         return exl3_gemm_f16(a_f16, self.trellis, self.suh, self.svh, self.K, self.mul1, self.mcg, True, a_had)
 
     def dequant(self) -> torch.Tensor:
-        """f16 [in, out] in one kernel (reconstruct_had_slice: decode + both Hadamards + sign vectors; ~1e-3
-        relative). The forward's prefill path, as exllamav3's reconstruct_hgemm at rows >= 1024."""
+        """f16 [in, out] in one kernel (reconstruct_had_slice: decode + both Hadamards + sign vectors; ~9e-4
+        relative, its Hadamards run in f16)."""
         w = torch.empty((self.trellis.shape[0] * 16, self.n), dtype=torch.float16, device=self.trellis.device)
         ext().reconstruct_had_slice(w, self.trellis, self.suh, self.svh, self.K, self.mcg, self.mul1, 0)
         return w
+
+    def recon_mm(self, a_f16: torch.Tensor) -> torch.Tensor:
+        """Prefill: a_f16 [m, in] -> f16 [m, out] through a dequantized weight and hipBLAS in 1024-row chunks. Below the
+        fused crossover the weight stays in the rotated basis (exact decode) and the activations take the Hadamards
+        (had_r_128 in, had_r_128 out: 2e-4 relative); above it the fused kernel's original-basis weight (9e-4)."""
+        m, k = a_f16.shape
+        fused = m >= FUSED_M or (self.n >= 16384 and m >= FUSED_M_WIDE)
+        y = torch.empty((m, self.n), dtype=torch.float16, device=a_f16.device)
+        if fused:
+            w, xs = self.dequant(), a_f16
+        else:
+            xs = torch.empty_like(a_f16)
+            ext().had_r_128(a_f16, xs, self.suh, None, 1.0)
+            w = torch.empty((k, self.n), dtype=torch.float16, device=a_f16.device)
+            ext().reconstruct(w, self.trellis, self.K, self.mcg, self.mul1)
+        for i in range(0, m, _MM_ROWS):
+            torch.matmul(xs[i:i + _MM_ROWS], w, out=y[i:i + _MM_ROWS])
+        if not fused:
+            ext().had_r_128(y, y, None, self.svh, 1.0)
+        return y
 
     def dequant_f32(self) -> torch.Tensor:
         return dequant_f32(self.trellis, self.suh, self.svh, self.K, self.mul1, self.mcg)
@@ -368,15 +397,17 @@ class Exl3LinearMethod(LinearMethodBase):
 
     @staticmethod
     def _warm(layer) -> None:
-        """Every exl3_gemm autotune bucket once per part, so a HIP graph capture never meets a first call."""
+        """One eager exl3_gemm per part and row count 1..8 before any capture: allocates the GEMV's per-device
+        parameter block (a cudaMalloc, not capturable) and asserts every chunk size takes the GEMV (tags 90-92), never
+        the autotuned GEMM whose first call host-syncs."""
         dev = layer.exl3_parts[0].trellis.device
-        for m in _WARM_M:
-            if m > RECON_M:
-                break
+        for m in range(1, _GEMV_ROWS + 1):
             a = torch.zeros((m, layer.exl3_k), dtype=torch.float16, device=dev)
             a_had = torch.empty_like(a)
             for p in layer.exl3_parts:
-                p.gemm(a, a_had)
+                c = torch.empty((m, p.n), dtype=torch.float32, device=dev)
+                tag = ext().exl3_gemm(a, p.trellis, c, p.suh, a_had, p.svh, -1, p.mcg, p.mul1, 0)
+                assert tag in (90, 91, 92), f"exl3 {layer.prefix}: {m} rows took exl3_gemm path {tag}, not the GEMV"
 
     # -------------------------------------------------------------------------------------------------- forward
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
@@ -388,7 +419,7 @@ class Exl3LinearMethod(LinearMethodBase):
         parts = layer.exl3_parts
         recon = m > RECON_M
         if recon:
-            run = lambda p: a @ p.dequant()                      # noqa: E731  (f16 GEMM, f32 accumulate)
+            run = lambda p: p.recon_mm(a)                        # noqa: E731
         else:
             a_had = torch.empty_like(a)
             run = lambda p: p.gemm(a, a_had)                     # noqa: E731
