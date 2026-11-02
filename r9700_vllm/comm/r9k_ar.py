@@ -275,7 +275,8 @@ class R9kAllReduceN:
      128 tok  640 KB   142.1 / 252.0 / 139.9
     1024 tok    5 MB   770.1 /1965.3 /1140.7   (the switch uplinks are the limit; RCCL's ring spreads it better)"""
 
-    def __init__(self, group, device, host: bool = False, one_shot_kb: float | None = None, max_kb: float | None = None):
+    def __init__(self, group, device, host: bool = False, one_shot_kb: float | None = None, max_kb: float | None = None,
+                 sub: bool = False, extra2: int = 0):
         self.disabled = True
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
@@ -297,6 +298,12 @@ class R9kAllReduceN:
             if hasattr(L, fn):
                 getattr(L, fn).restype = ctypes.c_int
                 getattr(L, fn).argtypes = at
+        if hasattr(L, "r9k_ar_twoshot_nrank_m"):
+            L.r9k_ar_twoshot_nrank_m.restype = ctypes.c_int
+            L.r9k_ar_twoshot_nrank_m.argtypes = at + [ctypes.c_int, ctypes.c_int]
+        if hasattr(L, "r9k_ar_twoshot_host_nrank_g"):
+            L.r9k_ar_twoshot_host_nrank_g.restype = ctypes.c_int
+            L.r9k_ar_twoshot_host_nrank_g.argtypes = at + [ctypes.c_int]
         for fn in ("r9k_ar_oneshot_nrank_g", "r9k_ar_twoshot_nrank_g"):
             if not hasattr(L, fn):
                 logger.warning("r9700: libr9k.so predates the fixed-grid all-reduce (%s); TP=%d stays on RCCL", fn,
@@ -320,9 +327,22 @@ class R9kAllReduceN:
         N = self.world_size
         self.slot1 = self.max1 // 16
         self.slot2 = self.max_bytes // 16
+        # Host pools take the host-memory two-shot (kernels/r9k_ar.hip r9k_ar_twoshot_host_nrank): each rank writes
+        # only its own pool and the readers pull, 1 S up + 1.5 S down a rank instead of the generic kernel's 1.5 + 1.5,
+        # and a pool of 2 x 2 slots instead of 2 x (N + 1). R9K_ARN_HOST_2S=0 keeps the generic kernel (A/B).
+        # R9K_ARNH_WPB: words a block per chunk (more blocks = more host reads in flight).
+        self._two_host = self._host and hasattr(L, "r9k_ar_twoshot_host_nrank_g") and \
+            os.environ.get("R9K_ARN_HOST_2S", "1") == "1"
+        if self._host:                                       # the kernel fixes the pool layout: agree on it
+            th = [None] * N
+            dist.all_gather_object(th, self._two_host, group=group)
+            self._two_host = all(th)
+        if self._two_host:
+            self.words_per_block2 = int(os.environ.get("R9K_ARNH_WPB", "512"))
         one = self._share(group, 2 * N * self.max1, N * L.r9k_ar_max_blocks() * 4)
-        two = self._share(group, 2 * (N + 1) * self.max_bytes, N * L.r9k_ar_max_blocks() * 4) \
-            if self.max_bytes > self.max1 else None
+        # extra2: slots of max_bytes appended to the two-shot pool for a caller's own kernel (r9k_ar8_fused)
+        two = self._share(group, ((4 if self._two_host else 2 * (N + 1)) + extra2) * self.max_bytes,
+                          N * L.r9k_ar_max_blocks() * 4) if self.max_bytes > self.max1 else None
         if one is None or (self.max_bytes > self.max1 and two is None):
             logger.warning("r9700: r9k N-rank all-reduce IPC setup failed; staying on RCCL")
             return
@@ -357,7 +377,8 @@ class R9kAllReduceN:
         # 97.62 -> 97.62%, 1/1 discordant, p=1.0, 75% of outputs token-identical). R9K_AR4=0 keeps RCCL.
         # Its constructor is collective (all ranks must take the same branch): R9K_AR4 is read on every rank.
         self.ar4 = None
-        if N == 4 and os.environ.get("R9K_AR4", "1") == "1":
+        # sub=True: a sub-group stage of comm/r9k_ar8.py, which never sends it a message above max_bytes
+        if N == 4 and os.environ.get("R9K_AR4", "1") == "1" and not sub:
             from .r9k_ar4 import R9kAllReduce4
             a4 = R9kAllReduce4(group, device)
             if not a4.disabled:
@@ -506,15 +527,49 @@ class R9kAllReduceN:
             raise RuntimeError(f"r9k_ag_oneshot_nrank failed ({rc}) shape={tuple(x.shape)} dim={dim}")
         return out
 
-    def all_reduce(self, x: torch.Tensor, nb: int | None = None, nt: int = 0, mode: int | None = None) -> torch.Tensor:
-        """mode: None = by size, 1 = force one-shot, 2 = force two-shot (tests/benchmarks)."""
+    def can_split(self) -> bool:
+        """reduce_scatter / all_gather_chunks available (the generic two-shot pool, kernels with modes)."""
+        return not self.disabled and self._sp2 is not None and not self._two_host and \
+            hasattr(self.L, "r9k_ar_twoshot_nrank_m")
+
+    def chunk(self, numel: int, esz: int) -> tuple[int, int]:
+        """(offset, length) in elements of this rank's chunk of a numel-element message in the two-shot kernels."""
+        n16 = numel * esz // 16
+        csz = (n16 + self.world_size - 1) // self.world_size
+        lo = min(self.rank * csz, n16)
+        hi = min(lo + csz, n16)
+        return lo * 16 // esz, (hi - lo) * 16 // esz
+
+    def _two_mode(self, x: torch.Tensor, out: torch.Tensor, mode: int) -> torch.Tensor:
+        nbytes = x.numel() * x.element_size()
+        rc = self.L.r9k_ar_twoshot_nrank_m(
+            self._sp2, self._fp2, self.world_size, self.rank, self._seq2.data_ptr(), self.slot2, x.data_ptr(),
+            out.data_ptr(), x.numel(), _DTYPE[x.dtype], torch.cuda.current_stream().cuda_stream,
+            self.nblocks(nbytes, True), 0, self.drain, self.acq, self.max_nb2 if self._fixed else 0, mode)
+        if rc:
+            raise RuntimeError(f"r9k_ar_twoshot_nrank_m({mode}) failed ({rc})")
+        return out
+
+    def reduce_scatter(self, x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+        """out[chunk(rank)] = the rank-ordered sum of that chunk (one rounding); the rest of out is not written."""
+        return self._two_mode(x, out, 1)
+
+    def all_gather_chunks(self, x: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+        """out = the whole message, chunk(q) taken from rank q's x (each rank's x need only hold its own chunk)."""
+        return self._two_mode(x, torch.empty_like(x) if out is None else out, 2)
+
+    def all_reduce(self, x: torch.Tensor, nb: int | None = None, nt: int = 0, mode: int | None = None,
+                   out: torch.Tensor | None = None) -> torch.Tensor:
+        """mode: None = by size, 1 = force one-shot, 2 = force two-shot (tests/benchmarks). out may be x (in place:
+        every kernel reads an element of `in` before the same lane writes it, and blocks own disjoint ranges)."""
         nbytes = x.numel() * x.element_size()
         if mode is None and nbytes > self.max_bytes:
             return self.ar4.all_reduce(x)
-        out = torch.empty_like(x)
+        out = torch.empty_like(x) if out is None else out
         two = (nbytes > self.max1) if mode is None else mode == 2
         if two:
-            fn, sp, fp, seq, slot = self.L.r9k_ar_twoshot_nrank_g, self._sp2, self._fp2, self._seq2, self.slot2
+            fn = self.L.r9k_ar_twoshot_host_nrank_g if self._two_host else self.L.r9k_ar_twoshot_nrank_g
+            sp, fp, seq, slot = self._sp2, self._fp2, self._seq2, self.slot2
             grid = self.max_nb2
         else:
             fn, sp, fp, seq, slot = self.L.r9k_ar_oneshot_nrank_g, self._sp, self._fp, self._seq, self.slot1

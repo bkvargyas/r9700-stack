@@ -1,7 +1,11 @@
 """Hierarchical 8-rank all-reduce (comm/r9k_ar8.py): correctness and latency vs the flat kernels and RCCL.
-    torchrun --nproc-per-node=8 tests/test_ar8.py        (TOKS=1,2,4 message sizes in tokens x 4096 bf16; BENCH=0 skips timing)
+    torchrun --nproc-per-node=8 tests/test_ar8.py        (BENCH=0 skips timing; TOKS=1,24x5120,... sets the table's
+                                                           sizes, tokens x WIDTH (4096) bf16)
 Checks: every rank's output identical (bit-exact across ranks); within 1 bf16 ulp of the fp32 rank-ordered
-reference (the pair sum is rounded once before the cross step); graph replay of chained calls."""
+reference (the pair sum is rounded once before the cross step); graph replay of chained calls, including mixed
+sizes that switch between the host stage's one-shot and two-shot; a burst of back-to-back calls of varying size
+(ranks drift out of step); every message size routes the same way on every rank (should()/_takes agree);
+DeepSeek-V4.1 sizes [tokens, 5120] up to 400 tokens (4 MB: above R9K_AR8_HOST_MAX_KB, so RCCL)."""
 import os
 import sys
 import time
@@ -35,12 +39,15 @@ def graph_time(fn, reps=50, iters=20):
         for _ in range(iters):
             fn()
     g.replay(); torch.cuda.synchronize()
-    dist.barrier()
-    t = time.perf_counter()
-    for _ in range(reps):
-        g.replay()
-    torch.cuda.synchronize()
-    return (time.perf_counter() - t) / reps / iters * 1e6
+    best = float("inf")
+    for _ in range(int(os.environ.get("TREPS", "3"))):      # best of 3: other jobs on the cards only add time
+        dist.barrier()
+        t = time.perf_counter()
+        for _ in range(reps):
+            g.replay()
+        torch.cuda.synchronize()
+        best = min(best, (time.perf_counter() - t) / reps / iters * 1e6)
+    return best
 
 
 def main():
@@ -78,52 +85,114 @@ def main():
             print(f"{name}: cross-rank identical={same} within {ulps} ulp={ok} max|diff|={diff.max().item():.3g}", flush=True)
         bad += (not same) + (not ok)
 
-    for it, n in enumerate((4096, 8192, 4096 * 4, 4096 * 16)):
-        x = inp(rank, it, n, torch.bfloat16, dev)
-        assert ar8._takes(x), f"ar8 does not take n={n}"
-        check(f"eager n={n}", ar8.all_reduce(x), ref(world, it, n, torch.bfloat16, dev), ulps=TOL)
-    # graph replay of chained calls (decode runs inside HIP graphs)
-    xs = [inp(rank, 100 + r, 4096, torch.bfloat16, dev) for r in range(3)]
-    for x in xs:
-        ar8.all_reduce(x)
-    torch.cuda.synchronize()
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        ys = [ar8.all_reduce(x) for x in xs]
-        y2 = ar8.all_reduce(ys[0])
-    for _ in range(3):
-        g.replay()
-    torch.cuda.synchronize()
-    for r, y in enumerate(ys):
-        check(f"graph {r}", y, ref(world, 100 + r, 4096, torch.bfloat16, dev), ulps=TOL)
-    check("graph chained", y2, ref(world, 100, 4096, torch.bfloat16, dev).float().mul(world).to(torch.bfloat16), ulps=2 * TOL)
-    # all-gather: vLLM concat semantics along dim=-1, TP rank order (logits: [tokens, vocab/8] bf16 per rank)
-    os.environ.setdefault("R9K_AG_MAX_KB", "1024")
-    for rows, cols in ((1, 19360), (4, 19360), (2, 4096)):
-        x = inp(rank, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols)
-        want = torch.cat([inp(q, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols) for q in range(world)], dim=-1)
-        if ar8._ag_takes(x, -1):
-            got = ar8.all_gather(x, -1)
-            ok = torch.equal(got, want)
-            if rank == 0:
-                print(f"ag8 [{rows}, {cols}] -> {tuple(got.shape)}: {'OK' if ok else 'MISMATCH'}", flush=True)
-            bad += (not ok)
-        elif rank == 0:
-            print(f"ag8 [{rows}, {cols}]: not taken (caps: pair ag_max {ar8.pair.ag_max >> 10} KiB)", flush=True)
+    if os.environ.get("CHECK", "1") == "1":       # CHECK=0: timing only (e.g. against an older ar8)
+        for it, n in enumerate((4096, 8192, 4096 * 4, 4096 * 16)):
+            x = inp(rank, it, n, torch.bfloat16, dev)
+            assert ar8._takes(x), f"ar8 does not take n={n}"
+            check(f"eager n={n}", ar8.all_reduce(x), ref(world, it, n, torch.bfloat16, dev), ulps=TOL)
+        # DeepSeek-V4.1 decode / verify sizes: [tokens, 5120] bf16, through the host stage's one-shot (<= 96 KB) and
+        # two-shot (above) up to R9K_AR8_HOST_MAX_KB; 400 tokens (4 MB) must be declined (RCCL)
+        for tok in (1, 9, 10, 24, 64, 100, 200, 400):
+            n = tok * 5120
+            x = inp(rank, 200 + tok, n, torch.bfloat16, dev)
+            takes = ar8.should(x) and ar8._takes(x)
+            allt = [None] * world
+            dist.all_gather_object(allt, takes)
+            if len(set(allt)) != 1:
+                bad += 1
+                if rank == 0:
+                    print(f"ds41 {tok} tok: ROUTING DISAGREES across ranks {allt}", flush=True)
+                continue
+            if not takes:
+                if rank == 0:
+                    print(f"ds41 {tok} x 5120 ({n * 2 >> 10} KiB): declined (RCCL)", flush=True)
+                continue
+            check(f"ds41 eager {tok} x 5120 ({n * 2 >> 10} KiB)", ar8.all_reduce(x), ref(world, 200 + tok, n, torch.bfloat16, dev),
+                  ulps=TOL)
+        # burst: back-to-back calls of varying size with no host sync in between (double buffering, one-/two-shot pools)
+        sizes = [5120 * t for t in (24, 1, 200, 10, 64, 2, 100, 24, 200, 4, 64, 9)]
+        outs = [ar8.all_reduce(inp(rank, 600 + i, n, torch.bfloat16, dev)) for i, n in enumerate(sizes)]
+        for i, (n, y) in enumerate(zip(sizes, outs)):
+            check(f"burst {i} n={n}", y, ref(world, 600 + i, n, torch.bfloat16, dev), ulps=TOL)
+        # graph replay of chained calls (decode runs inside HIP graphs)
+        xs = [inp(rank, 100 + r, 4096, torch.bfloat16, dev) for r in range(3)]
+        for x in xs:
+            ar8.all_reduce(x)
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            ys = [ar8.all_reduce(x) for x in xs]
+            y2 = ar8.all_reduce(ys[0])
+        for _ in range(3):
+            g.replay()
+        torch.cuda.synchronize()
+        for r, y in enumerate(ys):
+            check(f"graph {r}", y, ref(world, 100 + r, 4096, torch.bfloat16, dev), ulps=TOL)
+        check("graph chained", y2, ref(world, 100, 4096, torch.bfloat16, dev).float().mul(world).to(torch.bfloat16), ulps=2 * TOL)
+        # the same at DeepSeek-V4.1 sizes, mixed: two-shot / one-shot / two-shot of a different size / chained two-shot
+        gsz = [5120 * t for t in (64, 4, 200, 24)]
+        xs = [inp(rank, 700 + r, n, torch.bfloat16, dev) for r, n in enumerate(gsz)]
+        for x in xs:
+            ar8.all_reduce(x)
+        torch.cuda.synchronize()
+        g2 = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g2):
+            ys = [ar8.all_reduce(x) for x in xs]
+            y2 = ar8.all_reduce(ys[0].mul(0.125))
+        for _ in range(5):
+            g2.replay()
+        torch.cuda.synchronize()
+        for r, (n, y) in enumerate(zip(gsz, ys)):
+            check(f"graph ds41 {n // 5120} tok", y, ref(world, 700 + r, n, torch.bfloat16, dev), ulps=TOL)
+        # chained: the input is the (identical) all-reduced result / 8 on every rank -> want 8 x that, i.e. the result back
+        check("graph ds41 chained", y2, ys[0].float().mul(0.125).to(torch.bfloat16).float().mul(world).to(torch.bfloat16),
+              ulps=TOL)
+        # all-gather: vLLM concat semantics along dim=-1, TP rank order (logits: [tokens, vocab/8] bf16 per rank)
+        os.environ.setdefault("R9K_AG_MAX_KB", "1024")
+        for rows, cols in ((1, 19360), (4, 19360), (2, 4096)):
+            x = inp(rank, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols)
+            want = torch.cat([inp(q, 3000 + rows, rows * cols, torch.bfloat16, dev).view(rows, cols) for q in range(world)], dim=-1)
+            if ar8._ag_takes(x, -1):
+                got = ar8.all_gather(x, -1)
+                ok = torch.equal(got, want)
+                if rank == 0:
+                    print(f"ag8 [{rows}, {cols}] -> {tuple(got.shape)}: {'OK' if ok else 'MISMATCH'}", flush=True)
+                bad += (not ok)
+            elif rank == 0:
+                print(f"ag8 [{rows}, {cols}]: not taken (caps: pair ag_max {ar8.pair.ag_max >> 10} KiB)", flush=True)
     if rank == 0:
         print("RESULT", "PASS" if bad == 0 else f"FAIL ({bad})", flush=True)
     if os.environ.get("BENCH", "1") == "1":
         if rank == 0:
-            print(f"{'tokens':>7} {'KiB':>6} {'rccl':>8} {'flat-1s':>8} {'flat-2s':>8} {'ar8':>8}  (us, HIP graphs)", flush=True)
-        for tok in [int(t) for t in os.environ.get("TOKS", "1,2,4").split(",")]:
-            n = 4096 * tok
+            print(f"{'tokens':>7} {'width':>6} {'KiB':>6} {'rccl':>8} {'flat-1s':>8} {'flat-2s':>8} {'ar8':>8} {'cross':>8}"
+                  "  (us, HIP graphs, best of 3; ar8 - = declined -> RCCL; cross = the host stage alone: evens on the whole message, or both quartets on the halves in the split path)", flush=True)
+        dflt = "1,2,4,8x5120,9x5120,10x5120,16x5120,24x5120,32x5120,64x5120,100x5120,128x5120,200x5120,400x5120"
+        for spec in os.environ.get("TOKS", dflt).split(","):
+            tok, _, w = spec.partition("x")
+            tok, w = int(tok), int(w or 4096)
+            n = w * tok
             x = inp(rank, 500 + tok, n, torch.bfloat16, dev)
+            nb = n * 2
             t_rccl = graph_time(lambda: dist.all_reduce(x.clone()))
-            t_1s = graph_time(lambda: flat.all_reduce(x, mode=1)) if n * 2 <= flat.max1 else float("nan")
-            t_2s = graph_time(lambda: flat.all_reduce(x, mode=2))
-            t_8 = graph_time(lambda: ar8.all_reduce(x))
+            t_1s = graph_time(lambda: flat.all_reduce(x, mode=1)) if nb <= flat.max1 else float("nan")
+            t_2s = graph_time(lambda: flat.all_reduce(x, mode=2)) if nb <= min(flat.max_bytes, 512 << 10) else float("nan")
+            t_8 = graph_time(lambda: ar8.all_reduce(x)) if ar8.should(x) and ar8._takes(x) else float("nan")
+            t_c = float("nan")
+            if ar8.host_on and getattr(ar8, "split", False) and ar8.split_min < nb <= ar8.host_max:
+                off, ln = ar8.pair.chunk(n, 2)
+                xh = x[off:off + ln]
+                tc = graph_time(lambda: ar8.cross_host.all_reduce(xh))      # both quartets, on the halves
+                ts = [None] * world
+                dist.all_gather_object(ts, tc)
+                t_c = max(ts)
+            elif ar8.host_on and hasattr(ar8, "split") and ar8.host_min <= nb <= min(ar8.host_max, ar8.cross_host.max_bytes):
+                tc = graph_time((lambda: ar8.cross_host.all_reduce(x)) if ar8.pair_pos == 0 else (lambda: None))
+                ts = [None] * world
+                dist.all_gather_object(ts, tc)
+                t_c = max(t for t in ts if t is not None)
             if rank == 0:
-                print(f"{tok:>7} {n * 2 // 1024:>6} {t_rccl:>8.1f} {t_1s:>8.1f} {t_2s:>8.1f} {t_8:>8.1f}", flush=True)
+                f = lambda v: f"{v:>8.1f}" if v == v else f"{'-':>8}"
+                print(f"{tok:>7} {w:>6} {nb // 1024:>6} {t_rccl:>8.1f} {f(t_1s)} {f(t_2s)} {f(t_8)} {f(t_c)}", flush=True)
         xg = inp(rank, 4000, 19360, torch.bfloat16, dev).view(1, 19360)
         if ar8._ag_takes(xg, -1):
             t_ag_flat = graph_time(lambda: flat.all_gather(xg, -1)) if flat.should_ag(xg, -1) else float("nan")
@@ -132,6 +201,46 @@ def main():
             t_ag_rccl = graph_time(lambda: dist.all_gather(out_r, xg))
             if rank == 0:
                 print(f"all-gather [1, 19360] bf16 (38 KB/rank): rccl {t_ag_rccl:.1f}  flat-ag {t_ag_flat:.1f}  ag8 {t_ag8:.1f} us", flush=True)
+    if os.environ.get("PARTS", "0") == "3":
+        # stage costs at DeepSeek-V4.1 sizes: pair all-reduce, the evens' host cross stage, both quartets' host cross
+        # stages on half the message at once (one per quartet), the pair all-gather of the halves
+        for tok in [int(t) for t in os.environ.get("PTOKS", "8,16,24,64,100,200").split(",")]:
+            n = tok * 5120
+            x = inp(rank, 950 + tok, n, torch.bfloat16, dev)
+            h = x[: n // 2].contiguous()
+            buf = torch.empty_like(x)
+            cap = ar8.cross_host.max_bytes
+            rows = [("pair AR", lambda: ar8.pair.all_reduce(x)),
+                    ("pair RS", lambda: ar8.pair.reduce_scatter(x, buf)),
+                    ("pair AG chunks", lambda: ar8.pair.all_gather_chunks(x, buf)),
+                    ("pair RS + AG", lambda: (ar8.pair.reduce_scatter(x, buf), ar8.pair.all_gather_chunks(buf))),
+                    ("cross evens S", (lambda: ar8.cross_host.all_reduce(x)) if ar8.pair_pos == 0 and n * 2 <= cap
+                     else (lambda: None)),
+                    ("cross evens S/2", (lambda: ar8.cross_host.all_reduce(h)) if ar8.pair_pos == 0 else (lambda: None)),
+                    ("cross both quartets S/2", lambda: ar8.cross_host.all_reduce(h)),
+                    ("ar8", lambda: ar8.all_reduce(x))]
+            for name, fn in rows:
+                t = graph_time(fn)
+                ts = [None] * world
+                dist.all_gather_object(ts, t)
+                if rank == 0:
+                    print(f"  {tok:4d} tok {n * 2 >> 10:5d} KiB  {name:28s} {max(ts):8.1f} us", flush=True)
+    if os.environ.get("PARTS", "0") == "4":
+        # the pair stage alone: one-shot / two-shot by size and block count
+        for kb in (8, 16, 32, 64, 80, 128, 256, 512):
+            n = kb * 512
+            x = inp(rank, 970 + kb, n, torch.bfloat16, dev)
+            row = []
+            for mode, nb in ((1, None), (2, None), (2, 4), (2, 8), (2, 16)):
+                if mode == 1 and n * 2 > ar8.pair.max1:
+                    row.append(float("nan")); continue
+                t = graph_time(lambda: ar8.pair.all_reduce(x, mode=mode, nb=nb))
+                ts = [None] * world
+                dist.all_gather_object(ts, t)
+                row.append(max(ts))
+            if rank == 0:
+                print(f"  pair {kb:4d} KiB  1s {row[0]:7.1f}  2s {row[1]:7.1f}  2s/nb4 {row[2]:7.1f}  2s/nb8 {row[3]:7.1f}"
+                      f"  2s/nb16 {row[4]:7.1f} us", flush=True)
     if os.environ.get("PARTS", "0") in ("1", "2"):
         # component timing: where does the composed cost come from?
         n = 4096

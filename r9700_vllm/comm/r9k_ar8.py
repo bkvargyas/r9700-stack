@@ -15,11 +15,23 @@ Measured 22 us for 8 KB bf16 (H2 in tests/test_ar8.py). Every sub-collective sum
 rounds once, so all eight outputs are bit-identical. The bf16 message is rounded after step 1 and after step 2 (two
 roundings; the flat kernels round once, RCCL's ring seven times). R9K_AR8_FP32=1 runs steps 1-2 on an fp32 copy
 and casts once before step 3: bit-identical to the flat kernel's rank-ordered sum, but 45 us instead of 22 (the
-fp32 cross step doubles the bytes in flight) -- opt-in; the quality gates (GSM8K / sanity) judge the bf16 default. Messages above the sub-group caps fall back to the flat instance (two-shot), as do the
-all-gathers. R9K_AR8=0 keeps the flat kernel.
+fp32 cross step doubles the bytes in flight) -- opt-in; the quality gates (GSM8K / sanity) judge the bf16 default.
+Since 2026-10-30 the cross step goes through pinned host memory (R9K_AR8_CROSS_HOST, below) from 12 KB.
+
+Large messages (2026-11-02, DeepSeek-V4.1's [tokens, 5120] bf16 at 10-200 tokens a step), above R9K_AR8_SPLIT_KB (96)
+and up to R9K_AR8_HOST_MAX_KB (2048) -- the SPLIT path, one fused kernel (kernels/r9k_ar.hip r9k_ar8_fused):
+  1. pair reduce-scatter: each member of a pair ends with the pair sum of its half (even: first, odd: second)
+  2. each quartet (evens / odds) all-reduces its half through its host pools: write, reduce our quarter, pull
+  3. pair all-gather of the two halves
+The pair traffic (GPU <-> switch links) overlaps the cross traffic (the switch's uplink) sub-step by sub-step. Same two
+roundings in the same order as the small path, so the bits are those of the three-stage composition. Per uplink the
+cross step moves 1 S up / 1.5 S down, the all-reduce floor for four switches with GPU-side sums. Measured (HIP graphs,
+us, tests/test_ar8.py): 240 KB 83 (RCCL 124), 640 KB 157 (182), 1 MB 230 (240), 2 MB 418 (402). Larger messages
+(prefill) and anything this object declines run on RCCL (should() is False); R9K_AR8=0 keeps the flat kernel.
 """
 from __future__ import annotations
 
+import ctypes
 import os
 
 import torch
@@ -46,7 +58,7 @@ class R9kAllReduce8:
         self.cross_kb = int(float(os.environ.get("R9K_AR8_CROSS_KB", "8")) * 1024)
         # above this the hierarchy loses to RCCL (64 KB: 157 us sliced vs RCCL 104) and so does the flat two-shot (449):
         # should() declines and vLLM's communicator runs the message on RCCL. Only this 8-rank object looks at it.
-        self.max_kb = int(float(os.environ.get("R9K_AR8_MAX_KB", "40")) * 1024)
+        self.max_kb = self.max_kb_env = int(float(os.environ.get("R9K_AR8_MAX_KB", "40")) * 1024)
         g = dist.get_process_group_ranks(group)           # global ranks of the TP group, in TP-rank order
         # every rank must create every sub-group (new_group is collective over the world); keep ours
         pairs = [dist.new_group(ranks=[g[2 * i], g[2 * i + 1]], backend="gloo") for i in range(4)]
@@ -56,47 +68,105 @@ class R9kAllReduce8:
         # R9K_AR8_PAIR_1S_KB (64): the pair stage is switch-local, where a 32-64 KB one-shot is fine; without it the
         # 4-row verify step's 32 KB ran the pair stage as a 14 us two-shot twice an all-reduce (profile 2026-10-30).
         pair_1s = float(os.environ.get("R9K_AR8_PAIR_1S_KB", "64"))
-        self.pair = R9kAllReduceN(pairs[self.rank // 2], device, one_shot_kb=pair_1s)
-        # the odd quartet's group exists (new_group is collective) but never carries traffic
+        self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "2048")) * 1024)
+        # R9K_AR8_PAIR_MAX_KB: the pair stage's two-shot cap; by default it covers every message the host stage takes
+        # (x2 for the fp32 working copy), else those sizes would fall to the flat 8-rank kernel.
+        pair_max = float(os.environ.get("R9K_AR8_PAIR_MAX_KB", "0")) or \
+            max(float(os.environ.get("R9K_ARN_MAX_KB", "512")), self.host_max / 1024 * (2 if self.fp32 else 1))
+        self.pair = R9kAllReduceN(pairs[self.rank // 2], device, one_shot_kb=pair_1s, max_kb=pair_max, sub=True,
+                                  extra2=4)          # [6 s, 10 s): r9k_ar8_fused's RS / AG areas
+        # R9K_AR8_PAIR_WPB: the pair two-shot's words a block per chunk. The N-rank default (1024) gives an 80 KB pair
+        # message 2 blocks and 38 us; 8+ blocks take 14 us (tests/test_ar8.py PARTS=4, 2026-11-02).
+        self.pair.words_per_block2 = int(os.environ.get("R9K_AR8_PAIR_WPB", "256"))
+        # the odd quartet carries traffic only in the split path (its host pools; never peer writes)
         # R9K_AR8_CROSS_HOST (default 1; 0 keeps peer writes): a second cross object whose pools sit in pinned host memory, so the evens
         # push over one link to the host each instead of across four root complexes, where the peer stores stall
         # (the cliff above). Measured 2026-10-30 (tests/test_ar8.py, us, whole message): 8 KB 31.6 (P2P 21.6),
         # 16 KB 35.9 (41.6), 32 KB 47.4 (71.7), 64 KB 60.3 (RCCL 107). So messages from R9K_AR8_HOST_MIN_KB (12) up
-        # take the host stage whole (one-shot to R9K_AR8_HOST_1S_KB, 128) up to R9K_AR8_HOST_MAX_KB (96): at 128 KB the
-        # host path (103-148 us) no longer beats RCCL (109) and four-stream steps (16 rows) lost 5-10% with it, so 128 KB
-        # and up stay on RCCL; 1-row messages keep P2P. GLM TP8 2026-10-30: 86.5 -> 100-102 tok/s single stream.
-        self.cross = R9kAllReduceN(crosses[0], device) if self.pair_pos == 0 else None
+        # take the host stage whole; 1-row messages keep P2P. GLM TP8 2026-10-30: 86.5 -> 100-102 tok/s single stream.
+        # To 2026-11-01 the stage stopped at 96 KB (the one-shot moves 3 S a rank and lost to RCCL at 128 KB), which put
+        # every DeepSeek-V4.1 step above ~9 tokens on RCCL at 1-2 ms an all-reduce. Since 2026-11-02: one-shot to
+        # R9K_AR8_HOST_1S_KB (96), above it the host-memory two-shot (each even writes its own pool, reduces its quarter
+        # from the peers' pools, publishes it, pulls the other three: 2.5 S of PCIe a rank) up to R9K_AR8_HOST_MAX_KB
+        # (2048); larger messages (prefill) stay on RCCL.
+        # SPLIT (R9K_AR8_SPLIT_KB, 96): above it the two pair stages are a pair REDUCE-SCATTER and a pair ALL-GATHER
+        # (each moves half the message once instead of the whole message's all-reduce), and the cross stage runs on
+        # the halves in BOTH quartets at once -- evens the first half, odds the second, each through its quartet's
+        # host pools. The host path has no cross-root-complex stores, so the odds may send too; the two GPUs of a
+        # switch share its uplink, which still carries 1 S up / 1.5 S down, but their two links issue it. Same
+        # roundings as the whole-message path (pair sum, then the four pair sums in rank order), same bits.
+        self.cross = R9kAllReduceN(crosses[0], device, sub=True) if self.pair_pos == 0 else None
         # Every rank must route a message the same way (an even in the ar8 kernels while its odd runs RCCL is a
         # deadlock -- 2026-10-30), so the host stage's existence and caps are agreed over the whole group and the
         # size rules below read only group-wide state (host_on, host_min, host_max), never the evens' objects.
         self.cross_host = None
         self.host_min = int(float(os.environ.get("R9K_AR8_HOST_MIN_KB", "12")) * 1024)
-        self.host_max = int(float(os.environ.get("R9K_AR8_HOST_MAX_KB", "96")) * 1024)
         self.host_on = False
+        self.split_min = int(float(os.environ.get("R9K_AR8_SPLIT_KB", "96")) * 1024)
+        self.split = os.environ.get("R9K_AR8_SPLIT", "1") == "1" and not self.fp32 and self.split_min < self.host_max \
+            and self.pair.can_split()
         if os.environ.get("R9K_AR8_CROSS_HOST", "1") == "1":
-            h1 = float(os.environ.get("R9K_AR8_HOST_1S_KB", "128"))
-            ch = R9kAllReduceN(crosses[0], device, host=True, one_shot_kb=h1, max_kb=self.host_max / 1024) \
-                if self.pair_pos == 0 else None
-            ok_h = ch is None or not ch.disabled
+            h1 = float(os.environ.get("R9K_AR8_HOST_1S_KB", "96"))
+            # pool cap: whole messages to split_min, halves above it (+16 bytes: an odd number of words)
+            hcap = max(self.split_min, (self.host_max + 1) // 2 + 16) if self.split else self.host_max
+            # every rank builds its quartet's host stage: the odds carry the second halves in the split path
+            ch = R9kAllReduceN(crosses[self.pair_pos], device, host=True, one_shot_kb=h1, max_kb=hcap / 1024, sub=True)
+            ok_h = not ch.disabled
             oks_h = [None] * self.world_size
-            dist.all_gather_object(oks_h, ok_h, group=group)
-            if all(oks_h):
+            # the evens must also agree on the one-shot / two-shot boundary (each picks it locally per message)
+            dist.all_gather_object(oks_h, (ok_h, ch.max1 if ok_h else None, self.split), group=group)
+            if all(o[0] for o in oks_h) and len({o[1] for o in oks_h}) == 1:
+                self.split = all(o[2] for o in oks_h)
                 self.cross_host = ch
                 self.host_on = True
-                self.max_kb = max(self.max_kb, self.host_max)
             else:
                 logger.warning("r9700: ar8 host-memory cross stage unavailable on some rank; peer-write cross stage kept")
+        if not self.host_on:
+            self.split = False
+        # R9K_AR8_FUSED (1): the split path as one kernel (kernels/r9k_ar.hip r9k_ar8_fused), whose role blocks
+        # overlap the pair traffic with the cross traffic; 0 = three kernels. R9K_AR8_FUSED_K / _W: sub-steps a lane
+        # (8) and words a sub-step per part (512), which set the lanes (2 MB: 458 us at 8 x 256, 418 at 8 x 512, 530
+        # at 2 x 512). The kernel addresses both pools by fixed offsets, so the pool sizes must match across the
+        # pair and the quartet (agreed below).
+        L = self.pair.L
+        fz = self.split and os.environ.get("R9K_AR8_FUSED", "1") == "1" and hasattr(L, "r9k_ar8_fused") \
+            and self.pair.can_split() and self.cross_host is not None and self.cross_host._two_host
+        if fz:
+            L.r9k_ar8_fused.restype = ctypes.c_int
+            L.r9k_ar8_fused.argtypes = [ctypes.POINTER(ctypes.c_long)] * 4 + [ctypes.c_int] + [ctypes.c_long] * 6 + \
+                [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 3
+            L.r9k_ar8_fused_lanes.restype = ctypes.c_int
+        fzs = [None] * self.world_size
+        dist.all_gather_object(fzs, (fz, self.pair.slot2 if fz else 0, self.cross_host.slot2 if fz else 0), group=group)
+        self.fused = all(f[0] for f in fzs) and len({f[1:] for f in fzs}) == 1
+        if self.fused:
+            self._fseq = torch.zeros(5 * L.r9k_ar8_fused_lanes(), dtype=torch.int32, device=self.pair.device)
+            self._flanes = L.r9k_ar8_fused_lanes()
+            self._fk = int(os.environ.get("R9K_AR8_FUSED_K", "8"))
+            self._fw = int(os.environ.get("R9K_AR8_FUSED_W", "512"))
         ok = not self.pair.disabled and (self.cross is None or not self.cross.disabled)
         oks = [None] * self.world_size
-        dist.all_gather_object(oks, ok, group=group)
-        if not all(oks):
+        dist.all_gather_object(oks, (ok, self.pair.max_bytes, self.host_max, self.split_min, self.host_min), group=group)
+        if not all(o[0] for o in oks):
             logger.warning("r9700: ar8 sub-group setup failed on some rank; flat kernel kept")
             return
+        # group-wide caps for the size rules (a rank with a different environment must still route like the others)
+        self.pair_cap = min(o[1] for o in oks)
+        self.host_max = min(o[2] for o in oks)
+        self.split_min = min(o[3] for o in oks)
+        self.host_min = min(o[4] for o in oks)
+        if self.host_on:
+            self.max_kb = max(self.max_kb_env, self.host_max)
         self._zeros: dict = {}
+        # the odd's zero contribution to the last pair stage: one buffer of the largest message, allocated before any
+        # graph capture (a buffer grown later would leave captured graphs pointing at freed memory)
+        self._zbuf = torch.zeros(self.pair_cap, dtype=torch.uint8, device=self.pair.device) if self.pair_pos else None
         self.disabled = False
-        logger.info("r9700: ar8 hierarchical all-reduce installed (rank %d: pair %d, %s, %s intermediate)", self.rank,
-                    self.rank // 2, "cross-chain sender" if self.pair_pos == 0 else "idle in the cross step",
-                    "fp32" if self.fp32 else "bf16")
+        logger.info("r9700: ar8 hierarchical all-reduce installed (rank %d: pair %d, %s, %s intermediate; %s)",
+                    self.rank, self.rank // 2, "cross-chain sender" if self.pair_pos == 0 else "idle in the small path",
+                    "fp32" if self.fp32 else "bf16",
+                    f"split {'fused' if self.fused else '3 kernels'} {self.split_min >> 10}-{self.host_max >> 10} KiB"
+                    if self.split else "no split path")
 
     # ------------------------------------------------------------------------------------ all-gather
     # The flat 8-rank one-shot all-gather (the logits every step, ~38 KB per rank) hits the same fabric cliff:
@@ -150,22 +220,18 @@ class R9kAllReduce8:
             return False
         nw = x.numel() * (4 if self.fp32 else x.element_size())      # bytes of the working copy
         if self.host_on and nw >= self.host_min:
-            cap = min(self.pair.max_bytes, self.host_max)           # the same rule on evens and odds
+            cap = min(self.pair_cap, self.host_max)                 # the same rule on evens and odds
         else:
-            cap = self.pair.max_bytes if self.cross is None else min(self.pair.max_bytes, self.cross.max_bytes)
-        return nw <= cap and n <= self.pair.max_bytes
+            cap = self.pair_cap if self.cross is None else min(self.pair_cap, self.cross.max_bytes)
+        return nw <= cap and n <= self.pair_cap
 
     def should(self, x: torch.Tensor) -> bool:
         if x.numel() * x.element_size() > self.max_kb:
-            return False                                     # RCCL: 104 us at 64 KB against 157 here, 449 flat
+            return False                                     # RCCL (prefill sizes)
         return self._takes(x) or self.flat.should(x)
 
     def _zero(self, x: torch.Tensor) -> torch.Tensor:
-        key = (x.numel(), x.dtype)
-        z = self._zeros.get(key)
-        if z is None:
-            z = self._zeros[key] = torch.zeros(x.numel(), dtype=x.dtype, device=x.device)
-        return z
+        return self._zbuf[: x.numel() * x.element_size()].view(x.dtype)
 
     def _cross(self, y: torch.Tensor) -> torch.Tensor:
         """The evens' 4-chain stage. Four senders x the message is what the fabric sees in flight; at 32 KB a message
@@ -180,10 +246,36 @@ class R9kAllReduce8:
         parts = [self.cross.all_reduce(y[i:i + per]) for i in range(0, y.numel(), per)]
         return torch.cat(parts)
 
+    def _split(self, flat: torch.Tensor) -> torch.Tensor:
+        """Pair reduce-scatter -> host cross stage on our half (our quartet) -> pair all-gather; one fused kernel
+        (self.fused) or three."""
+        n, es = flat.numel(), flat.element_size()
+        if self.fused:
+            out = torch.empty_like(flat)
+            cq = -(-(-(-(n * es // 16) // 2)) // 4)          # words of a part: ceil(ceil(n16 / 2) / 4)
+            nl = max(1, min(self._flanes, -(-cq // (self._fk * self._fw))))
+            k = max(1, min(64, -(-cq // (nl * self._fw))))
+            ch = self.cross_host
+            rc = self.pair.L.r9k_ar8_fused(
+                self.pair._sp2, self.pair._fp2, ch._sp2, ch._fp2, self.rank, self._fseq.data_ptr(), self.pair.slot2,
+                ch.slot2, flat.data_ptr(), out.data_ptr(), n, _DTYPE[flat.dtype], torch.cuda.current_stream().cuda_stream,
+                nl, k, 0)
+            if rc:
+                raise RuntimeError(f"r9k_ar8_fused failed ({rc}) n={n}")
+            return out
+        buf = torch.empty_like(flat)
+        self.pair.reduce_scatter(flat, buf)                  # our half of the pair sum
+        off, ln = self.pair.chunk(n, es)
+        part = buf[off:off + ln]
+        self.cross_host.all_reduce(part, out=part)           # our quartet's total of that half, in place
+        return self.pair.all_gather_chunks(buf)
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if not self._takes(x):
             return self.flat.all_reduce(x)                   # callers check should() first: never above max_kb
         flat = x.view(-1)
+        if self.split and x.numel() * x.element_size() > self.split_min:     # group-wide state only (see above)
+            return self._split(flat).view_as(x)
         work = flat.float() if self.fp32 and x.dtype != torch.float32 else flat
         y = self.pair.all_reduce(work)                       # both pair members: the pair sum
         if self.pair_pos == 0:

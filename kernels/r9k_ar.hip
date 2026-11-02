@@ -517,10 +517,16 @@ extern "C" int r9k_ar_oneshot_nrank(const long* scratch_ptrs, const long* flag_p
 // phase 3 also satisfies a phase-1 wait. Only the chunk's owner reduces it, so all ranks hold identical bits.
 // Double buffering (s & 1) on both areas is safe by the same stream-order argument as the one-shot kernel.
 // Layout (per rank): scratch[buf][ rs: N slots of slot16 | ag: slot16 ] -- the caller sizes it 2*(N+1)*slot16.
+// mode (r9k_ar_twoshot_nrank_m): 0 = all-reduce; 1 = reduce-scatter only (steps 1-2: out holds OUR reduced chunk at
+// its place, the rest untouched); 2 = all-gather only (steps 3-4: `in` holds our chunk at its place; out = every
+// rank's chunk). The split 8-rank all-reduce of comm/r9k_ar8.py runs 1, then its cross stage on the chunk, then 2.
+// Every mode waits only for flag values its own call publishes (2s+1 and/or 2s+2) and every call advances s, so the
+// modes share the counters, flags and double buffering of mode 0: a rank reaches call s+2 only after waiting in call
+// s+1 for a value each peer publishes after its call-s kernel finished.
 template <typename T, int N>
 __global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
     R9kArPeers P, int rank, int* __restrict__ seq, long slot16, const uint4* __restrict__ in,
-    uint4* __restrict__ out, long n16, int drain, int acq, int nd) {
+    uint4* __restrict__ out, long n16, int drain, int acq, int nd, int mode) {
   const int b = blockIdx.x, nb = nd, tid = threadIdx.x, nt = blockDim.x;
   __shared__ int s_seq;
   if (tid == 0) s_seq = seq[b]++;
@@ -533,6 +539,15 @@ __global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
   const long per = (csz + nb - 1) / nb;               // this block's slice of every chunk
   const long lo = per * b, hi = min(lo + per, csz);
 
+  auto publish = [&](u32 v) {
+    if (tid < N && tid != rank) {
+      u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
+      if (drain >= 4) __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      else __hip_atomic_store(f, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  };
+  constexpr int NE = 16 / sizeof(T);
+  if (mode != 2) {
   // 1. scatter: chunk q -> rank q (4 words per lane per iteration so several stores are in flight per lane)
 #pragma unroll
   for (int q = 0; q < N; q++) {
@@ -548,22 +563,24 @@ __global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
   }
   __syncthreads();
   if (drain < 4) ar_release(drain);
-  auto publish = [&](u32 v) {
-    if (tid < N && tid != rank) {
-      u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
-      if (drain >= 4) __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
-      else __hip_atomic_store(f, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
-    }
-  };
   publish((u32)(2 * s + 1));
   if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], 2 * s + 1, acq);
   __syncthreads();
   ar_acquire(acq);
+  }
 
-  // 2+3. reduce our chunk, write it to out and to every peer's gather area
-  constexpr int NE = 16 / sizeof(T);
+  // 2+3. reduce our chunk (mode 2: take it from `in`), write it to out and to every peer's gather area
   const uint4* own = P.scratch[rank] + base;
-  {
+  if (mode == 2) {
+    const long c0 = (long)rank * csz, cn = min(csz, n16 - c0);
+    for (long i = lo + tid; i < min(hi, cn); i += nt) {
+      const uint4 r = in[c0 + i];
+      out[c0 + i] = r;
+#pragma unroll
+      for (int q = 0; q < N; q++)
+        if (q != rank) P.scratch[q][ag + c0 + i] = r;
+    }
+  } else {
     const long c0 = (long)rank * csz, cn = min(csz, n16 - c0);
     for (long i = lo + tid; i < min(hi, cn); i += nt) {
       float acc[NE];
@@ -581,11 +598,13 @@ __global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
 #pragma unroll
       for (int e = 0; e < NE; e++) ar_st(pr[e], acc[e]);
       out[c0 + i] = r;
+      if (mode == 1) continue;
 #pragma unroll
       for (int q = 0; q < N; q++)
         if (q != rank) P.scratch[q][ag + c0 + i] = r;   // gather area is indexed by global word
     }
   }
+  if (mode == 1) return;
   __syncthreads();
   if (drain < 4) ar_release(drain);
   publish((u32)(2 * s + 2));
@@ -603,11 +622,129 @@ __global__ void __launch_bounds__(1024) r9k_ar_twoshot_nrank_kernel(
   }
 }
 
-// Same arguments as r9k_ar_oneshot_nrank; scratch must be 2*(nranks+1)*slot16 words and the flag values are
-// NOT compatible with the one-shot kernel's, so the two need separate seq counters AND separate flag arrays.
-extern "C" int r9k_ar_twoshot_nrank_g(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
-                                    long seq, long slot16, long in, long out, long numel, int dtype,
-                                    long stream, int nblocks, int nthreads, int drain, int acq, int grid) {
+// ---------------------------------------------------------------- two-shot N-rank all-reduce through host memory
+// For pools in pinned host memory (comm/r9k_ar.py host=True: the cross stage of comm/r9k_ar8.py, 2026-11-02). The
+// generic two-shot above pushes each chunk into its OWNER's pool and the reduced chunk into every peer's pool; with
+// every pool in host memory both are host writes: 1.5 S up and 1.5 S down a rank. Here each rank writes only its
+// own pool and the readers pull:
+//   1. write chunks q != rank of our input into our pool's `in` area (0.75 S up); publish 2s+1 to every peer
+//   2. wait for 2s+1 from every peer; reduce OUR chunk -- own input from `in`, peer q's from q's pool (0.75 S down)
+//      -- in rank order, fp32, one rounding; write it to out and to our pool's `red` area (0.25 S up); publish 2s+2
+//   3. wait for 2s+2 from every peer; read their reduced chunks from their `red` areas into out (0.75 S down)
+// 1 S up + 1.5 S down, two barriers, the same bits as the generic kernel (the owner reduces its chunk in rank order).
+// Host reads cost a round trip of ~1-2 us, so every lane keeps several loads in flight (2 words x N in the reduce,
+// 4 words in the copies).
+// Layout (per rank): scratch[buf][ in: slot16 | red: slot16 ] = 2*2*slot16 words, addressed by global word; flags and
+// seq counters of its own, with the generic two-shot's flag values. Double buffering: rank r rewrites buffer s&1 in
+// call s+2 only after every peer published 2(s+1)+1, which a peer does only after its call-s kernel -- and with it
+// every read of r's buffer s&1 -- finished in stream order.
+template <typename T, int N>
+__global__ void __launch_bounds__(1024) r9k_ar_twoshot_host_nrank_kernel(
+    R9kArPeers P, int rank, int* __restrict__ seq, long slot16, const uint4* __restrict__ in,
+    uint4* __restrict__ out, long n16, int drain, int acq, int nd) {
+  const int b = blockIdx.x, nb = nd, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  if (b >= nd) return;                  // idle block: keeps its counter in step with the data blocks
+  const int s = s_seq;
+  const long base = (long)(s & 1) * 2 * slot16;
+  const long red = base + slot16;
+  const long csz = (n16 + N - 1) / N;
+  const long per = (csz + nb - 1) / nb;
+  const long lo = per * b, hi = min(lo + per, csz);
+  uint4* mine = P.scratch[rank];
+
+  // 1. our input, minus our own chunk, into our own pool
+#pragma unroll
+  for (int q = 0; q < N; q++) {
+    if (q == rank) continue;
+    const long c0 = (long)q * csz, end = min(hi, n16 - c0);
+    uint4* dst = mine + base + c0;
+    const uint4* src = in + c0;
+    long i = lo + tid;
+    for (; i + 3 * nt < end; i += 4 * nt) {
+      const uint4 v0 = src[i], v1 = src[i + nt], v2 = src[i + 2 * nt], v3 = src[i + 3 * nt];
+      dst[i] = v0; dst[i + nt] = v1; dst[i + 2 * nt] = v2; dst[i + 3 * nt] = v3;
+    }
+    for (; i < end; i += nt) dst[i] = src[i];
+  }
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  auto publish = [&](u32 v) {
+    if (tid < N && tid != rank) {
+      u32* f = &P.flags[tid][rank * R9K_AR_MAX_BLOCKS + b];
+      if (drain >= 4) __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+      else __hip_atomic_store(f, v, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+  };
+  publish((u32)(2 * s + 1));
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], 2 * s + 1, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 2. reduce our chunk from the N pools, two words a lane per pass
+  constexpr int NE = 16 / sizeof(T);
+  {
+    const long c0 = (long)rank * csz, end = min(hi, n16 - c0);
+    for (long i = lo + tid; i < end; i += 2 * nt) {
+      const bool two = i + nt < end;
+      uint4 v[N][2];
+#pragma unroll
+      for (int q = 0; q < N; q++) {
+        const uint4* src = q == rank ? in + c0 : P.scratch[q] + base + c0;
+        v[q][0] = src[i];
+        v[q][1] = two ? src[i + nt] : v[q][0];
+      }
+#pragma unroll
+      for (int k = 0; k < 2; k++) {
+        if (k == 1 && !two) break;
+        float acc[NE];
+#pragma unroll
+        for (int e = 0; e < NE; e++) acc[e] = 0.f;
+#pragma unroll
+        for (int q = 0; q < N; q++) {
+          const T* pc = (const T*)&v[q][k];
+#pragma unroll
+          for (int e = 0; e < NE; e++) acc[e] += ar_ld(pc[e]);
+        }
+        uint4 r;
+        T* pr = (T*)&r;
+#pragma unroll
+        for (int e = 0; e < NE; e++) ar_st(pr[e], acc[e]);
+        out[c0 + i + k * nt] = r;
+        mine[red + c0 + i + k * nt] = r;
+      }
+    }
+  }
+  __syncthreads();
+  if (drain < 4) ar_release(drain);
+  publish((u32)(2 * s + 2));
+  if (tid < N && tid != rank) ar_wait(&P.flags[rank][tid * R9K_AR_MAX_BLOCKS + b], 2 * s + 2, acq);
+  __syncthreads();
+  ar_acquire(acq);
+
+  // 3. pull the peers' reduced chunks
+#pragma unroll
+  for (int q = 0; q < N; q++) {
+    if (q == rank) continue;
+    const long c0 = (long)q * csz, end = min(hi, n16 - c0);
+    const uint4* src = P.scratch[q] + red + c0;
+    uint4* dst = out + c0;
+    long i = lo + tid;
+    for (; i + 3 * nt < end; i += 4 * nt) {
+      const uint4 v0 = src[i], v1 = src[i + nt], v2 = src[i + 2 * nt], v3 = src[i + 3 * nt];
+      dst[i] = v0; dst[i + nt] = v1; dst[i + 2 * nt] = v2; dst[i + 3 * nt] = v3;
+    }
+    for (; i < end; i += nt) dst[i] = src[i];
+  }
+}
+
+// host = 0: the generic two-shot (scratch 2*(nranks+1)*slot16 words); 1: the host-memory variant (2*2*slot16 words).
+static int ar_twoshot_launch(int host, int mode, const long* scratch_ptrs, const long* flag_ptrs, int nranks,
+                             int rank, long seq, long slot16, long in, long out, long numel, int dtype,
+                             long stream, int nblocks, int nthreads, int drain, int acq, int grid) {
+  if (mode < 0 || mode > 2 || (host && mode)) return -8;
   const int esz = dtype == 2 ? 4 : 2;
   const long nbytes = numel * esz;
   if (nbytes % 16) return -1;
@@ -630,8 +767,10 @@ extern "C" int r9k_ar_twoshot_nrank_g(const long* scratch_ptrs, const long* flag
   for (int q = 0; q < nranks; q++) { P.scratch[q] = (uint4*)scratch_ptrs[q]; P.flags[q] = (u32*)flag_ptrs[q]; }
   hipStream_t st = (hipStream_t)stream;
 #define ARN_LAUNCH(T, N)                                                                                   \
-  hipLaunchKernelGGL((r9k_ar_twoshot_nrank_kernel<T, N>), dim3(grid), dim3(nthreads), 0, st, P, rank,     \
-                     (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, drain, acq, nblocks)
+  if (host) hipLaunchKernelGGL((r9k_ar_twoshot_host_nrank_kernel<T, N>), dim3(grid), dim3(nthreads), 0, st, P, \
+                               rank, (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, drain, acq, nblocks); \
+  else hipLaunchKernelGGL((r9k_ar_twoshot_nrank_kernel<T, N>), dim3(grid), dim3(nthreads), 0, st, P, rank,      \
+                          (int*)seq, slot16, (const uint4*)in, (uint4*)out, n16, drain, acq, nblocks, mode)
 #define ARN_DT(N)                                                                                          \
   switch (dtype) {                                                                                         \
     case 0: ARN_LAUNCH(__hip_bfloat16, N); break;                                                          \
@@ -648,6 +787,276 @@ extern "C" int r9k_ar_twoshot_nrank_g(const long* scratch_ptrs, const long* flag
 #undef ARN_DT
 #undef ARN_LAUNCH
   return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// Same arguments as r9k_ar_oneshot_nrank; scratch must be 2*(nranks+1)*slot16 words and the flag values are
+// NOT compatible with the one-shot kernel's, so the two need separate seq counters AND separate flag arrays.
+extern "C" int r9k_ar_twoshot_nrank_g(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                    long seq, long slot16, long in, long out, long numel, int dtype,
+                                    long stream, int nblocks, int nthreads, int drain, int acq, int grid) {
+  return ar_twoshot_launch(0, 0, scratch_ptrs, flag_ptrs, nranks, rank, seq, slot16, in, out, numel, dtype, stream,
+                           nblocks, nthreads, drain, acq, grid);
+}
+
+// The same with a mode: 0 all-reduce, 1 reduce-scatter only, 2 all-gather only (see the kernel).
+extern "C" int r9k_ar_twoshot_nrank_m(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                    long seq, long slot16, long in, long out, long numel, int dtype,
+                                    long stream, int nblocks, int nthreads, int drain, int acq, int grid, int mode) {
+  return ar_twoshot_launch(0, mode, scratch_ptrs, flag_ptrs, nranks, rank, seq, slot16, in, out, numel, dtype,
+                           stream, nblocks, nthreads, drain, acq, grid);
+}
+
+// ---------------------------------------------------------------- fused split all-reduce for 8 ranks on 4 switches
+// comm/r9k_ar8.py's split path (pair reduce-scatter -> each quartet's host-memory two-shot on its half -> pair
+// all-gather) as one kernel, so the switch-local pair traffic (GPU <-> switch links) overlaps the cross traffic
+// (the switch's uplink to the host) instead of waiting for it. Run as three kernels, the stages' link time adds up
+// (2 MB: 128 + 295 + 128 us, tests/test_ar8.py PARTS=3, 2026-11-02).
+//
+// Rank t: pair p = t / 2 (partner t ^ 1), pos = t % 2 = the half it owns (pair two-shot chunking, 2 chunks); its
+// quartet = the four ranks with the same pos, in which it has index p and owns part p of the half (4-rank two-shot
+// chunking of the half). Each part is cut into nl lanes x K sub-steps; five ROLE blocks per lane walk the sub-steps:
+//   R0 push     sub-step j of our input's partner half (4 parts) into the partner's pair pool RS area; flag PP
+//   R1 pair-sum wait PP from the partner; pair sum of our half (even + odd, fp32, one rounding): our part -> out,
+//               the other three parts -> our host pool `in` area; flag HW to all four quartet members (us included)
+//   R2 reduce   wait HW from the four; our part = sum of the four pair sums in quartet order (fp32, one rounding)
+//               -> out, our host pool `red` area, the partner's pair pool AG area; flags HR (quartet), PA2 (partner)
+//   R3 gather   wait HR from the three peers; their reduced parts -> out and the partner's AG area; flag PA3
+//   R4 receive  wait PA2 + PA3 from the partner; its half from our AG area -> out
+// Dependencies only point to lower roles, which have lower block ids and are dispatched first, and R0 waits for
+// nothing: no reliance on all blocks being resident. Every element sees the split path's two roundings in the same
+// order, so the bits equal the three-kernel path (and the whole-message path).
+// Counters: seq[blockIdx] (5 * ARF_LM ints) counts calls; flag values c*64 + j + 1, compared by signed difference
+// (they wrap after ~67M calls). Flag words (rows of 256 per source, R9K_AR_MAX_BLOCKS): pair rows PP 64+L, PA2 96+L,
+// PA3 128+L; host rows HW 64+L, HR 96+L -- the two-shot kernels keep to [0, 64).
+// Pools: pair = the pair two-shot pool with 4 extra slots: [6 s, 10 s) (s = pslot words), parity c & 1 -> base 6 s +
+// 2 s * parity, RS area base + [0, s), AG area base + s + [0, s), indexed by global word; host = the quartet's host
+// two-shot pool (2 x [in | red] of hslot words), indexed by the word offset in the half. Reuse is safe in every
+// order (this kernel, the pair two-shot modes, the host two-shot): an area is rewritten only after a wait the
+// readers can satisfy only once their previous call ended -- the pair areas are disjoint from the two-shot's
+// slots because a partner may still be in R4 when we start the next call.
+#define ARF_LM 16
+
+struct ArfGeo {     // one half's geometry
+  long h0, hn, cq, per, st;   // half start (global word), length, part length, lane length, sub-step length
+};
+
+__device__ __forceinline__ ArfGeo arf_geo(long n16, int half, int nl, int K) {
+  ArfGeo g;
+  const long c2 = (n16 + 1) / 2;
+  g.h0 = min((long)half * c2, n16);
+  g.hn = min(g.h0 + c2, n16) - g.h0;
+  g.cq = (g.hn + 3) / 4;
+  g.per = (g.cq + nl - 1) / nl;
+  g.st = (g.per + K - 1) / K;
+  return g;
+}
+
+// [a, e): sub-step j of lane L of part k, as word offsets in the half
+__device__ __forceinline__ void arf_range(const ArfGeo& g, int k, int L, int j, long& a, long& e) {
+  const long p0 = (long)k * g.cq, pe = min(p0 + g.cq, g.hn);
+  const long l0 = p0 + (long)L * g.per, le = min(l0 + g.per, pe);
+  a = l0 + (long)j * g.st;
+  e = min(a + g.st, le);
+}
+
+__device__ __forceinline__ void arf_put(u32* f, u32 v) {
+  __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+__device__ __forceinline__ void arf_wait(u32* f, u32 v) {
+  while ((int)(__hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) - v) < 0)
+    __builtin_amdgcn_s_sleep(1);
+}
+
+__device__ __forceinline__ void arf_copy(uint4* __restrict__ dst, const uint4* __restrict__ src, long a, long e,
+                                         int tid, int nt) {
+  long i = a + tid;
+  for (; i + 3 * nt < e; i += 4 * nt) {
+    const uint4 v0 = src[i], v1 = src[i + nt], v2 = src[i + 2 * nt], v3 = src[i + 3 * nt];
+    dst[i] = v0; dst[i + nt] = v1; dst[i + 2 * nt] = v2; dst[i + 3 * nt] = v3;
+  }
+  for (; i < e; i += nt) dst[i] = src[i];
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 arf_round(const float* acc) {
+  constexpr int NE = 16 / sizeof(T);
+  uint4 r;
+  T* pr = (T*)&r;
+#pragma unroll
+  for (int x = 0; x < NE; x++) ar_st(pr[x], acc[x]);
+  return r;
+}
+
+template <typename T>
+__device__ __forceinline__ void arf_add(float* acc, const uint4& w) {
+  constexpr int NE = 16 / sizeof(T);
+  const T* pw = (const T*)&w;
+#pragma unroll
+  for (int x = 0; x < NE; x++) acc[x] += ar_ld(pw[x]);
+}
+
+template <typename T>
+__global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
+    R9kArPeers PP_, R9kArPeers HQ, int rank, int* __restrict__ seq, long pslot, long hslot,
+    const uint4* __restrict__ in, uint4* __restrict__ out, long n16, int nl, int K) {
+  const int role = blockIdx.x / ARF_LM, L = blockIdx.x % ARF_LM, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[blockIdx.x]++;
+  __syncthreads();
+  if (L >= nl) return;                  // idle lane: keeps its counter in step
+  const u32 c64 = (u32)s_seq * 64u;
+  const int pos = rank & 1, p = rank >> 1, mate = pos ^ 1;
+  const ArfGeo gm = arf_geo(n16, pos, nl, K), go = arf_geo(n16, mate, nl, K);
+  const long pb = 6 * pslot + (long)(s_seq & 1) * 2 * pslot;      // pair pool: RS area pb, AG area pb + pslot
+  const long hb = (long)(s_seq & 1) * 2 * hslot;                   // host pool: in hb, red hb + hslot
+  constexpr int NE = 16 / sizeof(T);
+  constexpr int MB = R9K_AR_MAX_BLOCKS;
+
+  for (int j = 0; j < K; j++) {
+    const u32 v = c64 + (u32)j + 1u;
+    long a, e;
+    if (role == 0) {                    // R0: our input's partner half -> partner RS area
+      uint4* dst = PP_.scratch[mate] + pb + go.h0;
+      for (int k = 0; k < 4; k++) {
+        arf_range(go, k, L, j, a, e);
+        arf_copy(dst, in + go.h0, a, e, tid, nt);
+      }
+      __syncthreads();
+      if (tid == 0) arf_put(&PP_.flags[mate][pos * MB + 64 + L], v);
+    } else if (role == 1) {             // R1: pair sum of our half
+      if (tid == 0) arf_wait(&PP_.flags[pos][mate * MB + 64 + L], v);
+      __syncthreads();
+      const uint4* rcv = PP_.scratch[pos] + pb + gm.h0;
+      const uint4* own = in + gm.h0;
+      for (int k = 0; k < 4; k++) {
+        arf_range(gm, k, L, j, a, e);
+        uint4* dst = k == p ? out + gm.h0 : HQ.scratch[p] + hb;
+        for (long i = a + tid; i < e; i += nt) {
+          const uint4 x0 = own[i], x1 = rcv[i];
+          float acc[NE];
+#pragma unroll
+          for (int x = 0; x < NE; x++) acc[x] = 0.f;
+          arf_add<T>(acc, pos == 0 ? x0 : x1);           // rank order: even, then odd
+          arf_add<T>(acc, pos == 0 ? x1 : x0);
+          dst[i] = arf_round<T>(acc);
+        }
+      }
+      __syncthreads();
+      if (tid < 4) arf_put(&HQ.flags[tid][p * MB + 64 + L], v);
+    } else if (role == 2) {             // R2: our part = the four pair sums in quartet order
+      if (tid < 4) arf_wait(&HQ.flags[p][tid * MB + 64 + L], v);
+      __syncthreads();
+      arf_range(gm, p, L, j, a, e);
+      uint4* red = HQ.scratch[p] + hb + hslot;
+      uint4* ag = PP_.scratch[mate] + pb + pslot + gm.h0;
+      for (long i = a + tid; i < e; i += 2 * nt) {
+        const bool two = i + nt < e;
+        uint4 w[4][2];
+#pragma unroll
+        for (int q = 0; q < 4; q++) {
+          const uint4* src = q == p ? out + gm.h0 : HQ.scratch[q] + hb;
+          w[q][0] = src[i];
+          w[q][1] = two ? src[i + nt] : w[q][0];
+        }
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+          if (u == 1 && !two) break;
+          float acc[NE];
+#pragma unroll
+          for (int x = 0; x < NE; x++) acc[x] = 0.f;
+#pragma unroll
+          for (int q = 0; q < 4; q++) arf_add<T>(acc, w[q][u]);
+          const uint4 r = arf_round<T>(acc);
+          const long ii = i + u * nt;
+          out[gm.h0 + ii] = r;
+          red[ii] = r;
+          ag[ii] = r;
+        }
+      }
+      __syncthreads();
+      if (tid < 4 && tid != p) arf_put(&HQ.flags[tid][p * MB + 96 + L], v);
+      if (tid == 4) arf_put(&PP_.flags[mate][pos * MB + 96 + L], v);
+    } else if (role == 3) {             // R3: the peers' reduced parts of our half
+      if (tid < 4 && tid != p) arf_wait(&HQ.flags[p][tid * MB + 96 + L], v);
+      __syncthreads();
+      uint4* ag = PP_.scratch[mate] + pb + pslot + gm.h0;
+      for (int q = 0; q < 4; q++) {
+        if (q == p) continue;
+        arf_range(gm, q, L, j, a, e);
+        const uint4* src = HQ.scratch[q] + hb + hslot;
+        long i = a + tid;
+        for (; i + nt < e; i += 2 * nt) {
+          const uint4 v0 = src[i], v1 = src[i + nt];
+          out[gm.h0 + i] = v0; ag[i] = v0;
+          out[gm.h0 + i + nt] = v1; ag[i + nt] = v1;
+        }
+        for (; i < e; i += nt) { const uint4 v0 = src[i]; out[gm.h0 + i] = v0; ag[i] = v0; }
+      }
+      __syncthreads();
+      if (tid == 0) arf_put(&PP_.flags[mate][pos * MB + 128 + L], v);
+    } else {                            // R4: the partner's half from our AG area
+      if (tid == 0) arf_wait(&PP_.flags[pos][mate * MB + 96 + L], v);
+      if (tid == 1) arf_wait(&PP_.flags[pos][mate * MB + 128 + L], v);
+      __syncthreads();
+      const uint4* src = PP_.scratch[pos] + pb + pslot + go.h0;
+      for (int k = 0; k < 4; k++) {
+        arf_range(go, k, L, j, a, e);
+        arf_copy(out + go.h0, src, a, e, tid, nt);
+      }
+    }
+  }
+}
+
+extern "C" int r9k_ar8_fused_lanes() { return ARF_LM; }
+
+// pair_scratch/pair_flags: the pair's 2 pointers (pair two-shot pool with >= 10 * pslot words); host_scratch /
+// host_flags: the quartet's 4 (host two-shot pools, >= 4 * hslot words); rank = TP rank 0..7 (pair index * 2 + pos);
+// seq: 5 * r9k_ar8_fused_lanes() ints; nl <= 16 lanes, K <= 64 sub-steps, nthreads 0 = by size. Grid 5 * 16.
+extern "C" int r9k_ar8_fused(const long* pair_scratch, const long* pair_flags, const long* host_scratch,
+                             const long* host_flags, int rank, long seq, long pslot, long hslot, long in, long out,
+                             long numel, int dtype, long stream, int nl, int K, int nthreads) {
+  const int esz = dtype == 2 ? 4 : 2;
+  const long nbytes = numel * esz;
+  if (nbytes % 16) return -1;
+  const long n16 = nbytes / 16;
+  if (rank < 0 || rank >= 8) return -5;
+  if (n16 <= 0) return 0;
+  const long c2 = (n16 + 1) / 2;
+  if (n16 > pslot || c2 > hslot) return -7;
+  if (nl <= 0 || nl > ARF_LM || K <= 0 || K > 64) return -2;
+  const long cq = (c2 + 3) / 4;
+  if ((long)nl > cq) nl = (int)cq;
+  const long per = (cq + nl - 1) / nl;
+  if ((long)K > per) K = (int)per;
+  if (nthreads <= 0) {
+    const long w = (per + K - 1) / K;
+    long t = ((w + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < 64 ? 64 : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE || nthreads < 8) return -3;
+  R9kArPeers P{}, H{};
+  for (int q = 0; q < 2; q++) { P.scratch[q] = (uint4*)pair_scratch[q]; P.flags[q] = (u32*)pair_flags[q]; }
+  for (int q = 0; q < 4; q++) { H.scratch[q] = (uint4*)host_scratch[q]; H.flags[q] = (u32*)host_flags[q]; }
+  hipStream_t st = (hipStream_t)stream;
+#define ARF_LAUNCH(T)                                                                                      \
+  hipLaunchKernelGGL((r9k_ar8_fused_kernel<T>), dim3(5 * ARF_LM), dim3(nthreads), 0, st, P, H, rank,      \
+                     (int*)seq, pslot, hslot, (const uint4*)in, (uint4*)out, n16, nl, K)
+  switch (dtype) {
+    case 0: ARF_LAUNCH(__hip_bfloat16); break;
+    case 1: ARF_LAUNCH(_Float16); break;
+    case 2: ARF_LAUNCH(float); break;
+    default: return -4;
+  }
+#undef ARF_LAUNCH
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// The host-memory two-shot: same arguments; scratch 2*2*slot16 words in pinned host memory; own seq and flag arrays.
+extern "C" int r9k_ar_twoshot_host_nrank_g(const long* scratch_ptrs, const long* flag_ptrs, int nranks, int rank,
+                                         long seq, long slot16, long in, long out, long numel, int dtype,
+                                         long stream, int nblocks, int nthreads, int drain, int acq, int grid) {
+  return ar_twoshot_launch(1, 0, scratch_ptrs, flag_ptrs, nranks, rank, seq, slot16, in, out, numel, dtype, stream,
+                           nblocks, nthreads, drain, acq, grid);
 }
 
 // grid = the data blocks (see r9k_ar_oneshot_2rank).
