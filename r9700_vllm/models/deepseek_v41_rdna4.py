@@ -15,6 +15,8 @@ is Triton or torch and runs here.
 Installed by r9700_vllm.register() next to the exl3 pieces (R9K_DISABLE=dsv41 turns it off); engages for any
 DeepSeek-V4.1 checkpoint, EXL3 or fp8.
 """
+import os
+
 import torch
 from vllm.logger import init_logger
 
@@ -62,6 +64,24 @@ def _install_prefill_logits() -> bool:
     return True
 
 
+def _install_all_prefill() -> bool:
+    """Diagnostic (R9K_DSV41_ALL_PREFILL=1): every request is a prefill -- split_decodes_and_prefills reports zero decodes
+    to every metadata builder, so the decode-only kernels (SWA ragged decode, decode indexer logits, decode compressor
+    and KV insert, decode Engram hashing) are bypassed and single-token steps run the prefill path. Slow; for bisecting
+    decode-vs-prefill divergence (notes/exl3-plan.md bring-up log)."""
+    from vllm.v1.attention.backends import utils as U
+    if getattr(U.split_decodes_and_prefills, "__r9k_patch__", None):
+        return True
+    orig = U.split_decodes_and_prefills
+
+    def split_decodes_and_prefills(common_attn_metadata, decode_threshold: int = 1, require_uniform: bool = False):
+        return orig(common_attn_metadata, decode_threshold=0, require_uniform=require_uniform)
+
+    split_decodes_and_prefills.__r9k_patch__ = "dsv41_all_prefill"
+    U.split_decodes_and_prefills = split_decodes_and_prefills
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -80,6 +100,12 @@ def patch() -> bool:
             done.append("prefill-logits:aiter-triton")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_ALL_PREFILL", "0") == "1":
+        try:
+            if _install_all_prefill():
+                done.append("ALL-PREFILL(diagnostic)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 all-prefill hook not installed (%s)", e)
     if done:
         logger.info("r9700: deepseek_v41 on RDNA4: %s", ", ".join(done))
     return bool(done)
