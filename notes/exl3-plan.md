@@ -308,3 +308,13 @@ Packages (parallel Opus agents; the owner integrates on eight cards and re-measu
 
 Integration: the owner relaunches `serve/ds41-exl3.sh` with the new tiers, runs divergence.py, needles, GSM8K, tprobe at 1 and
 4 streams with and without the drafter, and compares with the Phase 1 numbers above.
+
+### Phase 2 results so far (2026-11-02 18:15 UTC)
+- **P3 (decode attention) + L (casts) integrated** (a807cd4, d67dd59). On the eight-card server with graphs: divergence 23-24/24
+  at |dlogprob| 0.02-0.14 (the split-K reduce's fused inverse RoPE is right; the ragged workaround stays as
+  R9K_DSV41_DECODE=ragged). Short-context probe: no drafter 51.7 tok/s single (was 45.7), 125.9 at 4 streams (was 104);
+  drafter 55.6 single (was 50.7), 122.6 at 4 streams; essay 50 tok/s (was 42), code 97; prefill 3.4k tok/s. Decode after a
+  long prefill is flat: 51.6 / 51.5 / 51.5 / 51.4 tok/s at 2k / 8k / 16k / 28k tokens of context (no drafter) -- the stock
+  fallback kernel cost 180 us a layer at SWA 128 + top-k 512 (P3's table), the split-K path 19 us.
+- Remaining step time is in the MoE decode tier (P1), the collectives (P2, also the >9-token steps), the hyper-connection
+  kernels and the EXL3 GEMV launch count.
