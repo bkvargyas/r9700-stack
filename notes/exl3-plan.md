@@ -220,3 +220,15 @@ Placeholder stubs for all three live in the repo (branch `exl3`) so imports reso
    a step) going to RCCL at ~2.3 ms a call for 380 KiB. Decode at <= 8 tokens a step stays on ar8; multi-token steps
    (DSpark x several streams, 10+ concurrent streams) will pay 80 x 1-2 ms a step until the ar8 cross stage takes larger
    messages. Open item for after correctness.
+
+**2026-11-02 08:27-09:15 UTC, real weights.** Pack complete (43 shards, 196 GiB), composed dir, launch: weights 139 s, 25.5 GiB a
+rank, Engram 2 x 11.8 GiB pinned host a rank, KV (KVMEM 1) 193,534 tokens, graphs 7 s, 28.6-29.2 GiB a card; probe 47.1 tok/s
+single / 100 at four streams / 3.4k tok/s warm prefill -- the dummy numbers, as expected.
+Correctness: short answers right (Paris, the first primes, three sentences), retrieval from 1.7k and 3.3k-token prompts
+right; long generations degrade within ~20-60 tokens with doubled words ("of the the sea", "Recently Recently") and loops.
+Bisection by relaunch (each ~6 min): EAGER=1 + R9K_DISABLE=glm5next -> same; EXL3 decode tiers replaced by the dequant
+paths (R9K_EXL3_RECON_M=0 R9K_EXL3_MOE_MGEMM_M=0) -> same, and `divergence.py` (greedy decode vs fresh prefill of each
+prefix, prefix cache off) shows top-1 agreement 14-20/24 with |dlogprob| 0.6-1.3; **R9K_DSV41_ALL_PREFILL=1 (every step
+through the prefill path) -> correct**: 511-token essay with a proper ending, clean LRU code, 17*23=391, agreement 22-24/24
+at |dlogprob| 0.02-0.18. So the defect is in the decode-only attention path (SWA ragged decode kernel over the fp8 record,
+decode compressor, decode indexer), not in EXL3 / MoE / graphs / Engram slot cache / our GLM hooks. Next split: bf16 KV.
