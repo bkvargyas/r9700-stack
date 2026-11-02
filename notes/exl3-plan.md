@@ -206,3 +206,9 @@ Placeholder stubs for all three live in the repo (branch `exl3`) so imports reso
    aggregate (30 a stream), prefill 3,030 tokens 0.8-4.3 s (first prefill JIT-compiles four Triton kernels: compact ragged,
    cp_gather indexer cache, fp8_mqa_logits, block_scores)**. No DSpark yet. Memory: weights ~25 GiB + KV 1 GiB + graphs leaves
    ~3.3 GiB a card; the real pack's footprint should match (the dummy run synthesized K=5 attention, K=3 experts).
+5. DSPARK=1 on dummy weights (graphs, KVMEM=1, NBT=2048): drafter builds and captures (18 s, 1.55 GiB of graphs), 29.7-30.2
+   GiB used a card. Random weights accept nothing (2,410 drafted, 0 accepted), so the numbers are the speculative loop's
+   pure overhead: single stream 24.6 tok/s, 4 streams 54.8 aggregate; at a mean acceptance length of 3-4 the same loop
+   would give ~75-100 tok/s. Warm prefill 3,030 tokens in 0.82 s = 3,685 tok/s (the first prefill of a process pays ~11 s
+   of Triton JIT: compact-ragged, cp_gather indexer cache, fp8_mqa_logits, block_scores -- a warm-up request belongs in
+   the launcher).
