@@ -14,9 +14,11 @@ shape check applies. ``process_weights_after_loading`` turns the stash into one 
 rank split is not a 128-multiple (shared experts at TP8: 2304/8 = 288) is dequantized at load to a bf16 ``weight`` and
 runs the stock unquantized GEMM.
 
-Forward (decode, M <= RECON_M): x -> f16, ``exl3_gemm`` per part in 8-row chunks into an f32 C, cast into the bf16
-output slice. Rows 1..8 are exllamav3's RDNA multi-row GEMV; a 9+ row call would take its autotuned WMMA trellis GEMM,
-1.4-2.6x slower than 8-row GEMV chunks on gfx1201 and host-syncing on its first call at a new M (which kills a HIP graph
+Forward (decode, M <= RECON_M): x -> f16 into a static per-layer buffer, ``exl3_gemm`` per part in 8-row chunks into a
+static f32 C (stacked layers whose parts share K: one ``exl3_mgemm`` for all parts), one cast into the caller's dtype
+(per part when M > 1 and the layer has several). exllamav3 takes only f16 A and f16/f32 C, so the two casts stay:
+4 launches a single-matrix apply. Rows 1..8 are exllamav3's RDNA multi-row GEMV; a 9+ row call would take its
+autotuned WMMA trellis GEMM, 1.4-2.6x slower than 8-row GEMV chunks on gfx1201 and host-syncing on its first call at a new M (which kills a HIP graph
 capture), so it is never called. Above RECON_M (exllamav3's reconstruct_hgemm, notes/exl3-kernels.md): dequantize the
 part to f16 and run hipBLAS in 1024-row chunks (unchunked 4096-row f16 GEMMs fall to 15-31 TFLOPS on some shapes vs
 84-92 chunked) -- the plain decode with the two Hadamards on the activations below FUSED_M rows, exllamav3's fused
@@ -429,38 +431,81 @@ class Exl3LinearMethod(LinearMethodBase):
 
     @staticmethod
     def _warm(layer) -> None:
-        """One eager exl3_gemm per part and row count 1..8 before any capture: allocates the GEMV's per-device
-        parameter block (a cudaMalloc, not capturable) and asserts every chunk size takes the GEMV (tags 90-92), never
-        the autotuned GEMM whose first call host-syncs."""
-        dev = layer.exl3_parts[0].trellis.device
+        """Static decode buffers, the multi-matrix tables, and one eager call per row count 1..8 before any capture:
+        allocates the GEMV's per-device parameter block (a cudaMalloc, not capturable) and asserts every chunk size
+        takes the GEMV (tags 90-92, 93 multi-matrix), never the autotuned GEMM whose first call host-syncs."""
+        parts, k, n = layer.exl3_parts, layer.exl3_k, layer.exl3_n
+        dev = parts[0].trellis.device
+        rows = max(RECON_M, _GEMV_ROWS)
+        layer.exl3_abuf = torch.empty((rows, k), dtype=torch.float16, device=dev)
+        layer.exl3_ahad = torch.empty(len(parts) * _GEMV_ROWS * k, dtype=torch.float16, device=dev)
+        layer.exl3_cbuf = torch.empty(rows * n, dtype=torch.float32, device=dev)
+        layer.exl3_mg = None
+        p0 = parts[0]
+        if len(parts) > 1 and all((p.K, p.mcg, p.mul1) == (p0.K, p0.mcg, p0.mul1) for p in parts):
+            # one exl3_mgemm for all parts (one input rotation + one dot launch): part j writes its [m, n_j] block at
+            # cbuf[m * dst_j:], chunk c's rows from row 8c; the pointer table holds every (m, chunk) up front
+            base, chunks = layer.exl3_cbuf.data_ptr(), -(-rows // _GEMV_ROWS)
+            cp = [[[base + 4 * (m * p.dst + c * _GEMV_ROWS * p.n) for p in parts] for c in range(chunks)]
+                  for m in range(rows + 1)]
+            def ptrs(f):
+                return torch.tensor([getattr(p, f).data_ptr() for p in parts], dtype=torch.long, device=dev)
+            layer.exl3_mg = {"trellis": ptrs("trellis"), "suh": ptrs("suh"), "svh": ptrs("svh"),
+                             "size_n": torch.tensor([p.n for p in parts], dtype=torch.int32, device=dev),
+                             "cptrs": torch.tensor(cp, dtype=torch.long, device=dev),
+                             "carrier": torch.empty((1, 1, max(p.n for p in parts)), dtype=torch.float32, device=dev)}
         for m in range(1, _GEMV_ROWS + 1):
-            a = torch.zeros((m, layer.exl3_k), dtype=torch.float16, device=dev)
-            a_had = torch.empty_like(a)
+            for tag in Exl3LinearMethod._decode(layer, layer.exl3_abuf[:m].zero_()):
+                assert tag in (90, 91, 92, 93), f"exl3 {layer.prefix}: {m} rows took exl3_gemm path {tag}, not the GEMV"
+
+    @staticmethod
+    def _decode(layer, a: torch.Tensor) -> list[int]:
+        """a [m, k] f16 (m <= RECON_M) -> layer.exl3_cbuf: part blocks [m, n_j] at m * dst_j (== row layout when there
+        is one part or one row), 8-row GEMV chunks."""
+        m, k = a.shape
+        tags, mg, cbuf, ahad = [], layer.exl3_mg, layer.exl3_cbuf, layer.exl3_ahad
+        for c, i in enumerate(range(0, m, _GEMV_ROWS)):
+            j = min(m, i + _GEMV_ROWS)
+            if mg is not None:
+                p0 = layer.exl3_parts[0]
+                tags.append(ext().exl3_mgemm(a[i:j].unsqueeze(0), mg["trellis"], mg["carrier"].expand(1, j - i, -1),
+                                             mg["suh"], ahad, mg["svh"], None, None, p0.K, -1, p0.mcg, p0.mul1, -1,
+                                             -1, 0, 1, mg["size_n"], mg["cptrs"][m, c]))
+                continue
+            ah = ahad[:(j - i) * k].view(j - i, k)
             for p in layer.exl3_parts:
-                c = torch.empty((m, p.n), dtype=torch.float32, device=dev)
-                tag = ext().exl3_gemm(a, p.trellis, c, p.suh, a_had, p.svh, -1, p.mcg, p.mul1, 0)
-                assert tag in (90, 91, 92), f"exl3 {layer.prefix}: {m} rows took exl3_gemm path {tag}, not the GEMV"
+                cv = cbuf[m * p.dst:m * (p.dst + p.n)].view(m, p.n)
+                tags.append(ext().exl3_gemm(a[i:j], p.trellis, cv[i:j], p.suh, ah, p.svh, -1, p.mcg, p.mul1, 0))
+        return tags
 
     # -------------------------------------------------------------------------------------------------- forward
     def apply(self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
         if layer.exl3_dense:
             return dispatch_unquantized_gemm()(layer, x, layer.weight, bias)
         lead, k, n = x.shape[:-1], x.shape[-1], layer.exl3_n
-        a = x.reshape(-1, k).to(torch.float16).contiguous()
-        m = a.shape[0]
+        m = x.numel() // k
         parts = layer.exl3_parts
-        recon = m > RECON_M
-        if recon:
-            run = lambda p: p.recon_mm(a)                        # noqa: E731
+        if m <= RECON_M:
+            # decode: bf16 -> f16 straight into the static input (one kernel, any input strides), the GEMVs into the
+            # static f32 C, then one cast to the caller's dtype per output block (one in all when m == 1)
+            a = layer.exl3_abuf[:m]
+            a.view(x.shape).copy_(x)
+            self._decode(layer, a)
+            cbuf = layer.exl3_cbuf
+            if len(parts) == 1 or m == 1:
+                y = cbuf[:m * n].view(m, n).to(x.dtype)
+            else:
+                y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+                for p in parts:
+                    y[:, p.dst:p.dst + p.n].copy_(cbuf[m * p.dst:m * (p.dst + p.n)].view(m, p.n))
         else:
-            a_had = torch.empty_like(a)
-            run = lambda p: p.gemm(a, a_had)                     # noqa: E731
-        if len(parts) == 1:
-            y = run(parts[0]).to(x.dtype)
-        else:
-            y = torch.empty((m, n), dtype=x.dtype, device=x.device)
-            for p in parts:
-                y[:, p.dst:p.dst + p.n].copy_(run(p))
+            a = x.reshape(m, k).to(torch.float16).contiguous()
+            if len(parts) == 1:
+                y = parts[0].recon_mm(a).to(x.dtype)
+            else:
+                y = torch.empty((m, n), dtype=x.dtype, device=x.device)
+                for p in parts:
+                    y[:, p.dst:p.dst + p.n].copy_(p.recon_mm(a))
         if bias is not None:
             y += bias
         return y.view(*lead, n)

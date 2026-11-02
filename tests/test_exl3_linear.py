@@ -221,7 +221,19 @@ def t_stacked(E, cfg, Ms):
     errs = [rel(layer.quant_method.apply(layer, X(m, 5120, m)), X(m, 5120, m).float() @ r) for m in Ms]
     check("fused_wqa_wkv two shards (K5 + K6)", len(layer.exl3_parts) == 2 and max(errs) < TOL,
           " ".join(f"{e:.1e}" for e in errs))
-    fused = layer
+    fused = [layer]
+    # the common case (39 of 40 layers, compressor): equal K -> one exl3_mgemm for both shards
+    tc = make_exl3(5120, 512, 5, seed=13)
+    layer = MergedColumnParallelLinear(5120, [1280, 512], bias=False, quant_config=cfg, params_dtype=BF,
+                                       prefix="t.fused_wqa_wkv_k5", disable_tp=True)
+    load(layer, ta, 0)
+    load(layer, tc, 1)
+    finish(layer)
+    r = torch.cat([ref_weight(E, ta), ref_weight(E, tc)], 1)
+    errs = [rel(layer.quant_method.apply(layer, X(m, 5120, m)), X(m, 5120, m).float() @ r) for m in Ms]
+    check("fused_wqa_wkv two shards (K5 + K5, multi-matrix GEMV)", layer.exl3_mg is not None and max(errs) < TOL,
+          " ".join(f"{e:.1e}" for e in errs))
+    fused.append(layer)
 
     # wo_a: plain column 4096 -> 8192 from eight 4096 -> 1024 slices delivered by index
     sl = [make_exl3(4096, 1024, 5, seed=40 + g) for g in range(8)]
@@ -312,7 +324,7 @@ def t_graph(E, cfg, fused):
     t = make_exl3(2048, 24576, 4, seed=5)
     with TP(2, 8):
         fresh = finish(_load_new(ColumnParallelLinear, 2048, 24576, cfg, t))
-    for layer, k in ((fresh, 2048), (fused, 5120)):
+    for layer, k in [(fresh, 2048)] + [(f, 5120) for f in fused]:
         ok = True
         for m in list(range(1, 9)) + [16, 24, 32, 33, 64, 144, 512, 1100]:
             xs = X(m, k, 1000 + m)
@@ -542,3 +554,9 @@ if __name__ == "__main__":
 #     8192->5120 K5  377 | 481  446 | 542   539 | 663  1179 | 1192  2532 | 2052  5395 | 3961
 #     -> fused from 1024 rows (even at 1024, fused at 2048+), from 384 rows on 16384+ wide outputs (had_r_128 over the
 #     wide output is the cost). 5120->1280 at 4096 rows: 628 us now vs 1604 unchunked / fused before.
+#   Phase 2 (2026-11-02, card 3): static input / scratch / C buffers per layer, one output cast, exl3_mgemm for stacked
+#     layers with equal K. Launches per apply and graph us per apply, before -> after:
+#       Replicated 5120->1280      M=1 4 -> 4 (22.9 -> 22.9 us)   M=6 4 -> 4 (29.7 -> 29.8)
+#       Column wq_b TP8 1280->4096 M=1 4 -> 4 (21.0 -> 20.9)      M=6 4 -> 4 (26.2 -> 26.3)
+#       fused_wqa_wkv K5+K5        M=1 7 -> 4 (~35 -> 27.4)       M=6 7 -> 5 (~46 -> 38.0)
+#       fused_wqa_wkv K5+K6 (L39)  M=1 7 -> 6 (35.5 -> 33.1)      M=6 7 -> 7 (46.1 -> 46.4)
