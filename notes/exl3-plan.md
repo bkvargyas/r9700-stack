@@ -212,3 +212,11 @@ Placeholder stubs for all three live in the repo (branch `exl3`) so imports reso
    would give ~75-100 tok/s. Warm prefill 3,030 tokens in 0.82 s = 3,685 tok/s (the first prefill of a process pays ~11 s
    of Triton JIT: compact-ragged, cp_gather indexer cache, fp8_mqa_logits, block_scores -- a warm-up request belongs in
    the launcher).
+6. Decode profile (graphs, single stream, 64 tokens, PROF=1 PROFACT=CUDA): 20.3 ms of GPU time a step over 2,550 launches;
+   the sparse-attention decode kernel 1.9 ms, our ar8 pair+cross stages 3.2 ms (~79 all-reduces), expert GEMVs 2.1 ms,
+   attention GEMVs 1.3 ms, hyper-connection tilelang kernels 1.8 ms, bf16 skinny GEMMs 0.9 ms, hipBLASLt 1.2 ms, casts
+   ~1.2 ms. The RCCL "Generic" kernel (188 ms over the run) is the PREFILL's all-reduces: RCCL's collective log during
+   capture shows every [tokens, 5120] bf16 all-reduce above the ar8 host-stage ceiling (~96 KB, i.e. more than ~9 tokens
+   a step) going to RCCL at ~2.3 ms a call for 380 KiB. Decode at <= 8 tokens a step stays on ar8; multi-token steps
+   (DSpark x several streams, 10+ concurrent streams) will pay 80 x 1-2 ms a step until the ar8 cross stage takes larger
+   messages. Open item for after correctness.
