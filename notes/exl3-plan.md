@@ -350,3 +350,46 @@ sweep decides whether the 96 KB defaults move down.
 SPLIT_KB 32 and 48 tie (6 tokens 37 us, 8 tokens 47.5); 64 loses at 60 KB (58.5); HOST_1S_KB=48 loses at 80-90 KB (61-66).
 Defaults moved to SPLIT_KB 32; HOST_MAX_KB stays 2048 (the split path ties RCCL at 1.28 MB and loses 4 % at 2 MB -- not worth a rule; a 1.5 MB ceiling also sent the test burst's 2 MB message into the flat collective, which has no 4-rank fallback object -- that stray-oversize case now goes to RCCL); the
 three-kernel variant (R9K_AR8_FUSED=0) is 10-45 % slower than the fused kernel at every size.
+
+## Phase 3 -- KV cache headroom, hyper-connection kernels, draft tuning; then release v0.4.0 and deploy (Brian, 2026-11-02 21:xx UTC)
+
+Memory today (a 32 GiB card, graphs, drafter on): weights 25.5 GiB (EXL3 experts 22.8, attention 0.6, bf16 pieces: wo_a 0.32,
+shared experts 0.35, lm_head 0.16, embed 0.17), the r9k expert tier's scratch ~1.2 GiB (reserve() for 32 rows), the drafter
+~0.3 GiB + graphs (capture "took 1.55 GiB" with DSpark vs ~0 without), KV 1 GiB (= 193,534 tokens; ~5.5 KB a token across
+the SWA / compressed / indexer caches), prefill transients ~1-1.5 GiB at NBT 2048 -> 30.8 GiB used, ~1 GiB free. Target:
+3+ GiB of KV (>= 500k tokens) so 4 streams x 128k or one 500k-token session fit.
+Step time today (drafter, single stream ~14 ms): hyper-connections 1.8 ms (stock TileLang `mhc_pre_big_fuse`, `mhc_post`,
+`hc_prenorm_gemm`: 2 launches a layer each, 9-12 us each, latency-bound at M=1), the rest measured in Phase 2.
+
+Packages (parallel; the owner integrates, then runs the release gate):
+- **S -- serving tuning** (owns `serve/ds41-exl3.sh` defaults, `notes/exl3-serving.md`, `bench/ds41/` additions; the
+  eight-card server is S's -- H and P1 keep their single-card tests under 1 GiB on cards 6 / 5 meanwhile):
+  (1) memory audit per rank at steady state (what torch holds vs what the driver reports: `torch.cuda.memory_stats` in a
+  worker, the "Model loading took" / "Graph capturing took" lines, sysfs VRAM) -> a table by component; (2) reclaim:
+  cudagraph capture sizes (only the sizes the drafter produces: multiples of 6 up to 24 plus the drafter's own; vLLM's
+  `--cuda-graph-sizes` / compilation config), the expert tier's scratch (P1 shrinks it; take P1's new size), unused MoE
+  tier buffers, prefill transients (NBT 2048 vs 1024), the dequantized wo_a (320 MB bf16: keep for now); (3) raise KVMEM
+  to the maximum that survives the soak at 32k and a 128k-context needle (MAXLEN 131072; prefill 128k tokens ~40 s at
+  3.4k tok/s) with >= 0.7 GiB left; (4) draft length: num_speculative_tokens k in {3, 4, 5, 6} x {prose, code, GSM8K-style}
+  at 1 and 4 streams (tprobe + ask3 + longdecode; the verify step costs grow with T), and `enable_adaptive_verification`
+  true/false (the brief said AMD must disable it -- verify whether this pin runs it); (5) defaults into the launcher:
+  KVMEM, MAXLEN, NBT, DSPARK k; validation: divergence.py, needle at 8k / 28k / 100k, sanity_stress, soak 10 min, GSM8K 200.
+- **H -- hyper-connection kernels** (owns `kernels/r9k_mhc.hip`, `r9700_vllm/attn/mhc.py` or `r9700_vllm/hc_dsv4.py`,
+  the hook in `r9700_vllm/models/deepseek_v41_rdna4.py` (mhc part only), `tests/test_mhc_r9k.py`; card 6, < 1 GiB):
+  stock's ops live in `vllm/model_executor/layers/mhc.py` (MHCPreDelayedOp / MHCPostOp, `hc_collapse_triton`) with backends
+  in `vllm/model_executor/kernels/mhc/` (tilelang.py / tilelang_kernels.py = what RDNA4 runs today, triton.py, torch.py =
+  the reference, aiter.py, warmup.py) and the model's use in `vllm/models/deepseek_v41/amd/model.py` ~228-480 (hc_mult 4,
+  sinkhorn 20 iterations, eps, post_alpha 2.0; `hc_attn_fn` [24, 20480], `hc_attn_base` [24], `hc_attn_scale` [3], same for
+  ffn). First measure the Triton backend on RDNA4 against TileLang at M = 1, 6, 24 (a backend switch may already win);
+  then one HIP kernel per op for decode widths (M <= 32): the [M, 20480] x [20480, 24] mix GEMV, sinkhorn, the stream mix,
+  RMSNorm, and the post update, fp32 math with the torch reference's rounding points, bit-exact against torch.py (or within
+  bf16 rounding where stock itself differs), graph-safe; prefill widths stay on stock. Targets: <= 3 us a launch at M=1,
+  <= 6 us at M=24 (from 9-12 us), i.e. ~1.2 ms a step. Our Qwen/GLM hc kernels (kernels/r9k_hc.hip, r9700_vllm/hc.py) show
+  the house style for these elementwise-plus-skinny-GEMV kernels.
+- **P1 (resumed) -- expert tier scratch** (owns `r9700_vllm/moe/exl3_decode.py`, `kernels/r9k_moe_exl3.hip`; card 5, < 1 GiB):
+  reserve() for the real decode shapes (default R9K_EXL3_MOE_R9K_M = 24: four streams x a 6-token verify), bf16 or chunk
+  count cuts for the f32 partial buffers, no per-layer duplication: target <= 256 MiB a rank with no change to numerics or
+  timing at T <= 24; report the exact new footprint for S.
+Then (owner): integrate, release gate on the same tree -- GLM-5.3-Flash TP8 (ar8's split path now starts at 32 KB, so GLM's
+multi-token steps take it), Flash-Next TP4 and 27B TP2 (R9kAllReduceN changed) at the v0.3.8 numbers -- then v0.4.0:
+release note, CHANGELOG, README section, annotated tag, GitHub Release, deploy to VM100's production copy.
