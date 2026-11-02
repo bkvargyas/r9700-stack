@@ -328,3 +328,7 @@ headroom ~1 GiB). Lesson: the tree sync preserves source mtimes, so serve.sh's "
 missed P1's kernel once (the first "P1" integration measured the old tier); exl3-sync.sh now touches changed kernel sources.
 Launches a step with the drafter: ~810 (51,932 over 64 steps) vs ~2,550 before.
 Remaining gap to the Sparks is prose single-stream (61-82 vs 80.7); code and four-stream aggregate are at or above parity.
+GSM8K with all Phase 2 tiers (drafter on, graphs): **194/200 = 97.0 %**, 0 truncations, **2.9 min** (morning: 196/200 in 5.2 min
+-- the two-problem difference is within the noise of 200 problems; P1's kernel is the more accurate of the two expert tiers).
+P2's clean ar8 timing run (~/ds41/exl3/ar8-final.sh -> ar8-final.log) runs on the idle box after this; its SPLIT_KB / HOST_1S_KB
+sweep decides whether the 96 KB defaults move down.
