@@ -133,6 +133,27 @@ def _install_debug_decode() -> bool:
     return True
 
 
+def _install_no_fused_invrope() -> bool:
+    """R9K_DSV41_NO_FUSED_INVROPE=1: the decode launcher gets no inv_rope_positions, so its reduce epilogue does not
+    fold the inverse RoPE in; it reports 0 rotated rows and the caller runs the standalone inverse-RoPE pass the prefill
+    rows use. Isolates the fused epilogue (decode-only code) from the rest of the decode path."""
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
+    orig = O.rocm_sparse_attn_decode
+    if getattr(orig, "__r9k_patch__", None) == "dsv41_no_fused_invrope":
+        return True
+
+    def rocm_sparse_attn_decode(*args, **kwargs):
+        kwargs["inv_rope_positions"] = None
+        kwargs["inv_rope_cos_sin_cache"] = None
+        if kwargs.get("output_mxfp8") is not None:
+            raise RuntimeError("R9K_DSV41_NO_FUSED_INVROPE cannot drop the fused inverse RoPE under output_mxfp8")
+        return orig(*args, **kwargs)
+
+    rocm_sparse_attn_decode.__r9k_patch__ = "dsv41_no_fused_invrope"
+    O.rocm_sparse_attn_decode = rocm_sparse_attn_decode
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -151,6 +172,12 @@ def patch() -> bool:
             done.append("prefill-logits:aiter-triton")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_NO_FUSED_INVROPE", "0") == "1":
+        try:
+            if _install_no_fused_invrope():
+                done.append("decode:no-fused-invrope")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 no-fused-invrope hook not installed (%s)", e)
     if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
         try:
             if _install_debug_decode():
