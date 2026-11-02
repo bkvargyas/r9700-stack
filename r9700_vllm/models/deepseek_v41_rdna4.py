@@ -7,6 +7,11 @@ is Triton or torch and runs here.
   (v1/attention/ops/rocm_aiter_mla_sparse.py rocm_aiter_sparse_attn_indexer) is Triton k-quant/cache-insert, the paged
   logits (our tiled kernel through models/glm5next.py's hook on this GPU), torch fallbacks for the prefill logits and
   the top-k. On RDNA4 we take that op directly.
+* Prefill indexer logits: ``rocm_fp8_mqa_logits`` (same module) takes aiter's Triton ``fp8_mqa_logits`` only under the
+  same aiter gates and otherwise runs ``fp8_mqa_logits_torch``, which materializes [heads, M, N] scores in bf16 and f32 --
+  32 x 2048 x 2048 x 4 B = 512 MiB for a 2k prompt against 2k of context (OOM at ~31 GiB used), 16 GiB for a 4k chunk
+  against 32k of context. The image's aiter ships the Triton kernel with gfx1201 configs; on RDNA4 we call it directly
+  (clean_logits=False, as stock does) and keep the torch path only when the import fails.
 Installed by r9700_vllm.register() next to the exl3 pieces (R9K_DISABLE=dsv41 turns it off); engages for any
 DeepSeek-V4.1 checkpoint, EXL3 or fp8.
 """
@@ -37,6 +42,26 @@ def _install_indexer_gate() -> bool:
     return True
 
 
+def _install_prefill_logits() -> bool:
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
+    if getattr(O.rocm_fp8_mqa_logits, "__r9k_patch__", None):
+        return True
+    try:
+        from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits as aiter_fp8_mqa_logits
+    except Exception:
+        from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits as aiter_fp8_mqa_logits
+    orig = O.rocm_fp8_mqa_logits
+
+    def rocm_fp8_mqa_logits(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+        k_fp8, scale = kv
+        return aiter_fp8_mqa_logits(q, k_fp8, scale, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits=False)
+
+    rocm_fp8_mqa_logits.__r9k_patch__ = "dsv41_rdna4"
+    rocm_fp8_mqa_logits.__r9k_orig__ = orig
+    O.rocm_fp8_mqa_logits = rocm_fp8_mqa_logits
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -50,6 +75,11 @@ def patch() -> bool:
             done.append("indexer:rdna4-gate")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 indexer gate not installed (%s)", e)
+    try:
+        if _install_prefill_logits():
+            done.append("prefill-logits:aiter-triton")
+    except Exception as e:  # pragma: no cover
+        logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
     if done:
         logger.info("r9700: deepseek_v41 on RDNA4: %s", ", ".join(done))
     return bool(done)
