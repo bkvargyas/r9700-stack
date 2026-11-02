@@ -19,6 +19,9 @@ is Triton or torch and runs here.
   32 x 2048 x 2048 x 4 B = 512 MiB for a 2k prompt against 2k of context (OOM at ~31 GiB used), 16 GiB for a 4k chunk
   against 32k of context. The image's aiter ships the Triton kernel with gfx1201 configs; on RDNA4 we call it directly
   (clean_logits=False, as stock does) and keep the torch path only when the import fails.
+* Hyper-connections: stock's MHCPreDelayedOp / MHCPostOp run TileLang on RDNA4, three launches a seam (27 us at M=1);
+  R9K_DSV41_MHC=r9k (default when libr9k has the kernels) binds hc_dsv4.py's one-launch seam for calls of <= 32 rows
+  (_install_mhc); ``stock`` keeps TileLang.
 Installed by r9700_vllm.register() next to the exl3 pieces (R9K_DISABLE=dsv41 turns it off); engages for any
 DeepSeek-V4.1 checkpoint, EXL3 or fp8.
 """
@@ -198,6 +201,27 @@ def _install_splitk_decode() -> bool:
     return True
 
 
+def _install_mhc() -> bool:
+    """Hyper-connection seams on our kernels (hc_dsv4.py, kernels/r9k_mhc.hip): MHCPreDelayedOp.forward_hip (the post
+    folded into the delayed pre: one launch a seam instead of stock's three TileLang launches) and MHCPostOp.forward_hip,
+    for calls of up to 32 rows; wider calls run stock's ops inside the same custom ops. Installed on the classes before
+    the model is built (CustomOp binds forward_hip at construction). R9K_DSV41_MHC=stock keeps stock's."""
+    from vllm.model_executor.layers import mhc as M
+    from r9700_vllm import hc_dsv4 as D
+    if getattr(M.MHCPreDelayedOp.forward_hip, "__r9k_patch__", None) == "dsv41_mhc":
+        return True
+    if not D.available():
+        return False
+    D.register()
+    for cls, fn in ((M.MHCPreDelayedOp, D.pre_delayed_forward_hip), (M.MHCPostOp, D.post_forward_hip)):
+        def wrapped(self, *args, __fn=fn, **kwargs):
+            return __fn(self, *args, **kwargs)
+        wrapped.__r9k_patch__ = "dsv41_mhc"
+        wrapped.__r9k_orig__ = cls.forward_hip
+        cls.forward_hip = wrapped
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -230,6 +254,12 @@ def patch() -> bool:
                 done.append("decode:ragged+inverse-rope-unfused")
         except Exception as e:  # pragma: no cover
             logger.warning("r9700: dsv41 no-fused-invrope hook not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_MHC", "r9k") == "r9k":
+        try:
+            if _install_mhc():
+                done.append("mhc:r9k-seam(M<=32)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 r9k mhc kernels not installed (%s); stock TileLang", e)
     if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
         try:
             if _install_debug_decode():
