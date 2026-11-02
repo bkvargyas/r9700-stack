@@ -258,3 +258,53 @@ Soak (8 clients, 641 s, prompts 10.3k-30.6k tokens, median 21k): 85 requests, 0 
 median latency 59 s; VRAM settled at 30.7-31.0 GiB a card (allocator growth under long prefills; no OOM). Probe after the soak
 (usage-based, DSpark on): single stream 50.7 tok/s, 4 streams 117 tok/s aggregate, warm prefill 3.4k tok/s.
 Server left running on VM100 (container ds41, port 8080) for Brian's check-in.
+
+## Phase 2 -- performance (started 2026-11-02 ~14:00 UTC; Brian: "begin the payoff process")
+
+Target: the two DGX Sparks on TensorFold serve this pack at 80.7 tok/s prose / 118 code single stream (thinking off), 154-166
+at four streams, 2.1k tok/s prefill. We are at ~42-51 prose / ~96 code / 117 at four streams / 3.4k prefill. Where the step
+goes (dummy-weight profile, graphs, single stream: 20.3 ms GPU, 2,550 launches): our ar8 pair+cross stages 3.2 ms (~79
+all-reduces), expert GEMVs 2.1 ms, sparse-attention decode 1.9 ms, hyper-connection tilelang kernels 1.8 ms, attention GEMVs
+1.3 ms, hipBLASLt 1.2 ms, casts ~1.2 ms, bf16 skinny GEMMs 0.9 ms. The DSpark verify step (6 tokens) costs ~2x a single
+token: the MoE decode tier (exl3_mgemm per slot) runs ~70 us a local pick plus ~45 us fixed (T=1 77 us a layer, T=8 376 us),
+and stock's decode attention kernel on RDNA4 is the "fallback for un-tuned architectures": one workgroup per (query,
+16-head block) walking every key serially (48 us a layer a query, 1 of 32 CUs busy). Above ~9 tokens a step the
+[tokens, 5120] bf16 all-reduces leave ar8's host stage (96 KB ceiling) for RCCL at 1-2 ms each.
+
+Packages (parallel Opus agents; the owner integrates on eight cards and re-measures):
+- **P1 -- batched EXL3 expert kernel for the decode tier** (owns `kernels/r9k_moe_exl3.hip`, `r9700_vllm/moe/exl3_decode.py`,
+  the `R9K_EXL3_MOE_DECODE=r9k` tier in `r9700_vllm/quant/exl3_moe.py`, `tests/test_exl3_moe_r9k.py`; card 5, 4 if needed).
+  Physics: at T=6 x 6 picks = 36 slots, ~4.5 are local a rank a layer = 60 MB of trellis = 0.1 ms at 600 GB/s; we spend ~300 us.
+  Step 1: measure exllamav3's exl3_mgemm grid/occupancy at 1-6 local slots (rocprof or torch profiler) and say why it is slow.
+  Step 2: our kernel: grid over (slot, 128-output tile), gate and up for the same slot/tile in one workgroup (the rotated input
+  read once), per-slot input Hadamard with that expert's suh (in-kernel from LDS or a small pre-pass), EXL3 trellis decode
+  reusing exllamav3's device functions (MIT; copy with attribution in CREDITS.md; the 16x16 tile layout and the mul1 codebook
+  must match bit for bit -- validate against reconstruct), SiLU x up with act_limit, down projection the same way, 128-point
+  output Hadamard + svh in LDS, per-slot f32 outputs gathered per token in pick order (deterministic, as the current tier).
+  K = 2 and 3 (main), 4-6 (drafter: 16 local experts). No host syncs; graph-capturable; non-local slots skipped on device.
+  Targets: T=1 <= 50 us a layer, T=6 <= 120 us, T=24 <= 400 us; >= 400 GB/s on trellis bytes. Then integrate as the decode tier
+  and keep exllamav3's tier as `R9K_EXL3_MOE_DECODE=mgemv`.
+- **P2 -- ar8 beyond 96 KB** (owns `r9700_vllm/comm/r9k_ar8.py`, `r9700_vllm/comm/r9k_ar.py`, `kernels/r9k_ar*.hip` if needed,
+  `tests/test_ar8.py`; all eight cards for short collective tests, timing runs when the other cards are quiet). Extend the
+  pinned-host cross stage among the four evens to messages up to `R9K_AR8_HOST_MAX_KB` (default 2048): keep the one-shot host
+  exchange to ~96 KB, add a two-shot (reduce-scatter over host memory, then all-gather) above it -- each even writes its
+  buffer, reduces its quarter from the three peers, writes the reduced quarter back, reads the other quarters (2.75 S of
+  traffic vs 4 S, two barriers). Pair stage stays P2P (two-shot <= 512 KB today; raise if the sizes need it). Graph-safe
+  (device-mapped flags, no host syncs). Targets: 240 KB (24 tokens) <= 100 us, 1 MB <= 250 us, bit-exact across ranks, within
+  1 bf16 ulp of the rank-ordered fp32 reference, graph replay of chained calls (tests/test_ar8.py, extend TOKS to 24, 64, 200).
+- **P3 -- RDNA4 decode attention** (owns `r9700_vllm/models/deepseek_v41_rdna4.py` (the decode launcher part),
+  `r9700_vllm/attn/dsv4_decode.py` if the launcher grows, `tests/test_dsv4_decode.py`; card 7, 6 if needed). On RDNA4 route the
+  decode attention launch to stock's split-K Triton kernels (`_sparse_attn_decode_partial_kernel` + `_sparse_attn_decode_reduce_kernel`,
+  whose FUSE_INV_ROPE epilogue is correct) instead of the serial ragged fallback: our wrapper replaces the body of
+  `rocm_sparse_attn_decode` for the fallback case, choosing `num_splits` / `block_k` / `num_warps` for 32 CUs and wave32 (the
+  gfx950 tuning assumes 256 CUs), and then reports the rotated rows truthfully (dropping the current no-fused-invrope
+  workaround for that path). Both the fp8 and bf16 launchers. Validate with bench/ds41/divergence.py (>= 22/24 at |dlogprob|
+  < 0.2 on the real server -- ask the owner to run it) and a unit test against the ragged kernel's output on synthetic caches.
+  Targets: T=1 <= 15 us a layer, T=6 <= 40 us (now 48 us x queries). Stretch: our own HIP kernel (attn/r9k_sparse_mla.hip
+  does the GLM geometry; DSv4 is 448 nope + 64 rope, fp8 records with e8m0 scales per 64, SWA + top-k segments, attn_sink).
+- **L (resumed) -- casts** (owns `r9700_vllm/quant/exl3.py`; card 3): remove the standalone cast/copy kernels around the EXL3
+  GEMV (bf16 -> f16 input, f32 -> bf16 output, .contiguous() copies): had_r_128 or the kernel taking bf16 input if exllamav3
+  allows, f16 C with one fused cast, preallocated buffers; count launches per apply before/after and the per-step saving.
+
+Integration: the owner relaunches `serve/ds41-exl3.sh` with the new tiers, runs divergence.py, needles, GSM8K, tprobe at 1 and
+4 streams with and without the drafter, and compares with the Phase 1 numbers above.
