@@ -82,6 +82,58 @@ def _install_all_prefill() -> bool:
     return True
 
 
+def _install_debug_decode() -> bool:
+    """Diagnostic (R9K_DSV41_DEBUG_DECODE=1, eager): log the decode attention launches of rank 0 -- per call the
+    ragged main (SWA) and extra (top-k compressed) segments: lengths, slot ranges, duplicates, and the full slot lists of
+    the first launch of each step -- to check what the decode kernel is told to attend."""
+    import inspect
+    from vllm.v1.attention.ops import rocm_aiter_mla_sparse as O
+    state = {"calls": 0}
+
+    def wrap(name):
+        orig = getattr(O, name)
+        if getattr(orig, "__r9k_patch__", None):
+            return
+        sig = inspect.signature(orig)
+
+        def fn(*args, **kwargs):
+            try:
+                from vllm.distributed import get_tensor_model_parallel_rank
+                rank0 = get_tensor_model_parallel_rank() == 0
+            except Exception:
+                rank0 = True
+            if rank0 and state["calls"] < 160:
+                b = sig.bind(*args, **kwargs).arguments
+                i = state["calls"]; state["calls"] += 1
+                parts = [f"[dsv41-decode #{i} {name}]"]
+                for k, v in b.items():
+                    if isinstance(v, torch.Tensor):
+                        if v.dtype in (torch.int32, torch.int64) and v.numel() <= 1_000_000 and v.dim() == 1:
+                            x = v.detach().cpu()
+                            if "indptr" in k:
+                                d = (x[1:] - x[:-1])
+                                parts.append(f"{k}={tuple(v.shape)} lens={d[:8].tolist()}")
+                            else:
+                                n = int(x.numel())
+                                parts.append(f"{k}={tuple(v.shape)} min={int(x.min()) if n else 0} max={int(x.max()) if n else 0}")
+                                if i % 40 == 0:
+                                    parts.append(f"{k}[:150]={x[:150].tolist()}")
+                        else:
+                            parts.append(f"{k}={tuple(v.shape)}/{str(v.dtype).replace('torch.', '')}")
+                    elif isinstance(v, (int, float, bool)):
+                        parts.append(f"{k}={v}")
+                print(" ".join(parts), flush=True)
+            return orig(*args, **kwargs)
+
+        fn.__r9k_patch__ = "dsv41_debug_decode"
+        setattr(O, name, fn)
+
+    for name in ("rocm_sparse_attn_decode", "rocm_sparse_attn_decode_bf16"):
+        if hasattr(O, name):
+            wrap(name)
+    return True
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -100,6 +152,12 @@ def patch() -> bool:
             done.append("prefill-logits:aiter-triton")
     except Exception as e:  # pragma: no cover
         logger.warning("r9700: dsv41 prefill logits hook not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
+        try:
+            if _install_debug_decode():
+                done.append("DEBUG-DECODE(diagnostic)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 debug-decode hook not installed (%s)", e)
     if os.environ.get("R9K_DSV41_ALL_PREFILL", "0") == "1":
         try:
             if _install_all_prefill():
