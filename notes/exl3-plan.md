@@ -332,3 +332,21 @@ GSM8K with all Phase 2 tiers (drafter on, graphs): **194/200 = 97.0 %**, 0 trunc
 -- the two-problem difference is within the noise of 200 problems; P1's kernel is the more accurate of the two expert tiers).
 P2's clean ar8 timing run (~/ds41/exl3/ar8-final.sh -> ar8-final.log) runs on the idle box after this; its SPLIT_KB / HOST_1S_KB
 sweep decides whether the 96 KB defaults move down.
+
+### ar8 clean timing (P2's quiet-box run, 2026-11-02 19:15-19:21 UTC, us per all-reduce, HIP graphs, best of 3)
+| tokens x 5120 bf16 | KiB | RCCL | old ar8 (to 96 KB, then RCCL) | new ar8 (defaults 96/2048) | new, SPLIT_KB=32 |
+|---|---|---|---|---|---|
+| 1 (4096-wide) | 8 | 112 | 21 | 21 | 21 |
+| 4 (4096-wide) | 32 | 117 | 48 | 47 | 46 |
+| 6 | 60 | 105 | -- | -- | 37 |
+| 8 | 80 | 99 | 123 | 78 | 47 |
+| 10 | 100 | 102 | RCCL | 49 | 49 |
+| 16 | 160 | 111 | RCCL | 65 | 65 |
+| 24 | 240 | 125 | RCCL | 83 | -- |
+| 64 | 640 | 182 | RCCL | 157 | -- |
+| 100 | 1000 | 240 | RCCL | 230 | -- |
+| 128 | 1280 | 281 | RCCL | 281 | -- |
+| 200 | 2000 | 402 | RCCL | 419 | -- |
+SPLIT_KB 32 and 48 tie (6 tokens 37 us, 8 tokens 47.5); 64 loses at 60 KB (58.5); HOST_1S_KB=48 loses at 80-90 KB (61-66).
+Defaults moved to SPLIT_KB 32 and HOST_MAX_KB 1536 (the split path ties RCCL at 1.28 MB and loses 4 % at 2 MB); the
+three-kernel variant (R9K_AR8_FUSED=0) is 10-45 % slower than the fused kernel at every size.
