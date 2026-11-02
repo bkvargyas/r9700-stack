@@ -88,7 +88,7 @@ def _had128(dev: torch.device) -> torch.Tensor:
     """The 128-point Hadamard exllamav3 applies (Sylvester order, 1/sqrt(128); == ext.had_r_128), f32."""
     h = _HAD.get(dev)
     if h is None:
-        h = torch.ones(1, 1, device=dev)
+        h = torch.ones(1, 1, device=dev, dtype=torch.float32)   # not the default dtype: vLLM sets it to bf16
         while h.shape[0] < 128:
             h = torch.cat([torch.cat([h, h], 1), torch.cat([h, -h], 1)], 0)
         h = _HAD[dev] = h * 128 ** -0.5
@@ -357,7 +357,7 @@ class Exl3LinearMethod(LinearMethodBase):
             return {"trellis": torch.randint(-32768, 32768, (k // 16, n // 16, 80), dtype=torch.int32,
                                              device=dev).to(torch.int16),
                     "suh": (torch.randint(0, 2, (k,), device=dev) * 2 - 1).half(),
-                    "svh": ((torch.rand(n, device=dev) - 0.5) * 2 / k ** 0.5).half(),
+                    "svh": ((torch.rand(n, device=dev, dtype=torch.float32) - 0.5) * 2 / k ** 0.5).half(),
                     self.quant_config.codebook: True}
         k = layer.exl3_k
         if layer.exl3_row:
