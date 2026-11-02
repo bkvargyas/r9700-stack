@@ -447,6 +447,38 @@ def t_streams(E):
     return res
 
 
+def t_dummy(E, cfg):
+    """R9K_EXL3_DUMMY=1: layers that loaded nothing get random matrices of their real geometry (no assert)."""
+    from vllm.model_executor.layers.linear import ColumnParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+    print("[dummy] R9K_EXL3_DUMMY=1 with no loads", flush=True)
+    os.environ["R9K_EXL3_DUMMY"] = "1"
+    try:
+        ok = True
+        with TP(3, 8):
+            ls = [ColumnParallelLinear(1280, 32768, bias=False, quant_config=cfg, params_dtype=BF, prefix="d.wq_b"),
+                  MergedColumnParallelLinear(5120, [1280, 512], bias=False, quant_config=cfg, params_dtype=BF,
+                                             prefix="d.fused_wqa_wkv", disable_tp=True),
+                  RowParallelLinear(8192, 5120, bias=False, quant_config=cfg, params_dtype=BF, prefix="d.wo_b"),
+                  MergedColumnParallelLinear(5120, [2304, 2304], bias=False, quant_config=cfg, params_dtype=BF,
+                                             prefix="d.gate_up"),
+                  RowParallelLinear(2304, 5120, bias=False, quant_config=cfg, params_dtype=BF, prefix="d.down")]
+        for layer in ls:
+            finish(layer)
+            for m in (1, 24):
+                y = layer.quant_method.apply(layer, X(m, layer.exl3_k, m))
+                ok &= tuple(y.shape) == (m, layer.exl3_n) and bool(torch.isfinite(y).all())
+        ok &= len(ls[1].exl3_parts) == 2 and ls[3].exl3_dense and ls[4].exl3_dense
+    finally:
+        del os.environ["R9K_EXL3_DUMMY"]
+    layer = ColumnParallelLinear(1280, 4096, bias=False, quant_config=cfg, params_dtype=BF, prefix="d.real")
+    try:
+        finish(layer)
+        ok = False
+    except AssertionError:
+        pass
+    check("dummy mode: wq_b / fused_wqa_wkv / wo_b / dense shared expert finite, right shapes; no env -> assert", ok)
+
+
 def main():
     E = init_vllm()
     cfg = E.Exl3Config.from_config({"quant_method": "exl3", "version": "1.6.2", "avg_bits": 2.9, "head_bits": 6,
@@ -461,6 +493,7 @@ def main():
     t_tp8(E, cfg, Ms)
     fused = t_stacked(E, cfg, Ms)
     t_lm_head(E, cfg)
+    t_dummy(E, cfg)
     t_graph(E, cfg, fused)
     if not QUICK:
         t_timing(E, [(5120, 1280, 5), (1280, 4096, 5), (1024, 5120, 5), (4096, 1024, 5), (5120, 512, 5)])

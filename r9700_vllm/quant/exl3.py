@@ -345,11 +345,43 @@ class Exl3LinearMethod(LinearMethodBase):
         _placeholders(layer, self.quant_config.codebook, make_loader)
 
     # -------------------------------------------------------------------------------------------- after loading
+    def _dummy_stash(self, layer) -> dict:
+        """R9K_EXL3_DUMMY=1 (``--load-format dummy`` bring-up): random K=5 matrices of the layer's real per-rank
+        geometry, in the stash format the loaders produce (dense layers: whole matrices + this rank's span, then the
+        normal densify). Any int16 trellis decodes, so the forward and its warm-up run on real shapes."""
+        dev = torch.device("cuda", torch.cuda.current_device())
+        rank, size = self._tp(layer)
+        sizes = layer.output_partition_sizes
+
+        def mat(k, n):
+            return {"trellis": torch.randint(-32768, 32768, (k // 16, n // 16, 80), dtype=torch.int32,
+                                             device=dev).to(torch.int16),
+                    "suh": (torch.randint(0, 2, (k,), device=dev) * 2 - 1).half(),
+                    "svh": ((torch.rand(n, device=dev) - 0.5) * 2 / k ** 0.5).half(),
+                    self.quant_config.codebook: True}
+        k = layer.exl3_k
+        if layer.exl3_row:
+            whole = layer.exl3_dense
+            st = mat(k * size if whole else k, layer.exl3_n)
+            st["span"] = (rank * k, (rank + 1) * k, 0) if whole else (0, k, 0)
+            return {None: st}
+        out, dst = {}, 0
+        for i, n in enumerate(sizes):
+            whole = layer.exl3_dense and not isinstance(layer, ReplicatedLinear)
+            st = mat(k, n * size if whole else n)
+            st["span"] = (rank * n, (rank + 1) * n, dst) if whole else (0, n, dst)
+            out[i] = st
+            dst += n
+        return out
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         stash = layer.exl3_stash
         if not stash and (layer.exl3_parts or hasattr(layer, "weight")):
             return                                           # already processed
         prefix = getattr(layer, "prefix", "") or type(layer).__name__
+        if not stash and os.environ.get("R9K_EXL3_DUMMY") == "1":
+            stash = self._dummy_stash(layer)
+            logger.info_once("exl3: R9K_EXL3_DUMMY=1 -- random EXL3 matrices for layers that loaded none")
         parts = []
         for sid, st in stash.items():
             if st.get("skip"):
