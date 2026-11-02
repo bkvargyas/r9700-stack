@@ -280,6 +280,7 @@ class R9kAllReduceN:
         self.disabled = True
         self.world_size = dist.get_world_size(group)
         self.rank = dist.get_rank(group)
+        self.group = group                    # for the RCCL fallback on stray oversize calls
         # host=True (or R9K_ARN_HOST=1): the exchange buffers live in pinned host memory shared through /dev/shm
         # instead of each card's VRAM, so a push crosses one PCIe link to the host instead of two root complexes
         # (the cross-switch stage of comm/r9k_ar8.py). Same kernels, same bits; only the pointers differ.
