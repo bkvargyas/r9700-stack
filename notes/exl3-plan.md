@@ -250,3 +250,7 @@ DSPARK=1 with the fix (graphs): quality intact (557-token essay to a clean stop,
 code / 2.5 on prose, per-position 0.77/0.61/0.52/0.39/0.33 (code); usage-based speed 96 tok/s on code, ~42 tok/s on prose
 (vs 43-46 without the drafter): the verify step at 6 tokens costs ~2x a single-token step (MoE mgemv per slot, attention
 over 6 queries), so prose breaks even and code doubles. Multi-token decode MoE is the lever (also task 49 for 4+ streams).
+**Validation with the fix (10:00-10:40 UTC, DSPARK=1, graphs, KVMEM 1, NSEQ 4):** GSM8K 200 problems greedy with thinking:
+**196/200 = 98.0 %**, 0 truncations, 5.2 min at ~140 tok/s aggregate (4 streams; drafter acceptance 3.2-3.6 on math).
+Needles 3/3 at 8k, 16k and 28k tokens (prefill 2.5 / 6 / 8.6-11.5 s). Strict 8-way sanity after 24k-token prefills:
+0 bad of 80 (10 rounds). Soak: 8 clients x 10 min, 10k-28k prompts -- see below.
