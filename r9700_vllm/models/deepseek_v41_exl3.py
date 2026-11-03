@@ -248,6 +248,28 @@ class _Rewriter:
         self.direct.add(f"{path}.weight")
 
 
+def trim_rope_caches(model: torch.nn.Module, max_model_len: int, margin: int = 128) -> int:
+    """Stock builds both rotary embeddings' ``cos_sin_cache`` for 1,048,576 positions ([1M, 64] f32 = 256 MiB each, two
+    objects shared by the layers): slice them to the positions this server can see. Row p is the same whatever the cache
+    length, so every position below max_model_len + margin is bit-identical; the launcher's MAXLEN decides. Returns MiB freed
+    (package S's audit, 2026-11-03: 448 MiB a rank at 131072, 496 at 32768)."""
+    rows = max_model_len + margin
+    seen: set[int] = set()
+    freed = 0
+    for m in model.modules():
+        rope = getattr(m, "rotary_emb", None)
+        cache = getattr(rope, "cos_sin_cache", None) if rope is not None else None
+        if cache is None or id(rope) in seen or cache.shape[0] <= rows:
+            continue
+        seen.add(id(rope))
+        freed += (cache.shape[0] - rows) * cache.shape[1] * cache.element_size() >> 20
+        rope.cos_sin_cache = cache[:rows].contiguous()
+    if freed:
+        torch.cuda.empty_cache()
+        logger.info_once("r9700 exl3: RoPE cos/sin caches trimmed to %d positions (%d MiB freed a rank)", rows, freed)
+    return freed
+
+
 def _build():
     from vllm.models.deepseek_v41.amd.dspark import DSparkDeepseekV4ForCausalLM
     from vllm.models.deepseek_v41.amd.vl_model import DeepseekV41ForCausalLM
@@ -257,6 +279,7 @@ def _build():
 
         def __init__(self, *, vllm_config, prefix: str = "") -> None:
             self._r9k_exl3 = is_exl3(vllm_config.quant_config)
+            self._r9k_max_len = int(vllm_config.model_config.max_model_len)
             if not self._r9k_exl3:
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
                 return
@@ -270,7 +293,9 @@ def _build():
             if not self._r9k_exl3:
                 return super().load_weights(weights)
             rw = _Rewriter(self, draft=False)
-            return set(super().load_weights(rw(weights))) | rw.direct
+            loaded = set(super().load_weights(rw(weights))) | rw.direct
+            trim_rope_caches(self, self._r9k_max_len)
+            return loaded
 
     class DSparkDeepseekV41Exl3(DSparkDeepseekV4ForCausalLM):
         """Stock ROCm DSpark drafter (``mtp.{0,1,2}.*``); EXL3 packs load through _Rewriter (embed / lm_head alias the
@@ -278,6 +303,7 @@ def _build():
 
         def __init__(self, *, vllm_config, prefix: str = "") -> None:
             self._r9k_exl3 = is_exl3(vllm_config.quant_config)
+            self._r9k_max_len = int(vllm_config.model_config.max_model_len)
             if not self._r9k_exl3:
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
                 return
@@ -289,7 +315,9 @@ def _build():
             if not self._r9k_exl3:
                 return super().load_weights(weights)
             rw = _Rewriter(self, draft=True)
-            return set(super().load_weights(rw(weights))) | rw.direct
+            loaded = set(super().load_weights(rw(weights))) | rw.direct
+            trim_rope_caches(self, self._r9k_max_len)
+            return loaded
 
     out = {}
     for c in (DeepseekV41ForCausalLMExl3, DSparkDeepseekV41Exl3):
