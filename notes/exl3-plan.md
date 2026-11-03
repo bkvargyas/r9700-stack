@@ -557,3 +557,26 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   (86.6 / 81). Divergence 23 / 24 / 23 (|dlogprob| 0.084 / 0.031 / 0.048), GSM8K 98 / 100. B adds +4-11 % single stream on top of C;
   four streams unchanged (its fusions fall back to stock above 8 rows). Running total vs v0.4.0: single-stream prose **+24-27 %**
   (73 -> 90-92), code **+18 %** (152 -> 179); the Sparks' 80.7 / 118 are now beaten by 1.1x / 1.5x single stream.
+
+### Phase 4 results, package A (expert tier to 48 tokens, split-path collective; card 5 / eight cards; 2026-11-03 17:35 UTC)
+- **r9k expert tier** (card 5, graph replay, us a layer, K = 3, 48 local experts, cold weights, SCLK offset 0; T / local picks /
+  distinct experts): 6/4/4 **123 -> 118-124**, 6/5/5 146 -> 141-152, 24/18/15 **518 -> 414-435**, 36/27/21 795 -> 616-620, 48/36/25
+  **2324 (exllamav3's fused tier) -> 674-741** (449-492 GB/s on trellis bytes; gate+up 586 us at 377 GB/s, down 211 at 525),
+  48/36/12 676, 48/36/36 990. K = 2: 24 tok 548 -> 369, 48 tok 2309 -> 717. Drafter (K = 4, 16 local, top-3): T = 20 223 -> 213,
+  T = 40 407 -> 342. Slot cap 512, grouping compacts local slots first (O(nl^2)), batched input rotation, 2-row groups above 8
+  tokens, `r9k_moe_exl3_groups` validation export; R9K_EXL3_MOE_R9K_M default 48, scratch 47.5 MiB a rank. Bit-exact decode,
+  graphs = eager, rms rel err <= 4.2e-4 to T = 48. Target T = 48 <= 700 narrowly missed (steady state 735-741).
+- **NSEQ 8 launches** with the tier at 48: the v0.4.0 fault (HSA aperture violation in the mixed warm-up) is in the > 24-token path
+  through exllamav3's fused tier in-server (R9K_EXL3_MOE_R9K_M=24 on A's tree faults the same way; the fused tier is clean on one
+  card at 25-64 tokens; AMD_SERIALIZE_KERNEL names no kernel). Known limit: steps above 48 tokens (NSEQ > 8 at k = 5) stay off.
+- **Split-path collective** (eight cards, quiet box, us per all-reduce; before -> after, RCCL): 100 KiB 49.8 -> 45.4 (101), 160 65.1
+  -> 60.3 (112), **240 81.7 -> 77.2** (124), 320 99.8 -> 90.9 (135), **480 140.2 -> 121.8** (161), 640 158 -> 156 (182). The stage
+  trace: the two host-memory read roles (reduce, gather) take 31 + 23 us of the 85 us span at 240 KiB (~180 KB of host reads a
+  rank at ~3 GB/s, request-limited); more lanes or sub-steps lose (15 lanes 134 us; 30 lanes at 480 KiB 252). Rule: one lane with
+  1024-word sub-steps (R9K_AR8_FUSED_W1). Targets (<= 50 / <= 90) missed; the remaining gain needs a data path with fewer host
+  reads (v0.4.2). Rank skew inside a pair < 2 us; the ledger's 161 vs 80 us at 240 KB is arrival skew from the preceding compute.
+- **Launcher finding (unverified by the owner yet):** exporting ANY extra `-e` variable through DOCKER_ARGS into the container left
+  the DSpark drafter at MAL 1.01-1.04 (vs 1.7-1.8) in 5 of 5 launches, including a dummy `R9K_A4_DUMMY=48`; the bad runs JIT a
+  different rejection-sampler path. A's launcher export of R9K_EXL3_MOE_R9K_M was the union tree's four-stream regression. Being
+  reproduced on the clean C+B+A tree (clean-CBA.sh: `-e FOO_DUMMY=1` and `-e R9K_A4_DUMMY=48`).
+- Committed as 3f2167a on v041 (A's files + the build.sh export; the trace / lane-cap hunks were in b9c07e8).
