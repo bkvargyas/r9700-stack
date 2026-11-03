@@ -23,7 +23,7 @@ Release notes with the validation record: [notes/release-v0.4.0.md](notes/releas
   for the linears and our own batched expert decode kernel (bit-exact trellis decode, two launches a layer), the 6-bit head
   and the shared experts dequantized to bf16 at load. Single stream **70-75 tok/s** (prose) / **158 tok/s** (code) with the
   checkpoint's DSpark drafter (k = 5, adaptive verification), **187 / 336 tok/s** aggregate at four streams, prefill 3.4k
-  tok/s, GSM8K 97-98 %, needles retrieved to 28k (128k under validation). Two DGX Sparks on TensorFold serve the same pack at
+  tok/s, GSM8K 97-98 %, needles retrieved at 8k-28k on the 32k recipe and at 64k-126.7k on the 128k recipe. Two DGX Sparks on TensorFold serve the same pack at
   80.7 / 118 single-stream and 154 / 166 at four streams.
 - **RDNA4 fixes to stock's DeepSeek-V4/V4.1 path** (`models/deepseek_v41_rdna4.py`): the sparse-attention indexer's
   architecture gate opened (its op is Triton/torch); the prefill indexer logits through aiter's Triton kernel instead of a

@@ -136,10 +136,12 @@ peak by more than the 0.3-0.5 GiB those budgets add, so the trim buys headroom f
 | 32768 | 2.2 | 425,776 | -- | -- | OOM card 7 (speculator capture) |
 | 32768 | 2.0 | 387,069 | -- | -- | OOM card 7 (speculator capture) |
 | **32768** | **1.7** | **329,008** | 31,452 MiB | 31,913 MiB (0.69 GiB free) | 71 s, "took 1.41 GiB" |
-| 131072 | __KVB__ | __KVB_TOK__ | __B_IDLE__ | __B_PEAK__ | __B_CAPTURE__ |
+| 131072 | 1.5 | 588,434 (vLLM's 128k accounting) | -- | -- | OOM card 7 (speculator capture; the indexer's prefill-logits workspace is ~0.7 GiB larger at 128k) |
+| 131072 | 1.0 | 392,289 (2.99 x 131k) | 31,252 MiB | 31,821 at the 64k needle, 31,963 at 100k, 32,407-32,408 MiB (0.21 GiB free, cards 1 and 4) at the 120k needle and the 60-100k soak | 72 s, "took 1.43 GiB" |
+| **131072** | **0.8** | **313,831** (2.39 x 131k) | 31,032 MiB | 32,207 at the 120k needle, 32,231 MiB (0.38 GiB free) at the 128.5k needle and the 100-125k soak | 71 s, "took 1.43 GiB" |
 
-Defaults: `KVMEM=1.7` at the launcher's MAXLEN 32768 (10 concurrent 32k requests); `MAXLEN=131072 KVMEM=__KVB__` for the long-context
-launch. Open item for v0.4.1: capture the speculator with the dequant tier off (or size R9K_EXL3_MOE_R9K_M to the largest
+Defaults: `KVMEM=1.7` at the launcher's MAXLEN 32768 (10 concurrent 32k requests); `MAXLEN=131072 KVMEM=0.8` for the long-context
+launch (313,831 tokens: two full-length requests and change; KVMEM 1.0 retrieves at 120k too but leaves 0.21 GiB). Open item for v0.4.1: capture the speculator with the dequant tier off (or size R9K_EXL3_MOE_R9K_M to the largest
 capture width) so the capture peak falls back under the steady-state peak -- that is 0.3-0.5 GiB of KV (60-100k tokens).
 
 ## 5. Validation of the defaults (launch A: MAXLEN 32768, KVMEM 1.7, k = 5, adaptive on, graphs, 0.4.0rc image; 2026-11-03 06:51-07:35 UTC)
@@ -158,6 +160,24 @@ capture width) so the capture peak falls back under the steady-state peak -- tha
 | server log | 0 errors (the transformers "model of type deepseek_v41" notice x 8 is stock's) |
 | sysfs after | 31,836-31,916 MiB used a card |
 
-__B_VALIDATION__
+## 5b. The 128k launch (MAXLEN 131072, KVMEM 1.0 = 392,289 KV tokens, otherwise the defaults; `validate-B.sh` -> `S/validate-B.log`, 08:01-08:29 UTC)
+
+| | |
+|---|---|
+| needle.py 64k / 100k / 120k (3 facts each) | **3/3, 3/3, 3/3**; prefill 63.1k tokens in 17.5-19.0 s (3.4k tok/s), 98.9k in 27.1-27.3 s (3.6k), 118.5k in 32.4-33.0 s (3.6k) |
+| soak (2 clients, 60-100k-token prompts, 316 s) | 13 ok, 0 errors, median prompt 78,976 tokens, 3,234 prompt tok/s |
+| VRAM | worst card 0.78 GiB free at the 64k needle, 0.65 at 100k, **0.21 GiB at 120k and through the soak** (cards 1 and 4 at 32,391-32,408 MiB): the per-request prefill transient grows with the prompt's context (the indexer's logits over chunk x context) |
+| server log | 0 errors |
+
+## 5c. The documented 128k recipe (MAXLEN 131072, KVMEM 0.8 = 313,831 KV tokens; `validate-B3.sh` -> `S/validate-B3.log`, 08:38-08:59 UTC)
+
+| | |
+|---|---|
+| needle.py 120k / 128.5k (3 facts each) | **3/3, 3/3**; prefill 118.5k tokens in 32.5-33.3 s, 126.7k in 34.7-35.0 s (3.6k tok/s) |
+| soak (2 clients, 100-125k-token prompts, 213 s) | 6 ok, 0 errors, median prompt 119,396 tokens, 3,249 prompt tok/s, median latency 67.5 s |
+| VRAM | worst card 0.41 GiB free at the 120k needle, **0.38 GiB at 128.5k and through the soak** (cards 1 and 4 run ~0.4 GiB heavier than the rest at every budget) |
+| server log | 0 errors |
+
+
 
 

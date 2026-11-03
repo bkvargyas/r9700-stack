@@ -24,7 +24,8 @@ Current release: **v0.4.0** (2026-11-03, the vLLM 0.32 line), [release notes](no
     the previous pin, see the release notes).
   - **DeepSeek-V4.1-Flash** (552B MoE: 384 routed experts, Engram n-gram tables, the DSpark drafter) from the published
     **EXL3 2.9 bpw pack** (196 GiB): eight cards, tensor parallel 8 with expert parallel, the Engram tables in pinned host
-    memory, 32k context in the gated recipe (128k under validation). New in v0.4.0; notes/exl3-plan.md is the full story.
+    memory, 32k context in the gated recipe and a 128k recipe that retrieves at 126.7k-token prompts. New in v0.4.0;
+    notes/exl3-plan.md is the full story.
 - **Weight formats, handled at load:** NVFP4 checkpoints converted to MXFP4 with MSE-searched block exponents (folded
   exponent, bit-exact on the 27B); fp8 dense, drafter and lm-head GEMMs with per-token fp8 activations; fp8 KV cache;
   the Flash-Next per-layer-embedding table as int6 in pinned host memory; MXFP4 x fp8 grouped MoE GEMMs with routing,
@@ -117,10 +118,9 @@ clock offset on this box's 120 V feed)**
 | single-stream decode, prose / code / GSM8K-style | 70-75 / 158 / 114-121 tok/s |
 | per-stream decode at four streams, prose / code | 47 / 84 tok/s (187 / 336 aggregate) |
 | decode after a 2k / 16k / 28k-token prompt | 82 / 80 / 75 tok/s |
-| time to first token | 130-230 ms |
-| prompt processing | 3,400 tok/s (warm; the first prompt of a process JIT-compiles four Triton kernels) |
-| KV cache | 329k tokens at MAXLEN 32768 (one pool, replicated on every card) |
-| accuracy | GSM8K 196 / 200 then 194 / 200 (greedy, thinking on); needles 9 / 9 at 8k, 16k, 28k |
+| prompt processing | 2,500 tok/s on one 12k prompt, 3,000 aggregate on four at once, 3,400 on the warm short-prompt probe (the first prompt of a process JIT-compiles four Triton kernels) |
+| KV cache | 329k tokens at MAXLEN 32768 (ten 32k requests), 314k at MAXLEN 131072 (`KVMEM=0.8`; one pool, replicated on every card) |
+| accuracy | GSM8K 195 / 200 on the release launch (196 and 194 on the Phase 1 / 2 trees; greedy, thinking on); needles 9 / 9 at 8k, 16k, 28k; strict sanity 0 bad of 105 above max_num_seqs |
 
 How each number was produced, and what was tried and rejected: [PROGRESS.md](PROGRESS.md) and `notes/`.
 
