@@ -21,7 +21,7 @@ Release notes with the ledger and the validation record: [notes/release-v0.4.1.m
   (`moe/exl3_combine.py`); the decode glue in one launch each (`kernels/r9k_dsv4_glue.hip`: the FFN front 40 -> 21 us a layer, the
   DSpark markov head 720 -> 245 us, the attention input of the indexer layers 29 -> 13 us); our own EXL3 decode GEMV for 1-48 rows
   (`kernels/r9k_exl3_gemv.hip`: attention linears 26 -> 19 us at one row, 120 -> 44 at 24 rows where every matrix was dequantized
-  each step) with `wo_a` back on EXL3 (`R9K_DSV41_WOA`); the split-path all-reduce at 240-480 KiB 5-13 % faster. __CL_SPEED__
+  each step) with `wo_a` back on EXL3 (`R9K_DSV41_WOA`); the split-path all-reduce at 240-480 KiB 5-13 % faster. DeepSeek-V4.1-Flash on eight cards: prose **82-91 tok/s** single stream (v0.4.0 73), code **185-187** (152); four streams prose 186-230 aggregate (167), code **360-375** (297); GSM8K 98 / 100, divergence unchanged.
 - GLM-5.3-Flash TP8 takes the new small collectives (same bits; re-gated).
 
 ### Held back

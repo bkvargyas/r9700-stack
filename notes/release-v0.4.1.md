@@ -28,7 +28,7 @@ pass of that program: a per-kernel ledger of the serving step (notes/exl3-ledger
   MIT): up to 16 stacked projections a launch, the input rotation in-kernel, no casts, WMMA row tiles from 9 rows -- the attention
   linears 26 -> 19 us at one row and **120 -> 44 us at 24 rows**, where v0.4.0 dequantized every matrix every step (7.6 ms of a
   four-stream step). `wo_a` is back on EXL3 through an output-projection hook (`R9K_DSV41_WOA=exl3|bf16`): -230 MiB a rank, 18 -> 12
-  us at one row, slower above 16 rows. __WOA_DEFAULT__
+  us at one row, slower above 16 rows. EXL3 is the default: on the release tree it is 90.8 vs 87.8-89.0 tok/s single-stream prose, 197 vs 190.5 code, and within noise at four streams (99.9-100.5 vs 101.5-102.5 code).
 - The fused split-path all-reduce runs one lane with 1024-word sub-steps: 240 KiB 81.7 -> 77.2 us, 480 KiB 140 -> 122 (RCCL 124 / 161).
 - `bench/ds41/spectune.py` takes `STREAMS=1,4,8`; `bench/ds41/ledger/` holds the step-ledger tools.
 
@@ -41,7 +41,19 @@ pass of that program: a per-kernel ledger of the serving step (notes/exl3-ledger
 
 ## Speed (DeepSeek-V4.1-Flash, eight cards, the v0.4.0 launcher defaults; v0.4.0 in parentheses, two DGX Sparks in brackets)
 
-__REL_SPEED__
+Clean tree = git archive of the tag, VM100, `~/ds41/exl3/D4/clean-REL2.log`, 2026-11-03 19:13-19:46 UTC; spectune, greedy, best of 2 reps.
+
+| | single stream | per stream x 4 (aggregate) |
+|---|---:|---:|
+| prose, adaptive verification on (the default) | **82-91 tok/s** (73) [81] | **47-58** (186-230) (44-46; 167) [154] |
+| prose, adaptive off | **91** (75) | 43-48 (38) |
+| code, adaptive on | **185-187** (152) [118] | **99-102** (360-375) (81; 297) [166] |
+| code, adaptive off | **197** (158) | 100 (368-372) (84) |
+| plain decode, no drafter | 83 (52) | 53-60 (32) |
+
+Acceptance lengths unchanged (prose 1.7-2.0, code 4.1-4.4). Against the two Sparks: single stream 1.1x prose / 1.6x code, four streams
+1.2-1.5x prose / 2.2x code. The step ledger said where the rest is (notes/exl3-ledger.md); the 48-token tier and the GEMV
+bandwidth are v0.4.2's.
 
 ## Validation
 
