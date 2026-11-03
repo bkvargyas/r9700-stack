@@ -136,6 +136,11 @@ class R9kAllReduce8:
             L.r9k_ar8_fused.argtypes = [ctypes.POINTER(ctypes.c_long)] * 4 + [ctypes.c_int] + [ctypes.c_long] * 6 + \
                 [ctypes.c_int, ctypes.c_long] + [ctypes.c_int] * 3
             L.r9k_ar8_fused_lanes.restype = ctypes.c_int
+            if hasattr(L, "r9k_ar8_fused_t"):         # the same kernel with a stage trace (tests/test_ar8.py PARTS=5)
+                L.r9k_ar8_fused_t.restype = ctypes.c_int
+                L.r9k_ar8_fused_t.argtypes = L.r9k_ar8_fused.argtypes + [ctypes.c_long]
+                L.r9k_ar8_fused_trace_words.restype = ctypes.c_int
+                L.r9k_wallclock_khz.restype = ctypes.c_int
         fzs = [None] * self.world_size
         dist.all_gather_object(fzs, (fz, self.pair.slot2 if fz else 0, self.cross_host.slot2 if fz else 0), group=group)
         self.fused = all(f[0] for f in fzs) and len({f[1:] for f in fzs}) == 1
@@ -161,6 +166,7 @@ class R9kAllReduce8:
         # the odd's zero contribution to the last pair stage: one buffer of the largest message, allocated before any
         # graph capture (a buffer grown later would leave captured graphs pointing at freed memory)
         self._zbuf = torch.zeros(self.pair_cap, dtype=torch.uint8, device=self.pair.device) if self.pair_pos else None
+        self._setup_oneshot(group, pairs, crosses, device)     # package C: the one-kernel small path (collective)
         self.disabled = False
         logger.info("r9700: ar8 hierarchical all-reduce installed (rank %d: pair %d, %s, %s intermediate; %s)",
                     self.rank, self.rank // 2, "cross-chain sender" if self.pair_pos == 0 else "idle in the small path",
@@ -176,7 +182,11 @@ class R9kAllReduce8:
     def should_ag(self, x, dim):
         if self.disabled or os.environ.get("R9K_AG8", "1") != "1":
             return self.flat.should_ag(x, dim)
-        return self._ag_takes(x, dim) or self.flat.should_ag(x, dim)
+        if self._ag_os_takes(x, dim):
+            return True
+        # the flat 8-rank kernel only below R9K_AG8_FLAT_KB gathered (default never: the fabric cliff, see _setup_ag_os)
+        return self._ag_takes(x, dim) or (self.flat.should_ag(x, dim)
+                                          and x.numel() * x.element_size() * 8 <= self.ag_flat_max)
 
     def _ag_takes(self, x, dim) -> bool:
         if not self.pair.should_ag(x, dim):
@@ -188,6 +198,8 @@ class R9kAllReduce8:
         return (self.cross is None or n2 <= self.cross.ag_max) and n8 <= self.pair.ag_max
 
     def all_gather(self, x, dim=-1):
+        if os.environ.get("R9K_AG8", "1") == "1" and self._ag_os_takes(x, dim):
+            return self._ag_oneshot(x, dim)
         if not (os.environ.get("R9K_AG8", "1") == "1" and self._ag_takes(x, dim)):
             return self.flat.all_gather(x, dim)
         d = dim + x.dim() if dim < 0 else dim
@@ -246,20 +258,28 @@ class R9kAllReduce8:
         parts = [self.cross.all_reduce(y[i:i + per]) for i in range(0, y.numel(), per)]
         return torch.cat(parts)
 
-    def _split(self, flat: torch.Tensor) -> torch.Tensor:
+    def fused_lanes(self, nbytes: int) -> tuple[int, int]:
+        """(lanes, sub-steps) of the fused split kernel for a message: each lane is an independent pipeline of
+        five role blocks over its slice of every part, cut into sub-steps of ~_fw words."""
+        cq = -(-(-(-(nbytes // 16) // 2)) // 4)               # words of a part: ceil(ceil(n16 / 2) / 4)
+        nl = max(1, min(self._flanes, -(-cq // (self._fk * self._fw))))
+        k = max(1, min(64, -(-cq // (nl * self._fw))))
+        return nl, k
+
+    def _split(self, flat: torch.Tensor, trace: torch.Tensor | None = None) -> torch.Tensor:
         """Pair reduce-scatter -> host cross stage on our half (our quartet) -> pair all-gather; one fused kernel
-        (self.fused) or three."""
+        (self.fused) or three. trace (tests): uint64 [r9k_ar8_fused_trace_words()] for the stage timestamps."""
         n, es = flat.numel(), flat.element_size()
         if self.fused:
             out = torch.empty_like(flat)
-            cq = -(-(-(-(n * es // 16) // 2)) // 4)          # words of a part: ceil(ceil(n16 / 2) / 4)
-            nl = max(1, min(self._flanes, -(-cq // (self._fk * self._fw))))
-            k = max(1, min(64, -(-cq // (nl * self._fw))))
+            nl, k = self.fused_lanes(n * es)
             ch = self.cross_host
-            rc = self.pair.L.r9k_ar8_fused(
+            fn = self.pair.L.r9k_ar8_fused if trace is None else self.pair.L.r9k_ar8_fused_t
+            extra = () if trace is None else (trace.data_ptr(),)
+            rc = fn(
                 self.pair._sp2, self.pair._fp2, ch._sp2, ch._fp2, self.rank, self._fseq.data_ptr(), self.pair.slot2,
                 ch.slot2, flat.data_ptr(), out.data_ptr(), n, _DTYPE[flat.dtype], torch.cuda.current_stream().cuda_stream,
-                nl, k, 0)
+                nl, k, 0, *extra)
             if rc:
                 raise RuntimeError(f"r9k_ar8_fused failed ({rc}) n={n}")
             return out
@@ -270,10 +290,230 @@ class R9kAllReduce8:
         self.cross_host.all_reduce(part, out=part)           # our quartet's total of that half, in place
         return self.pair.all_gather_chunks(buf)
 
+    # ------------------------------------------------------------------ one-kernel small path (package C, 2026-11-03)
+    # R9K_AR8_ONESHOT (1; 0 = the stage kernels as before): every message up to R9K_AR8_OS_KB (64) is ONE kernel
+    # (kernels/r9k_ar.hip r9k_ar8_os) whose three phases are the split path's stages -- pair reduce-scatter (P2P),
+    # both quartets' exchange of the halves (pinned host pools), pair all-gather (P2P) -- joined by release / acquire
+    # flags instead of kernel boundaries. Same two roundings in the same order as the stage kernels, so the same bits.
+    # Quiet box, HIP graphs, wpb 256 (notes/exl3-p4-C.md): 8 / 16 / 32 / 40 / 60 / 64 KiB 14.6 / 16.5 / 22.1 / 25.2 /
+    # 34.2 / 36.7 us against the stage / split kernels' 21 / 34.5 / 46 / 34.7 / 37.6 / 38.3 (at wpb 128 the 60-64 KiB
+    # sizes lost, 39.8 vs 37.6: wpb 256 is what makes the 64 KiB cap pay). R9K_AR8_OS_P2P_KB (0): peer writes for phase B up
+    # to that size -- measured 83-153 us at every size (eight cross-chain senders: the fabric cliff); keep 0.
+    # R9K_AR8_OS_WPB (256): words of a half a block (256 beat 128: 32 KiB 22.3 vs 23.6, 60 KiB 34.5 vs 39.2),
+    # R9K_AR8_OS_NB (16) the block cap, R9K_AR8_OS_NT (0 = by size) threads a block.
+    # R9K_AR_SPIN_TIMEOUT_MS (0 = off): a flag wait longer than this traps, after printing who waited for what.
+    # all_reduce_moe: the same kernel, its message formed from the r9k expert tier's per-slot f32 outputs + the shared
+    # expert's output (r9700_vllm/moe/exl3_combine.py), bit-identical to the unfused add + all-reduce.
+    os_on = False
+    os_max = 0
+
+    def _setup_oneshot(self, group, pairs, crosses, device) -> None:
+        self._os_tmo = int(os.environ.get("R9K_AR_SPIN_TIMEOUT_MS", "0"))
+        self._os_diag = 0
+        if self._os_tmo > 0:
+            from .r9k_ar import host_mapped_words
+            hm = host_mapped_words(16)
+            if hm is not None:
+                self._os_diag_keep = hm
+                self._os_diag = hm[2]
+                self._os_watchdog(hm[1])
+        self._setup_ar_os(group, pairs, crosses, device)
+        self._setup_ag_os(group, pairs, crosses, device)
+
+    def _setup_ar_os(self, group, pairs, crosses, device) -> None:
+        from .r9k_ar import R9kPool
+        L = self.pair.L
+        want = os.environ.get("R9K_AR8_ONESHOT", "1") == "1" and not self.fp32 and hasattr(L, "r9k_ar8_os")
+        cfg = (want, float(os.environ.get("R9K_AR8_OS_KB", "64")), float(os.environ.get("R9K_AR8_OS_P2P_KB", "0")),
+               int(os.environ.get("R9K_AR8_OS_WPB", "256")), int(os.environ.get("R9K_AR8_OS_NB", "16")),
+               int(os.environ.get("R9K_AR8_OS_NT", "0")))
+        cfgs = [None] * self.world_size
+        dist.all_gather_object(cfgs, cfg, group=group)       # every rank must take the same branch (pools are collective)
+        if not all(c[0] for c in cfgs) or len(set(cfgs)) != 1:
+            if any(c[0] for c in cfgs):
+                logger.warning("r9700: ar8 one-kernel path off: ranks disagree on R9K_AR8_ONESHOT / _OS_* (%s)", cfgs)
+            return
+        _, os_kb, xp_kb, self._os_wpb, nbcap, self._os_nt = cfg
+        P = ctypes.POINTER(ctypes.c_long)
+        L.r9k_ar8_os.restype = ctypes.c_int
+        L.r9k_ar8_os.argtypes = [P] * 6 + [ctypes.c_int] + [ctypes.c_long] * 5 + [ctypes.c_int, ctypes.c_long] + \
+            [ctypes.c_int] * 4 + [ctypes.c_long]
+        L.r9k_ar8_os_moe.restype = ctypes.c_int
+        L.r9k_ar8_os_moe.argtypes = [P] * 6 + [ctypes.c_int] + [ctypes.c_long] * 6 + [ctypes.c_int] * 5 + \
+            [ctypes.c_long] * 3 + [ctypes.c_int] * 4 + [ctypes.c_long]
+        for f in ("r9k_ar8_os_max_blocks", "r9k_ar8_os_flag_row", "r9k_ar8_os_max_slots"):
+            getattr(L, f).restype = ctypes.c_int
+        MB, FR = L.r9k_ar8_os_max_blocks(), L.r9k_ar8_os_flag_row()
+        self._os_nb = max(1, min(nbcap, MB))
+        self._os_slots = L.r9k_ar8_os_max_slots()
+        slot = max(1, int(os_kb * 1024) // 16)               # words: the largest message, whole
+        self._os_slot = slot
+        pp = R9kPool(pairs[self.rank // 2], device, 4 * slot * 16, 2 * FR * 4)
+        hp = R9kPool(crosses[self.pair_pos], device, 2 * slot * 16, 4 * FR * 4, host=True)
+        xp = R9kPool(crosses[self.pair_pos], device, 8 * slot * 16, 4 * FR * 4) if xp_kb > 0 else None
+        ok = pp.ok and hp.ok and (xp is None or xp.ok)
+        oks = [None] * self.world_size
+        dist.all_gather_object(oks, ok, group=group)
+        if not all(oks):
+            logger.warning("r9700: ar8 one-kernel path: pool setup failed on some rank; stage kernels kept")
+            return
+        self._os_pools = (pp, hp, xp)
+        self._os_args = (pp.sp, pp.fp, hp.sp, hp.fp, xp.sp if xp else None, xp.fp if xp else None)
+        self._os_seq = torch.zeros(MB, dtype=torch.int32, device=self.pair.device)
+        self.os_max = slot * 16
+        self.os_xp = int(xp_kb * 1024) if xp is not None else 0
+        self.os_on = True
+        logger.info("r9700: ar8 one-kernel all-reduce for messages <= %d KiB (rank %d; phase-B transport: host pools%s; "
+                    "%d words a block, <= %d blocks; spin timeout %s)", self.os_max >> 10, self.rank,
+                    f", peer writes <= {self.os_xp >> 10} KiB" if self.os_xp else "", self._os_wpb, self._os_nb,
+                    f"{self._os_tmo} ms" if self._os_tmo > 0 else "off")
+
+    def _os_watchdog(self, arr) -> None:
+        """R9K_AR_SPIN_TIMEOUT_MS: print the kernel's timeout record before its trap takes the process down."""
+        import threading
+        import time as _t
+
+        def run():
+            while True:
+                if arr[0] == 0x52394B54:
+                    phase = {1: "A (partner's reduce-scatter push)", 2: "B (quartet peers' pair sums)",
+                             3: "C (partner's all-gather push)", 4: "all-gather 1 (quartet peers' pieces)",
+                             5: "all-gather 2 (partner's pieces)"}.get(arr[3], str(arr[3]))
+                    msg = (f"r9700: ar8 one-kernel all-reduce SPIN TIMEOUT ({self._os_tmo} ms): TP rank {arr[1]} "
+                           f"block {arr[2]} phase {phase} waited for flag {arr[4]} (call {arr[6]}), saw {arr[5]} -- a "
+                           f"peer is not running this collective (routing disagreement or a hung rank); trapping")
+                    logger.error(msg)
+                    print(msg, flush=True)
+                    return
+                _t.sleep(0.02)
+        threading.Thread(target=run, name="r9k-ar8-watchdog", daemon=True).start()
+
+    # ------------------------------------------------------------------ one-kernel all-gather (package C, 2026-11-03)
+    # R9K_AG8_ONESHOT (1): gathers of up to R9K_AG8_OS_KB (192: 6 rows of the logits; at 8 rows it ties RCCL, 234 vs 229
+    # us) a rank as ONE kernel (kernels/r9k_ar.hip r9k_ag8_os):
+    # own piece -> own host pool + the partner (P2P); the three quartet peers' pieces from host memory -> out + the
+    # partner; the partner quartet's four from our pair pool. Nothing crosses a root complex. Before it, gathers whose
+    # 8x size exceeded the pair path's R9K_AG_MAX_KB fell to the FLAT eight-rank one-shot (every rank pushing into all
+    # seven peers: the fabric cliff), 0.65-1.07 ms for Engram's [T, 3200] and 3.2-3.6 ms for the logits [<= 4, 16160]
+    # against RCCL's 0.2 ms (notes/exl3-ledger.md 1b). R9K_AG8_FLAT_KB (0): the largest gathered size (8x the piece)
+    # still allowed on that flat kernel; above it the call goes to RCCL. R9K_AG8_OS_WPB (256) words a block.
+    ag_os_on = False
+    ag_os_max = 0
+    ag_flat_max = 0
+    _os_tmo = 0
+    _os_diag = 0
+
+    def _setup_ag_os(self, group, pairs, crosses, device) -> None:
+        from .r9k_ar import R9kPool
+        L = self.pair.L
+        self.ag_flat_max = int(float(os.environ.get("R9K_AG8_FLAT_KB", "0")) * 1024)
+        want = os.environ.get("R9K_AG8_ONESHOT", "1") == "1" and hasattr(L, "r9k_ag8_os") and hasattr(L, "r9k_ar8_os")
+        cfg = (want, float(os.environ.get("R9K_AG8_OS_KB", "192")), int(os.environ.get("R9K_AG8_OS_WPB", "256")),
+               int(os.environ.get("R9K_AG8_OS_NB", "16")), int(os.environ.get("R9K_AG8_OS_NT", "0")),
+               self.ag_flat_max)
+        cfgs = [None] * self.world_size
+        dist.all_gather_object(cfgs, cfg, group=group)
+        if not all(c[0] for c in cfgs) or len(set(cfgs)) != 1:
+            if any(c[0] for c in cfgs):
+                logger.warning("r9700: ag8 one-kernel path off: ranks disagree on R9K_AG8_* (%s)", cfgs)
+            self.ag_flat_max = min(c[5] for c in cfgs)
+            return
+        _, kb, self._ag_wpb, nbcap, self._ag_nt, _ = cfg
+        P = ctypes.POINTER(ctypes.c_long)
+        L.r9k_ag8_os.restype = ctypes.c_int
+        L.r9k_ag8_os.argtypes = [P] * 4 + [ctypes.c_int] + [ctypes.c_long] * 6 + [ctypes.c_int, ctypes.c_long] + \
+            [ctypes.c_int] * 3 + [ctypes.c_long]
+        L.r9k_ar8_os_max_blocks.restype = ctypes.c_int
+        L.r9k_ar8_os_flag_row.restype = ctypes.c_int
+        MB, FR = L.r9k_ar8_os_max_blocks(), L.r9k_ar8_os_flag_row()
+        self._ag_nb = max(1, min(nbcap, MB))
+        slot = max(1, int(kb * 1024) // 16)
+        pp = R9kPool(pairs[self.rank // 2], device, 8 * slot * 16, 2 * FR * 4)
+        hp = R9kPool(crosses[self.pair_pos], device, 2 * slot * 16, 4 * FR * 4, host=True)
+        oks = [None] * self.world_size
+        dist.all_gather_object(oks, pp.ok and hp.ok, group=group)
+        if not all(oks):
+            logger.warning("r9700: ag8 one-kernel path: pool setup failed on some rank; previous all-gather paths kept")
+            return
+        self._ag_pools = (pp, hp)
+        self._ag_args = (pp.sp, pp.fp, hp.sp, hp.fp)
+        self._ag_slot = slot
+        self._ag_seq = torch.zeros(MB, dtype=torch.int32, device=self.pair.device)
+        self.ag_os_max = slot * 16
+        self.ag_os_on = True
+        logger.info("r9700: ag8 one-kernel all-gather for pieces <= %d KiB a rank (rank %d; flat 8-rank kernel %s)",
+                    self.ag_os_max >> 10, self.rank,
+                    f"<= {self.ag_flat_max >> 10} KiB gathered" if self.ag_flat_max else "never (RCCL instead)")
+
+    def _ag_os_takes(self, x, dim) -> bool:
+        if not self.ag_os_on or not x.is_contiguous() or x.element_size() not in (2, 4) or x.numel() == 0 \
+                or not (-x.dim() <= dim < x.dim()):
+            return False
+        rows, cols = R9kAllReduceN._ag_shape(x, dim)
+        return (cols * x.element_size()) % 16 == 0 and x.numel() * x.element_size() <= self.ag_os_max
+
+    def _ag_oneshot(self, x, dim):
+        d = dim + x.dim() if dim < 0 else dim
+        rows, cols = R9kAllReduceN._ag_shape(x, d)
+        shape = list(x.shape)
+        shape[d] *= 8
+        out = torch.empty(shape, dtype=x.dtype, device=x.device)
+        n16 = x.numel() * x.element_size() // 16
+        nd = max(1, min(self._ag_nb, -(-n16 // self._ag_wpb)))
+        rc = self.pair.L.r9k_ag8_os(*self._ag_args, self.rank, self._ag_seq.data_ptr(), self._ag_slot, x.data_ptr(),
+                                    out.data_ptr(), rows, cols, x.element_size(), torch.cuda.current_stream().cuda_stream,
+                                    nd, self._ag_nt, self._os_tmo, self._os_diag)
+        if rc:
+            raise RuntimeError(f"r9k_ag8_os failed ({rc}) shape={tuple(x.shape)} dim={dim}")
+        return out
+
+    def _os_nd(self, nbytes: int) -> int:
+        c2 = -(-(nbytes // 16) // 2)
+        return max(1, min(self._os_nb, -(-c2 // self._os_wpb)))
+
+    def _oneshot(self, flat: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(flat)
+        n = flat.numel() * flat.element_size()
+        rc = self.pair.L.r9k_ar8_os(
+            *self._os_args, self.rank, self._os_seq.data_ptr(), self._os_slot, flat.data_ptr(), out.data_ptr(),
+            flat.numel(), _DTYPE[flat.dtype], torch.cuda.current_stream().cuda_stream, self._os_nd(n), self._os_nt,
+            int(n <= self.os_xp), self._os_tmo, self._os_diag)
+        if rc:
+            raise RuntimeError(f"r9k_ar8_os failed ({rc}) n={n}")
+        return out
+
+    def moe_takes(self, shared: torch.Tensor, topk: int) -> bool:
+        """all_reduce_moe can take this call: the message (shared's shape, bf16) is one the plain call would send
+        through the one-kernel path too (so a rank that falls back still runs the same protocol)."""
+        if not self.os_on or shared.dtype != torch.bfloat16 or shared.dim() != 2 or not shared.is_contiguous():
+            return False
+        T, H = shared.shape
+        return T * topk <= self._os_slots and H % 8 == 0 and T * H * 2 <= self.os_max and self.should(shared) \
+            and self._takes(shared)
+
+    def all_reduce_moe(self, os_buf: torch.Tensor, w: torch.Tensor, ids: torch.Tensor, g2l: torch.Tensor, E: int,
+                       shared: torch.Tensor, topk: int) -> torch.Tensor:
+        """out [T, H] bf16 = all-reduce of bf16(bf16(sum_k w * os over the local picks, pick order) + shared): the
+        r9k expert tier's per-token sum + the runner's shared add, formed inside the collective's first phase.
+        os_buf f32 [>= T*topk, H] (the tier's per-slot outputs), w f32 [T*topk], ids int32 [T*topk] (global),
+        g2l int64 [G] (the layer's global -> local map; outside [0, E) = not here), shared bf16 [T, H]."""
+        T, H = shared.shape
+        out = torch.empty_like(shared)
+        rc = self.pair.L.r9k_ar8_os_moe(
+            *self._os_args, self.rank, self._os_seq.data_ptr(), self._os_slot, os_buf.data_ptr(), w.data_ptr(),
+            ids.data_ptr(), g2l.data_ptr(), g2l.numel(), E, T, topk, H, shared.data_ptr(), out.data_ptr(),
+            torch.cuda.current_stream().cuda_stream, self._os_nd(T * H * 2), self._os_nt, int(T * H * 2 <= self.os_xp),
+            self._os_tmo, self._os_diag)
+        if rc:
+            raise RuntimeError(f"r9k_ar8_os_moe failed ({rc}) T={T} H={H} topk={topk}")
+        return out
+
     def all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         if not self._takes(x):
             return self.flat.all_reduce(x)                   # callers check should() first: never above max_kb
         flat = x.view(-1)
+        if self.os_on and x.numel() * x.element_size() <= self.os_max:      # group-wide state only (_setup_oneshot)
+            return self._oneshot(flat).view_as(x)
         if self.split and x.numel() * x.element_size() > self.split_min:     # group-wide state only (see above)
             return self._split(flat).view_as(x)
         work = flat.float() if self.fp32 and x.dtype != torch.float32 else flat

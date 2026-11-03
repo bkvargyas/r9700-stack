@@ -834,7 +834,8 @@ extern "C" int r9k_ar_twoshot_nrank_m(const long* scratch_ptrs, const long* flag
 // order (this kernel, the pair two-shot modes, the host two-shot): an area is rewritten only after a wait the
 // readers can satisfy only once their previous call ended -- the pair areas are disjoint from the two-shot's
 // slots because a partner may still be in R4 when we start the next call.
-#define ARF_LM 16
+#define ARF_LM 32            // lanes (flag rows PP / PA2 / PA3 and HW / HR have 32 slots each)
+#define ARF_TS 130           // trace words a block: start, then (after wait, after work) per sub-step
 
 struct ArfGeo {     // one half's geometry
   long h0, hn, cq, per, st;   // half start (global word), length, part length, lane length, sub-step length
@@ -898,12 +899,16 @@ __device__ __forceinline__ void arf_add(float* acc, const uint4& w) {
 template <typename T>
 __global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
     R9kArPeers PP_, R9kArPeers HQ, int rank, int* __restrict__ seq, long pslot, long hslot,
-    const uint4* __restrict__ in, uint4* __restrict__ out, long n16, int nl, int K) {
+    const uint4* __restrict__ in, uint4* __restrict__ out, long n16, int nl, int K, unsigned long long* tr) {
   const int role = blockIdx.x / ARF_LM, L = blockIdx.x % ARF_LM, tid = threadIdx.x, nt = blockDim.x;
   __shared__ int s_seq;
   if (tid == 0) s_seq = seq[blockIdx.x]++;
   __syncthreads();
   if (L >= nl) return;                  // idle lane: keeps its counter in step
+  // stage trace (r9k_ar8_fused_t, tests/test_ar8.py PARTS=5): wall clock at the start, after each sub-step's wait and
+  // after its work, per role block
+#define ARF_T(i) do { if (tr && tid == 0) tr[(long)blockIdx.x * ARF_TS + (i)] = wall_clock64(); } while (0)
+  ARF_T(0);
   const u32 c64 = (u32)s_seq * 64u;
   const int pos = rank & 1, p = rank >> 1, mate = pos ^ 1;
   const ArfGeo gm = arf_geo(n16, pos, nl, K), go = arf_geo(n16, mate, nl, K);
@@ -916,16 +921,19 @@ __global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
     const u32 v = c64 + (u32)j + 1u;
     long a, e;
     if (role == 0) {                    // R0: our input's partner half -> partner RS area
+      ARF_T(1 + 2 * j);
       uint4* dst = PP_.scratch[mate] + pb + go.h0;
       for (int k = 0; k < 4; k++) {
         arf_range(go, k, L, j, a, e);
         arf_copy(dst, in + go.h0, a, e, tid, nt);
       }
       __syncthreads();
+      ARF_T(2 + 2 * j);
       if (tid == 0) arf_put(&PP_.flags[mate][pos * MB + 64 + L], v);
     } else if (role == 1) {             // R1: pair sum of our half
       if (tid == 0) arf_wait(&PP_.flags[pos][mate * MB + 64 + L], v);
       __syncthreads();
+      ARF_T(1 + 2 * j);
       const uint4* rcv = PP_.scratch[pos] + pb + gm.h0;
       const uint4* own = in + gm.h0;
       for (int k = 0; k < 4; k++) {
@@ -942,10 +950,12 @@ __global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
         }
       }
       __syncthreads();
+      ARF_T(2 + 2 * j);
       if (tid < 4) arf_put(&HQ.flags[tid][p * MB + 64 + L], v);
     } else if (role == 2) {             // R2: our part = the four pair sums in quartet order
       if (tid < 4) arf_wait(&HQ.flags[p][tid * MB + 64 + L], v);
       __syncthreads();
+      ARF_T(1 + 2 * j);
       arf_range(gm, p, L, j, a, e);
       uint4* red = HQ.scratch[p] + hb + hslot;
       uint4* ag = PP_.scratch[mate] + pb + pslot + gm.h0;
@@ -974,11 +984,13 @@ __global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
         }
       }
       __syncthreads();
+      ARF_T(2 + 2 * j);
       if (tid < 4 && tid != p) arf_put(&HQ.flags[tid][p * MB + 96 + L], v);
       if (tid == 4) arf_put(&PP_.flags[mate][pos * MB + 96 + L], v);
     } else if (role == 3) {             // R3: the peers' reduced parts of our half
       if (tid < 4 && tid != p) arf_wait(&HQ.flags[p][tid * MB + 96 + L], v);
       __syncthreads();
+      ARF_T(1 + 2 * j);
       uint4* ag = PP_.scratch[mate] + pb + pslot + gm.h0;
       for (int q = 0; q < 4; q++) {
         if (q == p) continue;
@@ -993,28 +1005,41 @@ __global__ void __launch_bounds__(1024) r9k_ar8_fused_kernel(
         for (; i < e; i += nt) { const uint4 v0 = src[i]; out[gm.h0 + i] = v0; ag[i] = v0; }
       }
       __syncthreads();
+      ARF_T(2 + 2 * j);
       if (tid == 0) arf_put(&PP_.flags[mate][pos * MB + 128 + L], v);
     } else {                            // R4: the partner's half from our AG area
       if (tid == 0) arf_wait(&PP_.flags[pos][mate * MB + 96 + L], v);
       if (tid == 1) arf_wait(&PP_.flags[pos][mate * MB + 128 + L], v);
       __syncthreads();
+      ARF_T(1 + 2 * j);
       const uint4* src = PP_.scratch[pos] + pb + pslot + go.h0;
       for (int k = 0; k < 4; k++) {
         arf_range(go, k, L, j, a, e);
         arf_copy(out + go.h0, src, a, e, tid, nt);
       }
+      if (tr) { __syncthreads(); ARF_T(2 + 2 * j); }
     }
   }
 }
 
+#undef ARF_T
+
 extern "C" int r9k_ar8_fused_lanes() { return ARF_LM; }
+extern "C" int r9k_ar8_fused_trace_words() { return 5 * ARF_LM * ARF_TS; }
+extern "C" int r9k_wallclock_khz() {
+  int dev = 0, khz = 0;
+  if (hipGetDevice(&dev) != hipSuccess || hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, dev) != hipSuccess)
+    return 0;
+  return khz;
+}
 
 // pair_scratch/pair_flags: the pair's 2 pointers (pair two-shot pool with >= 10 * pslot words); host_scratch /
 // host_flags: the quartet's 4 (host two-shot pools, >= 4 * hslot words); rank = TP rank 0..7 (pair index * 2 + pos);
-// seq: 5 * r9k_ar8_fused_lanes() ints; nl <= 16 lanes, K <= 64 sub-steps, nthreads 0 = by size. Grid 5 * 16.
-extern "C" int r9k_ar8_fused(const long* pair_scratch, const long* pair_flags, const long* host_scratch,
-                             const long* host_flags, int rank, long seq, long pslot, long hslot, long in, long out,
-                             long numel, int dtype, long stream, int nl, int K, int nthreads) {
+// seq: 5 * r9k_ar8_fused_lanes() ints; nl <= ARF_LM lanes, K <= 64 sub-steps, nthreads 0 = by size. Grid 5 * ARF_LM.
+// r9k_ar8_fused_t: the same with a stage trace (trace: r9k_ar8_fused_trace_words() uint64, wall clock ticks; 0 = off).
+extern "C" int r9k_ar8_fused_t(const long* pair_scratch, const long* pair_flags, const long* host_scratch,
+                               const long* host_flags, int rank, long seq, long pslot, long hslot, long in, long out,
+                               long numel, int dtype, long stream, int nl, int K, int nthreads, long trace) {
   const int esz = dtype == 2 ? 4 : 2;
   const long nbytes = numel * esz;
   if (nbytes % 16) return -1;
@@ -1040,7 +1065,7 @@ extern "C" int r9k_ar8_fused(const long* pair_scratch, const long* pair_flags, c
   hipStream_t st = (hipStream_t)stream;
 #define ARF_LAUNCH(T)                                                                                      \
   hipLaunchKernelGGL((r9k_ar8_fused_kernel<T>), dim3(5 * ARF_LM), dim3(nthreads), 0, st, P, H, rank,      \
-                     (int*)seq, pslot, hslot, (const uint4*)in, (uint4*)out, n16, nl, K)
+                     (int*)seq, pslot, hslot, (const uint4*)in, (uint4*)out, n16, nl, K, (unsigned long long*)trace)
   switch (dtype) {
     case 0: ARF_LAUNCH(__hip_bfloat16); break;
     case 1: ARF_LAUNCH(_Float16); break;
@@ -1049,6 +1074,13 @@ extern "C" int r9k_ar8_fused(const long* pair_scratch, const long* pair_flags, c
   }
 #undef ARF_LAUNCH
   return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+extern "C" int r9k_ar8_fused(const long* pair_scratch, const long* pair_flags, const long* host_scratch,
+                             const long* host_flags, int rank, long seq, long pslot, long hslot, long in, long out,
+                             long numel, int dtype, long stream, int nl, int K, int nthreads) {
+  return r9k_ar8_fused_t(pair_scratch, pair_flags, host_scratch, host_flags, rank, seq, pslot, hslot, in, out, numel,
+                         dtype, stream, nl, K, nthreads, 0);
 }
 
 // The host-memory two-shot: same arguments; scratch 2*2*slot16 words in pinned host memory; own seq and flag arrays.
@@ -1065,4 +1097,422 @@ extern "C" int r9k_ar_twoshot_nrank(const long* scratch_ptrs, const long* flag_p
                                     long stream, int nblocks, int nthreads, int drain, int acq) {
   return r9k_ar_twoshot_nrank_g(scratch_ptrs, flag_ptrs, nranks, rank, seq, slot16, in, out, numel, dtype, stream,
                                 nblocks, nthreads, drain, acq, 0);
+}
+
+// ---------------------------------------------------------------- one-kernel 8-rank all-reduce for small messages
+// (Package C, 2026-11-03; comm/r9k_ar8.py R9kAllReduce8._oneshot / all_reduce_moe.) Below ~64 KB the split path and the
+// whole-message path cost three kernels a call (8 KB 21 us, 32 KB 47, 60 KB 37 under HIP graphs): each stage pays a
+// launch and a drain, while the data itself moves in a few microseconds. Here the same three stages are three PHASES of
+// one kernel, connected by device-scope release / acquire flags between ranks exactly as the stages were:
+//   A  pair reduce-scatter (P2P, switch-local): push the partner's half of our input into its pair pool; wait for its
+//      push; pair sum of OUR half (even + odd in rank order, fp32, one rounding) -> out (staging) and our host pool
+//   B  quartet exchange of the halves (evens: first half, odds: second): wait for the three quartet peers' pair sums;
+//      our half's total = the four pair sums in quartet order (fp32, one rounding) -> out and the partner's AG area
+//   C  pair all-gather: wait for the partner's total of its half -> out
+// Every element sees the two roundings of the three-kernel composition in the same order, so the bits equal it (and
+// the whole-message path). Transport of phase B (xp): 0 = pinned host pools (each rank writes its own pool, the peers
+// pull: 0.5 S up, 1.5 S down a rank, nothing crosses a root complex), 1 = peer writes into the peers' VRAM pools
+// (lower latency, but eight cross-chain senders: only for the smallest messages, see the fabric cliff in r9k_ar8.py).
+//
+// Blocks: nd data blocks of a fixed grid of AOS_MB; block b owns a slice of each half and talks only to block b of its
+// partner / quartet peers (flag word per (source, block)); blocks of one rank never wait for each other, so no reliance
+// on co-residency inside a rank -- across ranks every rank launches the kernel in the same graph order (the existing
+// stage kernels assume the same). All AOS_MB counters advance every call (fixed grid), so all blocks agree on the
+// buffer parity. Flag values 4s+1 (phase A push / host write), 4s+2 (phase B AG push), compared by signed difference.
+// Reuse: a rank rewrites an area of parity s&1 in call s+2 only after its call s+1 waited (block 0 is always a data
+// block) for a value every reader of that area publishes in ITS call s+1, i.e. after the reader's call-s kernel ended.
+// Pools (words of 16 bytes, slot = the largest message): pair [2][RS slot | AG slot] (VRAM IPC, the pair's two ranks),
+// host [2][slot] (pinned host, the quartet's four), xp [2][4][slot] (VRAM IPC, the quartet's four; only for xp = 1);
+// flags: one u32 per (source, block) in AOS_FR-word rows, in the pool's own flag array.
+//
+// MOE = 1 (r9k_ar8_os_moe): the message is formed on the fly from the r9k expert tier's per-slot f32 outputs instead of
+// being read from a bf16 buffer: x[t] = bf16( bf16(sum_k w[t,k] * os[t*topk+k]) + shared[t] ) over the local picks k in
+// pick order (fp32, multiply then add, no contraction) -- exactly k_dn's per-token sum (kernels/r9k_moe_exl3.hip, RNE)
+// followed by stock's `shared_output + fused_output` (bf16 add), so the all-reduced bits equal the unfused path's.
+//
+// Spin timeout (tmo ticks > 0, R9K_AR_SPIN_TIMEOUT_MS): a wait that exceeds it writes a record to the host-mapped diag
+// words {magic, rank, block, phase, want, have, call} and traps after ~0.3 s (time for the Python watchdog to print it).
+#define AOS_MB 16
+#define AOS_FR 64
+#define AOS_SMAX 512
+#define AOS_MAGIC 0x52394b54u
+
+struct AosPools {
+  uint4* pair[2]; u32* pairf[2];    // by pair position (0 = even)
+  uint4* host[4]; u32* hostf[4];    // by quartet index (rank / 2)
+  uint4* xp[4];   u32* xpf[4];
+};
+
+struct AosMoe {
+  const float* os;          // [S, H] per-slot f32 outputs (rows of non-local slots are not read)
+  const float* w;           // [S] routing weights
+  const int* ids;           // [S] global expert ids
+  const long* g2l;          // [G] global -> local (outside [0, E) = not on this rank)
+  const uint16_t* sh;       // [T, H] bf16 shared-expert output
+  int G, E, topk, H, S;
+};
+
+__device__ __forceinline__ u32 aos_ld(u32* f) { return __hip_atomic_load(f, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM); }
+__device__ __forceinline__ void aos_put(u32* f, u32 v) {
+  __hip_atomic_store(f, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+__device__ __noinline__ void aos_timeout(u32* diag, int rank, int b, int phase, u32 want, u32 have, int s) {
+  if (diag) {
+    diag[1] = (u32)rank; diag[2] = (u32)b; diag[3] = (u32)phase; diag[4] = want; diag[5] = have; diag[6] = (u32)s;
+    __hip_atomic_store(&diag[0], AOS_MAGIC, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+  }
+  const u64 t0 = wall_clock64();
+  while (wall_clock64() - t0 < 30000000ull) __builtin_amdgcn_s_sleep(127);    // ~0.3 s at 100 MHz
+  __builtin_trap();
+}
+
+__device__ __forceinline__ void aos_wait(u32* f, u32 v, long tmo, u32* diag, int rank, int b, int phase, int s) {
+  if (tmo <= 0) {
+    while ((int)(aos_ld(f) - v) < 0) __builtin_amdgcn_s_sleep(1);
+    return;
+  }
+  const u64 t0 = wall_clock64();
+  u32 h;
+  while ((int)((h = aos_ld(f)) - v) < 0) {
+    __builtin_amdgcn_s_sleep(1);
+    if ((long)(wall_clock64() - t0) > tmo) aos_timeout(diag, rank, b, phase, v, h, s);
+  }
+}
+
+// RNE float -> bf16 bits, NaN quieted: the same function as kernels/r9k_moe_exl3.hip f_bf16
+__device__ __forceinline__ u32 aos_bf16(float f) {
+  u32 u = __float_as_uint(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return u >> 16;
+}
+
+// word i (8 bf16 elements) of the MoE message: k_dn's local weighted sum in pick order, rounded, plus the shared output
+__device__ __forceinline__ uint4 aos_moe_word(const AosMoe& M, const float* lw, long i) {
+  const int wpr = M.H >> 3;
+  const int t = (int)(i / wpr), c = (int)(i - (long)t * wpr) * 8;
+  float acc[8];
+#pragma unroll
+  for (int e = 0; e < 8; e++) acc[e] = 0.f;
+  for (int k = 0; k < M.topk; k++) {
+    const int s = t * M.topk + k;
+    const float wk = lw[s];
+    if (__float_as_uint(wk) == 0xffffffffu) continue;                // not a local slot (marker NaN)
+    const float4* o = (const float4*)(M.os + (size_t)s * M.H + c);
+    const float4 o0 = o[0], o1 = o[1];
+    acc[0] += wk * o0.x; acc[1] += wk * o0.y; acc[2] += wk * o0.z; acc[3] += wk * o0.w;
+    acc[4] += wk * o1.x; acc[5] += wk * o1.y; acc[6] += wk * o1.z; acc[7] += wk * o1.w;
+  }
+  const uint4 sw = *(const uint4*)(M.sh + (size_t)t * M.H + c);
+  const u32 sv[4] = {sw.x, sw.y, sw.z, sw.w};
+  u32 r[4];
+#pragma unroll
+  for (int e = 0; e < 4; e++) {
+    const float s0 = __uint_as_float(sv[e] << 16), s1 = __uint_as_float(sv[e] & 0xffff0000u);
+    const float f0 = __uint_as_float(aos_bf16(acc[2 * e]) << 16), f1 = __uint_as_float(aos_bf16(acc[2 * e + 1]) << 16);
+    r[e] = aos_bf16(s0 + f0) | (aos_bf16(s1 + f1) << 16);         // stock: shared_output + fused_output
+  }
+  return make_uint4(r[0], r[1], r[2], r[3]);
+}
+
+template <typename T, int MOE>
+__global__ void __launch_bounds__(1024) r9k_ar8_os_kernel(
+    AosPools P, int rank, int* __restrict__ seq, long slot, const uint4* __restrict__ in, uint4* __restrict__ out,
+    long n16, int nd, int xp, long tmo, u32* diag, AosMoe M) {
+  const int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  __shared__ float lw[MOE ? AOS_SMAX : 1];
+  if (tid == 0) s_seq = seq[b]++;
+  if (MOE && b < nd)
+    for (int s = tid; s < M.S; s += nt) {
+      const int id = M.ids[s];
+      const long e = (id >= 0 && id < M.G) ? M.g2l[id] : -1;
+      lw[s] = (e >= 0 && e < M.E) ? M.w[s] : __uint_as_float(0xffffffffu);
+    }
+  __syncthreads();
+  if (b >= nd) return;                  // idle block: keeps its counter in step
+  const int s = s_seq;
+  const u32 v1 = 4u * (u32)s + 1u, v2 = 4u * (u32)s + 2u;
+  const int pos = rank & 1, p = rank >> 1, mate = pos ^ 1;
+  const long c2 = (n16 + 1) / 2;
+  const long hm0 = pos ? c2 : 0, hmn = pos ? n16 - c2 : c2;           // our half
+  const long ho0 = pos ? 0 : c2, hon = pos ? c2 : n16 - c2;           // the partner's half
+  const long per = (c2 + nd - 1) / nd;
+  const long lo = (long)b * per;
+  const long hiM = min(lo + per, hmn), hiO = min(lo + per, hon);
+  const long pb = (long)(s & 1) * 2 * slot;                            // pair pool: RS pb, AG pb + slot
+  const long hb = (long)(s & 1) * slot;                                // host pool
+  const long xb = (long)(s & 1) * 4 * slot;                            // xp pool: [4][slot]
+  constexpr int NE = 16 / sizeof(T);
+  auto load = [&](long i) -> uint4 {
+    if constexpr (MOE) return aos_moe_word(M, lw, i);
+    else return in[i];
+  };
+
+  // A. the partner's half of our input -> its RS area
+  {
+    uint4* dst = P.pair[mate] + pb + ho0;
+    for (long i = lo + tid; i < hiO; i += nt) dst[i] = load(ho0 + i);
+  }
+  __syncthreads();
+  if (tid == 0) aos_put(&P.pairf[mate][pos * AOS_FR + b], v1);
+  if (tid == 0) aos_wait(&P.pairf[pos][mate * AOS_FR + b], v1, tmo, diag, rank, b, 1, s);
+  __syncthreads();
+  {
+    const uint4* rcv = P.pair[pos] + pb + hm0;
+    uint4* hdst = xp ? nullptr : P.host[p] + hb;
+    for (long i = lo + tid; i < hiM; i += nt) {
+      const uint4 x0 = load(hm0 + i), x1 = rcv[i];
+      float acc[NE];
+#pragma unroll
+      for (int e = 0; e < NE; e++) acc[e] = 0.f;
+      arf_add<T>(acc, pos == 0 ? x0 : x1);                             // rank order: even, then odd
+      arf_add<T>(acc, pos == 0 ? x1 : x0);
+      const uint4 r = arf_round<T>(acc);
+      out[hm0 + i] = r;
+      if (xp) {
+#pragma unroll
+        for (int q = 0; q < 4; q++)
+          if (q != p) P.xp[q][xb + (long)p * slot + i] = r;
+      } else {
+        hdst[i] = r;
+      }
+    }
+  }
+  __syncthreads();
+  if (tid < 4 && tid != p) aos_put(xp ? &P.xpf[tid][p * AOS_FR + b] : &P.hostf[tid][p * AOS_FR + b], v1);
+
+  // B. our half's total from the four pair sums, in quartet order
+  if (tid < 4 && tid != p)
+    aos_wait(xp ? &P.xpf[p][tid * AOS_FR + b] : &P.hostf[p][tid * AOS_FR + b], v1, tmo, diag, rank, b, 2, s);
+  __syncthreads();
+  {
+    uint4* ag = P.pair[mate] + pb + slot + hm0;
+    const uint4* src[4];
+#pragma unroll
+    for (int q = 0; q < 4; q++)
+      src[q] = q == p ? out + hm0 : (xp ? P.xp[p] + xb + (long)q * slot : P.host[q] + hb);
+    for (long i = lo + tid; i < hiM; i += 2 * nt) {
+      const bool two = i + nt < hiM;
+      uint4 w[4][2];
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        w[q][0] = src[q][i];
+        w[q][1] = two ? src[q][i + nt] : w[q][0];
+      }
+#pragma unroll
+      for (int u = 0; u < 2; u++) {
+        if (u == 1 && !two) break;
+        float acc[NE];
+#pragma unroll
+        for (int e = 0; e < NE; e++) acc[e] = 0.f;
+#pragma unroll
+        for (int q = 0; q < 4; q++) arf_add<T>(acc, w[q][u]);
+        const uint4 r = arf_round<T>(acc);
+        out[hm0 + i + u * nt] = r;
+        ag[i + u * nt] = r;
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) aos_put(&P.pairf[mate][pos * AOS_FR + b], v2);
+
+  // C. the partner's total of its half
+  if (tid == 0) aos_wait(&P.pairf[pos][mate * AOS_FR + b], v2, tmo, diag, rank, b, 3, s);
+  __syncthreads();
+  {
+    const uint4* src = P.pair[pos] + pb + slot + ho0;
+    for (long i = lo + tid; i < hiO; i += nt) out[ho0 + i] = src[i];
+  }
+}
+
+extern "C" int r9k_ar8_os_max_blocks() { return AOS_MB; }
+extern "C" int r9k_ar8_os_flag_row() { return AOS_FR; }
+extern "C" int r9k_ar8_os_max_slots() { return AOS_SMAX; }
+
+static long aos_ticks(int tmo_ms) {
+  if (tmo_ms <= 0) return 0;
+  static int khz = 0;
+  if (!khz) {
+    int dev = 0, v = 0;
+    if (hipGetDevice(&dev) == hipSuccess && hipDeviceGetAttribute(&v, hipDeviceAttributeWallClockRate, dev) == hipSuccess
+        && v > 0) khz = v;
+    else khz = 100000;
+  }
+  return (long)tmo_ms * khz;
+}
+
+static int aos_launch(int moe, const long* pair_s, const long* pair_f, const long* host_s, const long* host_f,
+                      const long* xp_s, const long* xp_f, int rank, long seq, long slot, long in, long out, long n16,
+                      int dtype, long stream, int nd, int nthreads, int xp, int tmo_ms, long diag, const AosMoe& M) {
+  if (rank < 0 || rank >= 8) return -5;
+  if (n16 <= 0) return 0;
+  if (n16 > slot) return -7;
+  if (xp && !xp_s) return -9;
+  if (nd <= 0 || nd > AOS_MB) return -2;
+  const long c2 = (n16 + 1) / 2;
+  if ((long)nd > c2) nd = (int)c2;
+  const long per = (c2 + nd - 1) / nd;
+  if (nthreads <= 0) {
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < 64 ? 64 : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE || nthreads < 64) return -3;
+  AosPools P{};
+  for (int q = 0; q < 2; q++) { P.pair[q] = (uint4*)pair_s[q]; P.pairf[q] = (u32*)pair_f[q]; }
+  for (int q = 0; q < 4; q++) { P.host[q] = (uint4*)host_s[q]; P.hostf[q] = (u32*)host_f[q]; }
+  if (xp_s)
+    for (int q = 0; q < 4; q++) { P.xp[q] = (uint4*)xp_s[q]; P.xpf[q] = (u32*)xp_f[q]; }
+  const long tmo = aos_ticks(tmo_ms);
+  hipStream_t st = (hipStream_t)stream;
+#define AOS_LAUNCH(T, MO)                                                                                   \
+  hipLaunchKernelGGL((r9k_ar8_os_kernel<T, MO>), dim3(AOS_MB), dim3(nthreads), 0, st, P, rank, (int*)seq, slot, \
+                     (const uint4*)in, (uint4*)out, n16, nd, xp, tmo, (u32*)diag, M)
+  if (moe) {
+    AOS_LAUNCH(__hip_bfloat16, 1);
+  } else {
+    switch (dtype) {
+      case 0: AOS_LAUNCH(__hip_bfloat16, 0); break;
+      case 1: AOS_LAUNCH(_Float16, 0); break;
+      case 2: AOS_LAUNCH(float, 0); break;
+      default: return -4;
+    }
+  }
+#undef AOS_LAUNCH
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// pair_s/pair_f: the pair's 2 pool pointers by position (>= 4 * slot words); host_s/host_f: the quartet's 4 host pools
+// (>= 2 * slot words); xp_s/xp_f: the quartet's 4 VRAM pools (>= 8 * slot words) or 0 when xp = 0. seq: AOS_MB ints,
+// shared by the plain and the MoE entry (they are one protocol). rank: TP rank 0..7. nthreads 0 = by size.
+extern "C" int r9k_ar8_os(const long* pair_s, const long* pair_f, const long* host_s, const long* host_f,
+                          const long* xp_s, const long* xp_f, int rank, long seq, long slot, long in, long out,
+                          long numel, int dtype, long stream, int nd, int nthreads, int xp, int tmo_ms, long diag) {
+  const int esz = dtype == 2 ? 4 : 2;
+  const long nbytes = numel * esz;
+  if (nbytes % 16) return -1;
+  AosMoe M{};
+  return aos_launch(0, pair_s, pair_f, host_s, host_f, xp_s, xp_f, rank, seq, slot, in, out, nbytes / 16, dtype, stream,
+                    nd, nthreads, xp, tmo_ms, diag, M);
+}
+
+// The fused MoE reduction: out [T, H] bf16 = all-reduce over the eight ranks of
+//   bf16( bf16(sum over local picks k of w[t,k] * os[t*topk+k]) + shared[t] )
+// os f32 [T*topk, H], w f32 [T*topk], ids int32 [T*topk], g2l int64 [G], shared bf16 [T, H] (rows contiguous).
+extern "C" int r9k_ar8_os_moe(const long* pair_s, const long* pair_f, const long* host_s, const long* host_f,
+                              const long* xp_s, const long* xp_f, int rank, long seq, long slot, long os, long w,
+                              long ids, long g2l, int G, int E, int T, int topk, int H, long shared, long out,
+                              long stream, int nd, int nthreads, int xp, int tmo_ms, long diag) {
+  if (H % 8 || T <= 0 || topk <= 0 || T * topk > AOS_SMAX) return -1;
+  AosMoe M{(const float*)os, (const float*)w, (const int*)ids, (const long*)g2l, (const uint16_t*)shared, G, E, topk, H,
+           T * topk};
+  return aos_launch(1, pair_s, pair_f, host_s, host_f, xp_s, xp_f, rank, seq, slot, 0, out, (long)T * H / 8, 0, stream,
+                    nd, nthreads, xp, tmo_ms, diag, M);
+}
+
+// ---------------------------------------------------------------- one-kernel 8-rank all-gather (package C, 2026-11-03)
+// comm/r9k_ar8.py R9kAllReduce8._ag_oneshot. The flat 8-rank one-shot all-gather (r9k_ag_oneshot_nrank_kernel<8>) pushes
+// every rank's piece into all seven peers' VRAM: eight senders across the four root complexes, the fabric cliff --
+// 0.65-1.07 ms for Engram's [T, 3200] and 3.2-3.6 ms for the logits [<= 4, 16160] (notes/exl3-ledger.md 1b). Here no
+// store crosses a root complex: each rank
+//   1  writes its piece to out, to its own pinned host pool and to its partner's pair pool (P2P, switch-local); flags
+//      its quartet (host)
+//   2  waits for its three quartet peers, pulls their pieces from host memory -> out and on to the partner's pair pool;
+//      flags the partner
+//   3  waits for the partner; copies the partner quartet's four pieces from its own pair pool -> out
+// Up a rank 1 piece to the host, down 3, 4 to the partner. Pure copies: the result is the input bits.
+// Layout: in [rows, cols] contiguous (cols16 words a row), out [rows, 8 * cols16] with rank q's piece at column block q
+// (vLLM's concat along `dim`). Pools: host [2][slot], pair [2][4][slot] (slot = the largest piece, words); flags one u32 per
+// (source, block), value 2s+1. Reuse as r9k_ar8_os: an area of parity s&1 is rewritten in call s+2 only after call s+1
+// waited for every reader's flag of s+1 (block 0 always carries data).
+__global__ void __launch_bounds__(1024) r9k_ag8_os_kernel(
+    AosPools P, int rank, int* __restrict__ seq, long slot, const uint4* __restrict__ in, uint4* __restrict__ out,
+    long n16, long cols16, int nd, long tmo, u32* diag) {
+  const int b = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[b]++;
+  __syncthreads();
+  if (b >= nd) return;
+  const int s = s_seq;
+  const u32 v = 2u * (u32)s + 1u;
+  const int pos = rank & 1, p = rank >> 1, mate = pos ^ 1;
+  const long per = (n16 + nd - 1) / nd;
+  const long lo = (long)b * per, hi = min(lo + per, n16);
+  const long hb = (long)(s & 1) * slot, pb = (long)(s & 1) * 4 * slot;
+  auto oidx = [&](int q, long i) -> long { const long r = i / cols16; return r * 8 * cols16 + (long)q * cols16 + (i - r * cols16); };
+
+  // 1. own piece -> out, own host pool, partner's pair pool (slot p)
+  {
+    uint4* h = P.host[p] + hb;
+    uint4* pp = P.pair[mate] + pb + (long)p * slot;
+    for (long i = lo + tid; i < hi; i += nt) {
+      const uint4 w = in[i];
+      out[oidx(rank, i)] = w;
+      h[i] = w;
+      pp[i] = w;
+    }
+  }
+  __syncthreads();
+  if (tid < 4 && tid != p) aos_put(&P.hostf[tid][p * AOS_FR + b], v);
+  if (tid < 4 && tid != p) aos_wait(&P.hostf[p][tid * AOS_FR + b], v, tmo, diag, rank, b, 4, s);
+  __syncthreads();
+  // 2. the quartet peers' pieces from host memory -> out and the partner's pair pool
+  {
+    uint4* pp = P.pair[mate] + pb;
+    for (long i = lo + tid; i < hi; i += nt) {
+      uint4 w[4];
+#pragma unroll
+      for (int q = 0; q < 4; q++)
+        if (q != p) w[q] = P.host[q][hb + i];
+#pragma unroll
+      for (int q = 0; q < 4; q++) {
+        if (q == p) continue;
+        out[oidx(2 * q + pos, i)] = w[q];
+        pp[(long)q * slot + i] = w[q];
+      }
+    }
+  }
+  __syncthreads();
+  if (tid == 0) aos_put(&P.pairf[mate][pos * AOS_FR + b], v);
+  if (tid == 0) aos_wait(&P.pairf[pos][mate * AOS_FR + b], v, tmo, diag, rank, b, 5, s);
+  __syncthreads();
+  // 3. the partner quartet's four pieces
+  {
+    const uint4* src = P.pair[pos] + pb;
+    for (long i = lo + tid; i < hi; i += nt) {
+      uint4 w[4];
+#pragma unroll
+      for (int q = 0; q < 4; q++) w[q] = src[(long)q * slot + i];
+#pragma unroll
+      for (int q = 0; q < 4; q++) out[oidx(2 * q + mate, i)] = w[q];
+    }
+  }
+}
+
+// pair_s/pair_f: the pair's 2 pools by position (>= 8 * slot words); host_s/host_f: the quartet's 4 host pools (>= 2 *
+// slot words); seq: AOS_MB ints of its own. rows x cols elements of esz bytes (cols * esz % 16 == 0, rows * cols * esz
+// <= slot * 16). nthreads 0 = by size.
+extern "C" int r9k_ag8_os(const long* pair_s, const long* pair_f, const long* host_s, const long* host_f, int rank,
+                          long seq, long slot, long in, long out, long rows, long cols, int esz, long stream, int nd,
+                          int nthreads, int tmo_ms, long diag) {
+  const long rowbytes = cols * esz;
+  if (rowbytes % 16 || rows <= 0) return -1;
+  if (rank < 0 || rank >= 8) return -5;
+  const long cols16 = rowbytes / 16, n16 = rows * cols16;
+  if (n16 > slot) return -7;
+  if (nd <= 0 || nd > AOS_MB) return -2;
+  if ((long)nd > n16) nd = (int)n16;
+  const long per = (n16 + nd - 1) / nd;
+  if (nthreads <= 0) {
+    long t = ((per + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < 64 ? 64 : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE || nthreads < 64) return -3;
+  AosPools P{};
+  for (int q = 0; q < 2; q++) { P.pair[q] = (uint4*)pair_s[q]; P.pairf[q] = (u32*)pair_f[q]; }
+  for (int q = 0; q < 4; q++) { P.host[q] = (uint4*)host_s[q]; P.hostf[q] = (u32*)host_f[q]; }
+  hipLaunchKernelGGL(r9k_ag8_os_kernel, dim3(AOS_MB), dim3(nthreads), 0, (hipStream_t)stream, P, rank, (int*)seq, slot,
+                     (const uint4*)in, (uint4*)out, n16, cols16, nd, aos_ticks(tmo_ms), (u32*)diag);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
 }

@@ -584,3 +584,44 @@ class R9kAllReduceN:
         if rc:
             raise RuntimeError(f"r9k_ar_{'two' if two else 'one'}shot_nrank failed ({rc})")
         return out
+
+
+class R9kPool:
+    """One exchange pool (scratch | flags) shared over `group`, without a collective of its own: the IPC-opened VRAM
+    pools or the pinned host pools of R9kAllReduceN, for a caller's own kernel (comm/r9k_ar8.py's one-kernel small
+    path, kernels/r9k_ar.hip r9k_ar8_os). Collective over the group. .ok, .sp / .fp (ctypes arrays of the group's
+    pointers in group-rank order)."""
+
+    _share = R9kAllReduceN._share                  # the same allocation / IPC / host-mapping code as the collectives
+    _share_host = R9kAllReduceN._share_host
+
+    def __init__(self, group, device, scratch_bytes: int, flag_bytes: int, host: bool = False):
+        self.ok = False
+        self.world_size = dist.get_world_size(group)
+        self.rank = dist.get_rank(group)
+        self._host = host
+        self._host_maps: list = []
+        self.L = _lib()
+        self.device = torch.device(f"cuda:{device}") if isinstance(device, int) else device
+        torch.cuda.set_device(self.device)
+        r = self._share(group, scratch_bytes, flag_bytes)
+        if r is not None:
+            self.sp, self.fp = r
+            self.ok = True
+
+
+def host_mapped_words(n: int):
+    """n u32 words of zeroed pinned host memory mapped for the device: (keepalive, host ctypes array, device pointer).
+    Used for the spin-timeout record of comm/r9k_ar8.py (the kernel writes it, a watchdog thread prints it)."""
+    import mmap
+    H = _hip()
+    size = max(mmap.PAGESIZE, (n * 4 + mmap.PAGESIZE - 1) // mmap.PAGESIZE * mmap.PAGESIZE)
+    m = mmap.mmap(-1, size, flags=mmap.MAP_SHARED | mmap.MAP_ANONYMOUS, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+    arr = (ctypes.c_uint32 * n).from_buffer(m)
+    addr = ctypes.addressof(arr)
+    if H.hipHostRegister(ctypes.c_void_p(addr), ctypes.c_size_t(size), 3) != 0:
+        return None
+    dp = ctypes.c_void_p()
+    if H.hipHostGetDevicePointer(ctypes.byref(dp), ctypes.c_void_p(addr), 0) != 0 or not dp.value:
+        return None
+    return m, arr, dp.value
