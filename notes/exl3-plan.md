@@ -506,3 +506,23 @@ all-gather; ~3.5-4 ms a step = ~15 %), then the one-kernel all-reduce; D's multi
 never runs in decode (~5 ms at four streams), then wo_a; A fixes the NSEQ 8 launch fault before its T = 48 tier work; B's pool is
 the 1.6 ms of glue plus the drafter's head path (markov head, lm_head gather), not launch gaps. New floor estimate after A-D:
 single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~290-310 aggregate).
+
+### Phase 4 results, package C (collectives; quiet box, HIP graphs, best of 3; 2026-11-03 12:49-12:51 UTC, tables in VM100 ~/ds41/exl3/C4/)
+- **The all-gather.** v0.4.0 routes gathers whose eight-way result exceeds R9K_AG_MAX_KB (128) but whose piece does not onto the flat
+  eight-rank kernel, where every rank stores its whole piece into seven peers across the root complexes -- the same fabric cliff as
+  the flat all-reduce: **403 / 709 / 919 / 1040 us at [3 / 4 / 5 / 6, 3200]** (Engram) and **890 / 2585 / 3896 us at [1 / 2 / 4,
+  16160]** (the target logits at the adaptive-trimmed verify widths), against RCCL's 76-85 and 80-144. C's one-kernel all-gather
+  (own piece -> own host pool + partner's pair pool over P2P; pull the quartet's pieces from host memory and forward to the
+  partner; copy the partner quartet's four from the pair pool; nothing crosses a root complex; pure copies, exact bits):
+  **15.7-47.5 us on the Engram shapes, 39.7 / 71.9 / 129.1 / 181.7 / 233.9 us at 1 / 2 / 4 / 6 / 8 rows x 16160** (RCCL 80 / 103 /
+  144 / 187 / 229). Defaults: R9K_AG8_OS_KB 192 (RCCL above), R9K_AG8_FLAT_KB 0 (the flat kernel never). Worth ~3.8 ms of the
+  25.4 ms single-stream step.
+- **One-kernel all-reduce** (three phases with system-scope flags, host pools, 16 blocks a rank): **14.6 / 17.3 / 23.5 / 27.2 us at
+  8 / 16 / 32 / 40 KiB** (stage kernels 21 / 34.5 / 46 / 34.7; RCCL 107-114), 39.8 at 60 KiB and 41.8 at 64 against the fused
+  split path's 37.6 / 38.5 -> default R9K_AR8_OS_KB 48. Peer writes instead of host pools (R9K_AR8_OS_P2P_KB) are 83-153 us at
+  every size: off. Bit-identical to the stage kernels (same rounding order), so GLM TP8's results cannot change; its speed goes
+  through the GLM gate (its 1-row logits gather and its <= 48 KiB all-reduces take the new kernels).
+- **Fused MoE reduction** (the expert tier's per-slot f32 partials x pick weights + the shared expert formed inside the collective's
+  first phase; no residual add before the all-reduce on this pin): T = 1 **18.5 us vs 40.9** for add + stage kernels; no gain at
+  60 KiB, hence the 48 KiB cap (fused for T <= 4). One launch a layer saved. Hook r9700_vllm/moe/exl3_combine.py, installed from
+  the EXL3 model classes (integration step), R9K_EXL3_MOE_AR=0 to disable.
