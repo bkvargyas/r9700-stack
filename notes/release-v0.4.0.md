@@ -98,7 +98,30 @@ soaks of 2 clients with 60-100k-token prompts (316 s: 13 requests, 0 errors, 3,2
 
 **The other three configurations on the same tree and image (`~/ds41/exl3/gate-040.sh`, VM100):**
 
-__GATE__
+Same tree and image as the tag (`r9700/vllm:0.4.0rc` = the tagged `docker/Dockerfile` on `nightly-rocm100-e4a5b553`), overlay on,
+nothing else on the box, 2026-11-03 09:00-11:01 UTC. Numbers in parentheses are v0.3.8's gate.
+
+**Qwen3.8-27B-NVFP4 TP2 (cards 0,1, DFlash2 drafter):** probe 218.0 tok/s mean (code 238 / prose 105 / json 274 / math 256), 4.47
+tokens a step, 513 / 617 tok/s at 8 / 16 streams, prefill 3,872 tok/s on 8k (217.6 / 4.48 / 516 / 643 / 3,877). BetterBench
+combined **195.7** (198.2), update p99 24.5 ms, 1 / 2 / 4 / 8 streams 174.5 / 292.4 / 445.4 / 585.6 (176.9 / 296.4 / 437.2 / 595.5),
+prompt processing 3.67-3.91k tok/s at 2k-32k (3.7-3.95k). Strict sanity: 0 bad of 160 after long prompts, 0 of 1,020 at 17
+streams, 0 of 1,280 at 32. Soak (16 clients, 200-30k-token prompts, 942 s): 195 requests, 0 errors, median prompt 14.4k tokens,
+3,038 prompt tok/s. 0 server errors.
+
+**Qwen3.8-Flash-Next TP4 (cards 0-3, MTP-3):** KV cache 477,832 tokens (477,002). Probe 222.6 tok/s mean (221 / 160 / 261 / 248),
+3.11 tokens a step, 469 / 915 tok/s at 8 / 16 streams, prefill 6,762 tok/s on 8k (221.4 / 3.09 / 470 / 924 / 6,743). BetterBench
+combined **189.7** (184.6), update p99 15.2 ms, 1 / 2 / 4 / 8 streams 175.4 / 276.6 / 400.0 / 534.9 (174.0 / 276.3 / 402.4 / 535.6),
+prompt processing 5.0 / 7.0 / 7.4 / 7.1k tok/s at 2k / 8k / 16k / 32k (4.96 / 6.95 / 7.31 / 7.07k). Strict sanity 0 bad of 160 /
+1,020 / 1,280. Soak (16 clients, 907 s): 375 requests, 0 errors (1 over the 32k limit rejected, by design), median prompt 16.5k
+tokens, 6,648 prompt tok/s. 0 server errors.
+
+**GLM-5.3-Flash TP8 (32k production recipe: RedHat checkpoint, MTP-3, fp8 KV, NSEQ 4, NBT 8192; the eight-rank collective's
+split path now starts at 32 KB):** KV cache 210,051 tokens (203,329 on the v0.3.8 deploy smoke). Decode-only 88.1 tok/s median
+over three 512-token runs at 44 % draft acceptance (v0.3.7's same measure: 75.0; the v0.3.8 probe mean is a different tool),
+four streams 139 then 177 tok/s aggregate (131 / 157 on v0.3.7's gate, 161 in v0.3.8's BetterBench), 12.7k needle correct
+(ttft 5.1 s, prefill 2,495 tok/s, 117 tok/s at depth, 88 % acceptance). Strict sanity (thinking on): 0 bad of 160 after long
+prompts, 0 of 300 at 5 streams, 0 of 320 at 8. Soak (16 clients, 1,002 s): 159 requests, 0 errors (1 over-length rejection),
+median prompt 14.9k tokens, 2,476 prompt tok/s. 0 server errors.
 
 ## Known limits
 
