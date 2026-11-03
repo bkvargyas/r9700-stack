@@ -5,12 +5,12 @@ cards (gfx1201 / RDNA4) on **stock vLLM and stock ROCm**. No fork, no patched so
 re-quantised weights: everything loads at runtime through vLLM's own extension points, so vLLM and ROCm update
 underneath it.
 
-Current release: **v0.4.0** (2026-11-03, the vLLM 0.32 line), [release notes](notes/release-v0.4.0.md),
+Current release: **v0.4.1** (2026-11-03, the vLLM 0.32 line), [release notes](notes/release-v0.4.1.md),
 [CHANGELOG.md](CHANGELOG.md).
 
 ![r9700-stack v0.4.0: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.4.0.svg)
 
-## What v0.4.0 gives you
+## What v0.4.1 gives you
 
 - **Stock vLLM 0.32 on stock ROCm 10.** Pinned to the 2026-10-25 ROCm 10 nightly (vLLM 0.32.1rc1, torch 2.13); the
   plugin registers through vLLM's platform, quantization, model and attention-backend entry points and carries its
@@ -39,9 +39,12 @@ Current release: **v0.4.0** (2026-11-03, the vLLM 0.32 line), [release notes](no
     70-80 ms to first token, ~480k-token KV cache.
   - GLM-5.3-Flash TP8: **100 tok/s** (MTP-3; 75-80 before v0.3.8's host-memory collective), 161 tok/s at four streams,
     3.1-3.4k tok/s prompt processing at 2k-32k, needles found at 12.7k / 30k / 67k tokens on this nightly (216k on the previous pin).
-  - DeepSeek-V4.1-Flash TP8 (EXL3 2.9 bpw, DSpark k = 5 with adaptive verification): **70-75 tok/s on prose, 158 on code**
-    single stream, 187 / 336 tok/s aggregate at four streams, 3.4k tok/s prompt processing, decode flat to 28k of context,
-    GSM8K 97-98 %. Two DGX Sparks on TensorFold serve the same pack at 81 / 118 single stream and 154 / 166 at four streams.
+  - DeepSeek-V4.1-Flash TP8 (EXL3 2.9 bpw, DSpark k = 5 with adaptive verification): **82-91 tok/s on prose, 185-187 on code**
+    single stream (v0.4.0: 73 / 152), 186-230 / 360-375 tok/s aggregate at four streams, 3.4k tok/s prompt processing, decode
+    flat to 28k of context, GSM8K 97-98 %. Two DGX Sparks on TensorFold serve the same pack at 81 / 118 single stream and
+    154 / 166 at four streams. v0.4.1's gains come from a per-kernel ledger of the step (notes/exl3-ledger.md): a one-kernel
+    eight-rank all-gather and all-reduce for the small decode messages, the decode glue fused into single launches, and our
+    own multi-row EXL3 GEMV that retires the whole-matrix dequant above 16 rows.
 - **Speculative decoding on every family:** MTP-3 for Flash-Next and GLM, the DFlash2 drafter for the 27B, the checkpoint's
   DSpark drafter for DeepSeek, all on the same kernels, with the draft metadata, indexer logits and all-reduces inside the HIP
   graphs.
@@ -79,7 +82,7 @@ multi-rank communication tests and the kernel unit gates. v0.3.2 kernels (unchan
 p = 1.00 against v0.3.1), HumanEval 162 / 164; v0.3.3 validation: 0 bad answers in 5,060 strict-sanity checks,
 0 errors in 1,224 soak requests.
 
-## Speed (210 W with a -42 mV offset, 32k context; the v0.4.0 gate numbers are in the release notes)
+## Speed (210 W with a -42 mV offset, 32k context; the v0.4.1 gate numbers are in the release notes)
 
 **Qwen3.8-Flash-Next (MXFP4 experts, fp8 dense), four cards, TP4, MTP-3**
 
@@ -115,9 +118,9 @@ clock offset on this box's 120 V feed)**
 
 | | |
 |---|---:|
-| single-stream decode, prose / code / GSM8K-style | 70-75 / 158 / 114-121 tok/s |
-| per-stream decode at four streams, prose / code | 47 / 84 tok/s (187 / 336 aggregate) |
-| decode after a 2k / 16k / 28k-token prompt | 82 / 80 / 75 tok/s |
+| single-stream decode, prose / code / GSM8K-style | 82-91 / 185-187 / 147-148 tok/s (v0.4.0: 70-75 / 158 / 114-121) |
+| per-stream decode at four streams, prose / code | 47-58 / 99-102 tok/s (186-230 / 360-375 aggregate) |
+| decode after a 2k / 16k / 28k-token prompt | 82 / 80 / 75 tok/s (v0.4.0 measurement) |
 | prompt processing | 2,500 tok/s on one 12k prompt, 3,000 aggregate on four at once, 3,400 on the warm short-prompt probe (the first prompt of a process JIT-compiles four Triton kernels) |
 | KV cache | 329k tokens at MAXLEN 32768 (ten 32k requests), 314k at MAXLEN 131072 (`KVMEM=0.8`; one pool, replicated on every card) |
 | accuracy | GSM8K 195 / 200 on the release launch (196 and 194 on the Phase 1 / 2 trees; greedy, thinking on); needles 9 / 9 at 8k, 16k, 28k; strict sanity 0 bad of 105 above max_num_seqs |
