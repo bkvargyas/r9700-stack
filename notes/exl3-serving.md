@@ -1,0 +1,163 @@
+# DeepSeek-V4.1-Flash EXL3 2.9 bpw -- serving tuning (package S, Phase 3, 2026-11-02/03)
+
+Eight R9700s on VM100, TP8 + EP, DSpark drafter on, HIP graphs, fp8_ds_mla KV, prefix caching off, NSEQ 4, SCLK -500 MHz.
+Tools (bench/ds41/): `memprobe_ext.py` + `memprobe.py` (per-rank allocator state, tensor inventory, raw-hipMalloc headroom;
+stock `--worker-extension-cls` + the dev endpoint `/collective_rpc`, launcher `MEMPROBE=1`), `vramwatch.py` (driver
+VRAM peak over a workload), `prefillpeak.py` (prefill-only load), `spectune.py` (the draft-length table: prose / code /
+GSM8K at 1 and 4 streams, usage-based tok/s, acceptance from the /metrics spec-decode counters).
+Served from an isolated copy (VM100 `~/r9700-exl3-S` = committed HEAD + this package's files) because the shared
+`~/r9700-exl3` sync carries other packages' uncommitted work (one sync pulled a `r9k_mhc.hip` that did not compile and
+the launch failed in the libr9k build).
+
+## 1. Memory audit (rank 0, steady state, k=5 drafter + HIP graphs, KVMEM 1, NBT 2048, MAXLEN 32768, NSEQ 4)
+
+Three views of the same card, and they disagree:
+- **sysfs `mem_info_vram_used`** (the driver's VRAM manager) -- the real one. A raw `hipMalloc` loop inside the worker
+  (`memprobe.py try`) got **1,568 MiB** on rank 0 while sysfs showed 1,499 MiB free.
+- **`hipMemGetInfo` / `torch.cuda.mem_get_info`** reported only **610 MiB** free at that moment (and 54 MiB after a prefill
+  burst that left sysfs at 1.0 GiB free): it under-reports by ~0.9-1.3 GiB (KFD-side accounting that is not VRAM; it
+  also moves with the number of captured graphs -- see 2a). vLLM's "Graph capturing ... took X GiB" is a
+  `mem_get_info` delta, so it inherits the same error. **Budget against sysfs; never against mem_get_info.**
+- **torch** (`memory_stats`): allocated / reserved; plus a walk of every device tensor reachable from the model runner,
+  the drafter and the plugin / vLLM module globals (`memprobe.py inv`), and a gc scan for tensors the walk missed (none).
+
+| component (rank 0) | MiB | note |
+|---|---:|---|
+| routed experts (EXL3 trellis + suh/svh + pointer tables, 40 layers x 48 local) | 23,516 | |
+| drafter (DSpark mtp.0-2: experts 813, attention 75, shared 25, markov/confidence heads + rest 188, hc 6, router 4) | 1,111 | plan said ~0.3 GiB |
+| attention (wq_a/wq_b/wkv/wo_a bf16/wo_b, indexer, compressor) | 977 | |
+| **RoPE cos/sin caches** (two: SWA layers and compressed layers, 1,048,576 positions x 64 f32 each) | **512** | see 2c |
+| shared experts (bf16, TP-sharded) | 338 | |
+| embed / lm_head (bf16, vocab-sharded) | 158 / 158 | |
+| router (gate f16 [384, 5120] x 40) | 150 | |
+| hyper-connections (hc_* f32) | 75 | |
+| other (norms, sinks, Engram device part 29, ...) | 129 | |
+| vLLM workspace manager (sparse-MLA / indexer prefill workspace) | 174 | |
+| r9k expert-tier scratch (P1's 88f6cb5: 24 MiB) | 24 | was ~1.2 GiB before P1 |
+| runner buffers | 24 | |
+| **= weights + fixed buffers** | **27,345** | "Model loading took 26.76 GiB" |
+| KV cache (KVMEM 1 = 193,534 tokens; one 1,024 MiB pool) | 1,024 | |
+| **= inventoried device tensors** | **28,369** | |
+| allocated, not reachable from Python (C++-held: BLAS workspaces, compiled-graph statics, ...) | 731 | torch allocated 29,100 |
+| torch cache: reserved - allocated (fragmentation; 602 MiB "inactive split") | 840 | reserved 29,940; graph pool 242 of it |
+| non-torch VRAM (RCCL + ar8 IPC buffers, HIP graph execs, code objects, runtime scratch) | 1,181 | sysfs - reserved |
+| **sysfs used, idle** | **31,121** | 30.4 GiB; worst card 31,213 (card5) |
+| sysfs free, idle (32,624 MiB card) | 1,503 | worst card 1,411 |
+| prefill transient (4 x 6k-token prompts at NBT 2048) | +400-440 | allocated peak +440, reserved +394 |
+| Engram tables (2 x 11.8 GiB fp8 + scales) | (24,170) | pinned HOST memory, mapped; not VRAM |
+
+The reachable-tensor walk accounts for every Python-owned device tensor (gc scan: 0 MiB unreached); the rest of the
+footprint is the allocator's cache (0.8 GiB), C++-held allocations (0.7 GiB) and memory outside torch (1.2 GiB).
+
+## 2. Reclaim
+
+| item | how | real VRAM (sysfs, a card) | other effect | status |
+|---|---|---:|---|---|
+| (a) HIP-graph capture sizes | `CGSIZES` = 1,2,4 + (k+1) x 1..NSEQ (k=5: 1,2,4,6,12,18,24) instead of vLLM's 1,2,4,6,8,12,16,24,32,40,48 | -35 MiB | "Graph capturing took" 1.57 -> 1.17 GiB (mem_get_info), torch graph pool 256 -> 242 MiB, capture 27 -> 19 s; speed unchanged (table 4) | **launcher default** |
+| (b) allocator fragmentation | `ALLOC_CONF=expandable_segments:True` (PYTORCH_ALLOC_CONF) | **-470 MiB** (idle 31.12-31.21 -> 30.66-30.73 GiB) | inactive splits 602 -> 0 MiB, "Model loading took" 26.75 -> 26.51 GiB (load-time temporaries returned), the low card (card2, -350 MiB) evens out; speed unchanged; graphs, ar8 IPC (its own hipMalloc) and RCCL fine | **launcher default** |
+| (c) drafter length | k=3 vs k=5 | -215 MiB at k=3 | drafter graphs scale with k; k=5 is the speed choice | (k=5 kept) |
+| (d) adaptive verification | ADAPTIVE=true | +78 MiB | varlen verify graphs (capture 71 s) | kept (speed, table 4) |
+| (e) r9k expert-tier scratch | P1, 88f6cb5 | ~-1.2 GiB vs Phase 2 | 24 MiB a rank now | in HEAD |
+| (f) RoPE cos/sin caches | **plugin change, for the owner** (below) | up to -448 MiB at MAXLEN 131072 (-496 at 32768) | | not done |
+| (g) MoE tier buffers | -- | ~0 | exllamav3 FusedBuffers (116 MiB) + dq_temp (22.5 MiB) are already shared across the 40 layers and serve the prefill tiering; the mgemv coop buffers are a few MiB | nothing to do |
+| (h) wo_a bf16 (320 MiB) | keep (plan) | | | kept |
+| (i) prefill transients | NBT / `VLLM_SPARSE_INDEXER_MAX_LOGITS_MB` | see 3 | | see 3 |
+
+**(f) for the owner -- trim the two RoPE caches to max_model_len (exact).** Both DeepSeek-V4.1 rotary embeddings build
+`cos_sin_cache` [1,048,576, 64] f32 = 256 MiB a rank each (vllm/models/deepseek_v41/common/rope.py `build_deepseek_v4_rope`
+-> model_executor/layers/rotary_embedding DeepseekScalingRotaryEmbedding / DeepseekV4ScalingRotaryEmbedding
+`_compute_cos_sin_cache`: `t = arange(max_position_embeddings * scaling_factor)`). The SWA layers' cache is
+max_position_embeddings (1,048,576) x factor 1.0; the compressed layers' is original_max 65,536 x factor 16. The values
+at position p do not depend on the cache length, so slicing both to `vllm_config.model_config.max_model_len` rows after
+construction (e.g. in `models/deepseek_v41_exl3.py` load_weights / a post-load hook: for every module with a
+`rotary_emb` attribute, `rotary_emb.cos_sin_cache = rotary_emb.cos_sin_cache[:max_model_len].contiguous()` once, then drop
+the old buffer; the layers share two objects, so two slices) is bit-identical for every position the server can see and
+returns 448 MiB at MAXLEN 131072, 496 MiB at 32768. Check that nothing indexes the cache by a position beyond
+max_model_len (the drafter's lookahead positions are < max_model_len + k; slice to max_model_len + 64 to be safe). The
+launcher route (`--hf-overrides '{"text_config":{"max_position_embeddings":N}}'`) only reaches the SWA cache and fails
+anyway: this config class keeps `text_config` as a plain dict at override time, so vLLM replaces it ("text_config ...
+does not have num_attention_heads").
+
+
+## 4. Draft length and adaptive verification (DSpark)
+
+`spectune.py`: greedy, natural stop; prose = ask3's lighthouse essay (thinking off), code = ask3's LRU module (thinking
+off), gsm = GSM8K test questions as gsm8k_ds41.py asks them (default template, thinking on; 1 stream: questions 0-3 back
+to back, 4 streams: questions 0-15 dealt round-robin). Numbers are **per-stream decode tok/s** (usage-based: completion
+tokens over first-token-to-end; the 4-stream aggregate decode rate is ~4x the per-stream figure) and the **mean acceptance
+length** (MAL = 1 + accepted / drafts, from the /metrics spec-decode counters around each run). Best of 2 reps (3 where
+noted); the other agents' single-card tests made individual reps noisy (a second rep is usually the warm one: the
+first request of an AV process pays a ~20 % warm-up, see WARM below).
+Each row is one launch (relaunch ~6-8 min); capture list = 1,2,4 + (k+1) x 1..4.
+**Rows above the line ran before package H's hyper-connection kernels (5a943a7); rows below, with them
+(`mhc:r9k-seam(M<=32)` in the launch log). Timing is not comparable across the line.**
+
+| k | adaptive | prose x1 | prose x4 /stream | code x1 | code x4 /stream | gsm x1 | gsm x4 /stream | MAL prose / code / gsm (x1) | graph capture |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+| 4 | false | 69.8 | 36.4 | 132.2 | 70.8 | 111.8 | 63.5 | 2.07 / 3.91 / 3.29 | 19 s |
+| 5 | false | 68.2 | 36.7 | 158.8 | 80.7 | 112.3 | 67.2 | 1.99 / 4.65 / 3.27 | 27 s (vLLM list) |
+| 5 | false, short graph list | 69.6 | 34.8 | 165.2 | 83.1 | 129.9 | 64.3 | 1.93 / 4.62 / 3.59 | 19 s |
+| 6 | false | 63.7 | 24.3 | 155.0 | 57.4 | 114.2 | 52.0 | 1.97 / 4.86 / 3.51 | 21 s |
+| --- with H --- | | | | | | | | | |
+| 3 | false | 63.9 | 44.0 | 115.8 | 75.2 | 101.9 | 65.8 | 1.85 / 3.34 / 2.92 | 13 s, 0.92 GiB |
+| 4 | true | 65.7 | 40.3 | 133.5 | 77.1 | 103.3 | 66.6 | 1.88 / 3.97 / 3.04 | 67 s, 1.70 GiB |
+| **5** | **false** | **74.6** | 38.3 | 158.1 | 84.3 | **120.9** | 70.7 | 2.06 / 4.39 / 3.33 | 19 s, 1.17 GiB |
+| **5** | **true** | 70.1 (3 reps) | **46.8** (3 reps) | **159.3** | 83.6 | 113.7 | 69.6 | 1.78 / 4.50 / 3.14 | 71 s, 1.71 GiB |
+| 6 | true | 68.1 | 39.0 | 158.4 | 84.3 | 112.0 | 67.4 | 1.76 / 4.72 / 3.22 | 73 s, 1.70 GiB |
+
+Per-position acceptance (k=5, with H, x1): prose 0.59 / 0.29 / 0.12 / 0.04 / 0.02; code 0.91 / 0.78 / 0.68 / 0.56 / 0.47;
+gsm 0.82 / 0.62 / 0.46 / 0.28 / 0.14. The server log's `SpecDecoding metrics` lines agree (e.g. code x4, k=5: mean acceptance
+length 4.42-4.47, per-position 0.89 / 0.78 / 0.67-0.69 / 0.58-0.59 / 0.50-0.51).
+
+- **k = 5 wins.** k=4 loses code (-15-20 %), k=3 more; k=6 gains nothing on code (MAL 4.86 vs 4.65, but a 7-token
+  verify step a stream costs more) and loses at 4 streams (28-token steps).
+- **`enable_adaptive_verification: true` runs on this pin and on RDNA4** (the Phase 1 assumption that AMD must keep it false
+  does not hold: the selector check passes for the DeepSeek-V4.1 ROCm backends, and the DSpark cost-curve profiling runs
+  at init; capture takes 71 s instead of 19 s and the captured varlen graphs cost +78 MiB of real VRAM). It trims verification
+  per request on device: on prose at four streams it is **+22-28 %** (46.3-46.8 vs 36.1-38.3 per stream, three reps each
+  side); single-stream prose and GSM8K lose 5-6 % (70.0 vs 74.5; 113.7 vs 120.9); code is unchanged.
+  Greedy output is unaffected (verification is lossless; the validation below ran with it on).
+- Default: **DSPARK_K=5, ADAPTIVE=true** (four-stream prose is where we trailed the Sparks most; ADAPTIVE=false is the
+  knob for a single-user box and buys back ~6 % single-stream prose).
+
+## 3. KV budget (the release launches, image r9700/vllm:0.4.0rc, HEAD with the RoPE trim)
+
+The trim runs ("RoPE cos/sin caches trimmed to 32896 positions (494 MiB freed a rank)") and the idle footprint drops by ~190 MiB
+a card (31,380-31,452 MiB at KVMEM 1.7 against 31,574-31,626 on the untrimmed tree), but **the serving peak does not move**:
+after a 4-stream 12k prefill burst and after the 15-minute soak the worst card sits at 31,909-31,913 MiB used (0.69-0.70 GiB
+free) with or without the trim. The binding constraint is earlier anyway: **the drafter's graph capture**. With the trim in,
+`KVMEM=2.2` (425,776 tokens) and `KVMEM=2.0` (387,069 tokens) both die on card 7 while the DSpark speculator captures, in the
+expert tier's dequant path for a > 24-token dummy batch (`exl3_moe.py _gemm_dq: torch.empty_like(a)`, 120 MiB, "0 bytes free,
+30.37 GiB allocated by PyTorch"); the other ranks then hang in the broadcast. The capture-time peak is above the steady-state
+peak by more than the 0.3-0.5 GiB those budgets add, so the trim buys headroom for the capture, not KV.
+
+| MAXLEN | KVMEM | KV tokens | idle used (worst card) | peak used after burst / soak | capture |
+|---|---:|---:|---:|---:|---|
+| 32768 | 2.2 | 425,776 | -- | -- | OOM card 7 (speculator capture) |
+| 32768 | 2.0 | 387,069 | -- | -- | OOM card 7 (speculator capture) |
+| **32768** | **1.7** | **329,008** | 31,452 MiB | 31,913 MiB (0.69 GiB free) | 71 s, "took 1.41 GiB" |
+| 131072 | __KVB__ | __KVB_TOK__ | __B_IDLE__ | __B_PEAK__ | __B_CAPTURE__ |
+
+Defaults: `KVMEM=1.7` at the launcher's MAXLEN 32768 (10 concurrent 32k requests); `MAXLEN=131072 KVMEM=__KVB__` for the long-context
+launch. Open item for v0.4.1: capture the speculator with the dequant tier off (or size R9K_EXL3_MOE_R9K_M to the largest
+capture width) so the capture peak falls back under the steady-state peak -- that is 0.3-0.5 GiB of KV (60-100k tokens).
+
+## 5. Validation of the defaults (launch A: MAXLEN 32768, KVMEM 1.7, k = 5, adaptive on, graphs, 0.4.0rc image; 2026-11-03 06:51-07:35 UTC)
+
+`validate.sh` -> `S/validate-A.log`; the server up since 06:51 UTC with "r9700_vllm 0.4.0 registered", KV 329,008 tokens.
+
+| | |
+|---|---|
+| spectune (per-stream tok/s, MAL) | prose x1 **72.5-73.0** (1.86-1.88), x4 **44.3-45.6** (1.72; 166-167 aggregate); code x1 **152.2** (4.31), x4 **81** (4.1; 296-298 aggregate); GSM8K-style x1 **122** (3.4), x4 64-67 (3.04-3.09; 140-159 aggregate) |
+| prompt processing | one 12.3k prompt 2,532 tok/s (4.86 s); four 12.3k prompts 3,040 tok/s aggregate; a 1.5k prompt 1.43 s |
+| divergence.py (greedy decode vs fresh prefill, 24 tokens) | prose 23/24 (mean dlogprob 0.124), code 24/24 (0.016), math 24/24 (0.045) |
+| needle.py 8k / 16k / 28k (3 facts each) | 3/3, 3/3, 3/3 (prefill 2.3 / 4.5 / 7.7 s) |
+| strict sanity (NSEQ 4) | 5 streams (5 rounds after 20-24k-token prefills): **0 bad of 25**; 8 streams (10 rounds): **0 bad of 80** |
+| soak (8 clients, 200-28k-token prompts, 934 s) | 174 ok, 0 errors, 1 context-length rejection (by design), prompts 409-32,694 tokens (median 14,846), 2,816 prompt tok/s, 47.5 output tok/s, median latency 42.6 s; worst card 0.69 GiB free throughout |
+| GSM8K 200 (greedy, thinking on) | **195 / 200 = 97.5 %**, 1 truncated, 3.2 min |
+| server log | 0 errors (the transformers "model of type deepseek_v41" notice x 8 is stock's) |
+| sysfs after | 31,836-31,916 MiB used a card |
+
+__B_VALIDATION__
+
+
