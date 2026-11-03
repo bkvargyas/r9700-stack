@@ -8,7 +8,7 @@ underneath it.
 Current release: **v0.4.1** (2026-11-03, the vLLM 0.32 line), [release notes](notes/release-v0.4.1.md),
 [CHANGELOG.md](CHANGELOG.md).
 
-![r9700-stack v0.4.0: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.4.0.svg)
+![r9700-stack v0.4.1: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.4.1.svg)
 
 ## What v0.4.1 gives you
 
