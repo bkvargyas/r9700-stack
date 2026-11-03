@@ -46,7 +46,7 @@ namespace {
 #ifndef R9K_EXL3_U
 #define R9K_EXL3_U 0               // k-tiles whose loads go out together (0 = exllamav3's table)
 #endif
-constexpr int SMAX = 512;          // slots a launch (T * topk): T = 48 x 6 = 288, x 3 (drafter) = 144
+constexpr int SMAX = 256;          // slots a launch (T * topk)
 constexpr int MMAX = 8;            // rows a group
 constexpr int TPW = R9K_EXL3_TPW;
 constexpr int GU_WAVES = 2 * 8 / TPW;   // a 128-column segment of gate and of up
@@ -527,62 +527,50 @@ struct Args
 struct Setup
 {
     int loc[SMAX];            // local expert of slot, -1 = not here
-    int ls[SMAX];             // local slots in slot order (nl of them)
-    int rank[SMAX];           // ls[j]'s occurrences of the same expert before it (local-list order = slot order)
-    int lead[SMAX];           // group g -> local-list index of its leader
+    int rank[SMAX];           // occurrences of the same expert before this slot
+    int lead[SMAX];           // group g -> leader slot
     int rows[MMAX];           // current group's slots
-    const half* suh[2];       // current group's gate / up suh (k_gu)
     int nl, ng, m, e, last;
 };
 
-// Groups from the routing, identical in every block of both kernels: the local slots of an expert, in slot order,
-// cut into runs of at most R -- so an expert's trellis is read once for up to R tokens (r9k_moe_exl3_groups exports
-// the same table for the tests). Cost O(S) loads + O(nl^2 / threads) LDS reads: the slot list is compacted first,
-// so the rank walk covers only local slots (~S / 8 at EP 8; the uncompacted walk was O(S^2), 288^2 at T = 48).
-// Returns false (block-uniform) when this block's group lane has nothing to do.
+// Groups from the routing, identical in every block of both kernels. Returns false (block-uniform) when this
+// block's group lane has nothing to do.
 __device__ __forceinline__ bool setup(Setup& st, const Args& a, const int p, const bool keep_empty)
 {
     const int tid = threadIdx.x, nt = blockDim.x;
+    if (tid == 0) st.nl = 0;
+    __syncthreads();
+    int nloc = 0;
     for (int i = tid; i < a.S; i += nt)
     {
         int id = a.ids[i];
         int e = (id >= 0 && id < a.G) ? (int) a.g2l[id] : -1;
-        st.loc[i] = (e >= 0 && e < a.E) ? e : -1;
+        e = (e >= 0 && e < a.E) ? e : -1;
+        st.loc[i] = e;
+        nloc += e >= 0;
     }
+    if (nloc) atomicAdd(&st.nl, nloc);
     __syncthreads();
-    if (tid < 32)             // compaction in slot order
+    if (p >= st.nl && !keep_empty) return false;
+    for (int i = tid; i < a.S; i += nt)
     {
-        int cnt = 0;
-        for (int base = 0; base < a.S; base += 32)
-        {
-            const int i = base + tid;
-            const bool f = i < a.S && st.loc[i] >= 0;
-            const uint32_t mask = (uint32_t) __ballot(f);
-            if (f) st.ls[cnt + __popc(mask & ((1u << tid) - 1u))] = i;
-            cnt += __popc(mask);
-        }
-        if (tid == 0) st.nl = cnt;
-    }
-    __syncthreads();
-    const int nl = st.nl;
-    if (p >= nl && !keep_empty) return false;
-    for (int j = tid; j < nl; j += nt)
-    {
-        const int e = st.loc[st.ls[j]];
+        const int e = st.loc[i];
         int r = 0;
-        for (int k = 0; k < j; ++k) r += st.loc[st.ls[k]] == e;
-        st.rank[j] = r;
+        if (e >= 0)
+            for (int j = 0; j < i; ++j) r += st.loc[j] == e;
+        st.rank[i] = r;
     }
     __syncthreads();
     if (tid < 32)
     {
         int cnt = 0;
-        for (int base = 0; base < nl; base += 32)
+        for (int base = 0; base < a.S; base += 32)
         {
-            const int j = base + tid;
-            const bool f = j < nl && st.rank[j] % a.R == 0;
+            const int i = base + tid;
+            const bool f = i < a.S && st.loc[i] >= 0 && st.rank[i] % a.R == 0;
             const uint32_t mask = (uint32_t) __ballot(f);
-            if (f) st.lead[cnt + __popc(mask & ((1u << tid) - 1u))] = j;
+            const int pos = cnt + __popc(mask & ((1u << tid) - 1u));
+            if (f) st.lead[pos] = i;
             cnt += __popc(mask);
         }
         if (tid == 0) st.ng = cnt;
@@ -595,18 +583,13 @@ __device__ __forceinline__ bool setup(Setup& st, const Args& a, const int p, con
 __device__ __forceinline__ void group_rows(Setup& st, const Args& a, const int g)
 {
     const int l0 = st.lead[g];
-    const int e = st.loc[st.ls[l0]];
+    const int e = st.loc[l0];
     const int r1 = st.rank[l0] + a.R;
     int m = 0;
-    for (int j = l0; j < st.nl && m < a.R; ++j)
-        if (st.loc[st.ls[j]] == e && st.rank[j] < r1) st.rows[m++] = st.ls[j];
+    for (int i = l0; i < a.S && m < a.R; ++i)
+        if (st.loc[i] == e && st.rank[i] < r1) st.rows[m++] = i;
     st.m = m;
     st.e = e;
-    if (a.tab[1])             // (k_groups runs without tables)
-    {
-        st.suh[0] = (const half*) a.tab[1][e];
-        st.suh[1] = (const half*) a.tab[4][e];
-    }
 }
 
 // Per-row dot dispatch: the row tile M is the smallest of 1, 2, 4, 8 covering m (rows past m re-read row m - 1)
@@ -646,53 +629,27 @@ __global__ __launch_bounds__(GU_WAVES * 32) void k_gu(const Args a)
         __syncthreads();
         const int m = st.m, e = st.e;
 
-        // rotated input chunk: x[token] * suh, Hadamard, f16 into LDS; one wave a (row, matrix, 128-block). The loads
-        // of up to RB tasks a wave go out together (each is an L2 round trip; at T = 48 a block walks several groups,
-        // and serial rounds of them were ~15 % of k_gu), the suh pointers come from LDS (group_rows)
-        constexpr int RB = 4;
-        const int ntask = m * 2 * segs;
-        for (int t0 = wave; t0 < ntask; t0 += RB * GU_WAVES)
+        // rotated input chunk: x[token] * suh, Hadamard, f16 into LDS; one wave a (row, matrix, 128-block)
+        for (int task = wave; task < m * 2 * segs; task += GU_WAVES)
         {
-            uint2 xu[RB], su[RB];
-            #pragma unroll
-            for (int j = 0; j < RB; ++j)
+            const int r = task / (2 * segs), mat = (task / segs) & 1, seg = task % segs;
+            const int tok = st.rows[r] / a.topk;
+            const int k = k0 + seg * 128 + lane * 4;
+            float v[4];
+            if (a.x_f16) ld_h4((const half*) a.x + (size_t) tok * a.H + k, v);
+            else
             {
-                const int task = t0 + j * GU_WAVES;
-                if (task >= ntask) break;
-                const int r = task / (2 * segs), mat = (task / segs) & 1, seg = task % segs;
-                const int tok = st.rows[r] / a.topk;
-                const int k = k0 + seg * 128 + lane * 4;
-                xu[j] = *(const uint2*) ((const uint16_t*) a.x + (size_t) tok * a.H + k);
-                su[j] = *(const uint2*) (st.suh[mat] + k);
+                uint2 u = *(const uint2*) ((const uint16_t*) a.x + (size_t) tok * a.H + k);
+                v[0] = bf16_f(u.x & 0xffff); v[1] = bf16_f(u.x >> 16); v[2] = bf16_f(u.y & 0xffff); v[3] = bf16_f(u.y >> 16);
             }
+            float s[4];
+            ld_h4((const half*) a.tab[mat * 3 + 1][e] + k, s);
             #pragma unroll
-            for (int j = 0; j < RB; ++j)
-            {
-                const int task = t0 + j * GU_WAVES;
-                if (task >= ntask) break;
-                const int r = task / (2 * segs), mat = (task / segs) & 1, seg = task % segs;
-                float v[4], sv[4];
-                if (a.x_f16)
-                {
-                    h2 p0 = as_h2(xu[j].x), p1 = as_h2(xu[j].y);
-                    v[0] = (float) p0.x; v[1] = (float) p0.y; v[2] = (float) p1.x; v[3] = (float) p1.y;
-                }
-                else
-                {
-                    v[0] = bf16_f(xu[j].x & 0xffff); v[1] = bf16_f(xu[j].x >> 16);
-                    v[2] = bf16_f(xu[j].y & 0xffff); v[3] = bf16_f(xu[j].y >> 16);
-                }
-                {
-                    h2 q0 = as_h2(su[j].x), q1 = as_h2(su[j].y);
-                    sv[0] = (float) q0.x; sv[1] = (float) q0.y; sv[2] = (float) q1.x; sv[3] = (float) q1.y;
-                }
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) v[i] *= sv[i];
-                had128(v, lane);
-                #pragma unroll
-                for (int i = 0; i < 4; ++i) v[i] *= RS128;
-                st_h4(sh_x + ((size_t) (mat * a.R + r) * kc) + seg * 128 + lane * 4, v);
-            }
+            for (int i = 0; i < 4; ++i) v[i] *= s[i];
+            had128(v, lane);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) v[i] *= RS128;
+            st_h4(sh_x + ((size_t) (mat * a.R + r) * kc) + seg * 128 + lane * 4, v);
         }
         __syncthreads();
 
@@ -717,7 +674,7 @@ __global__ __launch_bounds__(GU_WAVES * 32) void k_gu(const Args a)
         }
         __threadfence();
         __syncthreads();
-        int* c = ctr + st.ls[st.lead[g]] * NB + nb;
+        int* c = ctr + st.lead[g] * NB + nb;
         if (threadIdx.x == 0) st.last = atomicAdd(c, 1) == a.ks1 - 1;
         __syncthreads();
         if (st.last)
@@ -811,7 +768,7 @@ __global__ __launch_bounds__(DN_WAVES * 32) void k_dn(const Args a)
         }
         __threadfence();
         __syncthreads();
-        int* c = ctr2 + st.ls[st.lead[g]] * NB + nb;
+        int* c = ctr2 + st.lead[g] * NB + nb;
         if (threadIdx.x == 0) st.last = atomicAdd(c, 1) == a.ks2 - 1;
         __syncthreads();
         if (st.last)
@@ -864,27 +821,6 @@ __global__ __launch_bounds__(DN_WAVES * 32) void k_dn(const Args a)
             }
         }
         __syncthreads();
-    }
-}
-
-// Validation: the group table every block of k_gu / k_dn derives (one block, same setup()):
-// out[0] = local slots, out[1] = groups, then per group (2 + MMAX ints): local expert, rows, the rows' slots.
-// Each group is one pass over its expert's trellis in every (segment, chunk) block, so trellis bytes a layer =
-// groups x the expert's bytes.
-__global__ __launch_bounds__(256) void k_groups(const Args a, int* out)
-{
-    __shared__ Setup st;
-    setup(st, a, 0, true);
-    if (threadIdx.x) return;
-    out[0] = st.nl;
-    out[1] = st.ng;
-    for (int g = 0; g < st.ng; ++g)
-    {
-        group_rows(st, a, g);
-        int* o = out + 2 + g * (2 + MMAX);
-        o[0] = st.e;
-        o[1] = st.m;
-        for (int r = 0; r < MMAX; ++r) o[2 + r] = r < st.m ? st.rows[r] : -1;
     }
 }
 
@@ -978,20 +914,8 @@ extern "C" int r9k_moe_exl3_decode(long x, int x_f16, long ids, long w, long g2l
     hipStream_t st = (hipStream_t) stream;
     constexpr int CB2 = 2;
     if (R == 1) return cb == 2 ? launch_k<CB2, 1>(K, a, P, st) : launch_k<1, 1>(K, a, P, st);
-    if (R == 2) return cb == 2 ? launch_k<CB2, 2>(K, a, P, st) : launch_k<1, 2>(K, a, P, st);
     if (R <= 4) return cb == 2 ? launch_k<CB2, 4>(K, a, P, st) : launch_k<1, 4>(K, a, P, st);
     return cb == 2 ? launch_k<CB2, 8>(K, a, P, st) : launch_k<1, 8>(K, a, P, st);
-}
-
-extern "C" int r9k_moe_exl3_groups(long ids, long g2l, int G, int E, int T, int topk, int R, long out, long stream)
-{
-    const int S = T * topk;
-    if (T < 1 || S > SMAX || R < 1 || R > MMAX) return -1;
-    Args a{};
-    a.ids = (const int*) ids; a.g2l = (const int64_t*) g2l;
-    a.T = T; a.topk = topk; a.S = S; a.G = G; a.E = E; a.R = R;
-    hipLaunchKernelGGL(k_groups, dim3(1), dim3(256), 0, (hipStream_t) stream, a, (int*) out);
-    return hipGetLastError() == hipSuccess ? 0 : -4;
 }
 
 extern "C" int r9k_exl3_dq_tiles(long trellis, long out, int k, int n, int K, int cb, long stream)

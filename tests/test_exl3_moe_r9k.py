@@ -7,14 +7,9 @@
    kernel output in f32 (rms rel gate 2e-3) and through Exl3MoEMethod.apply in bf16 (gate 1e-2 like test_exl3_moe).
    Routings: random 6-of-384, all-local, none-local (exact zeros), shared experts across tokens (group rows), x*6
    (act_limit clipping).
-3. HIP graph: capture at T, replay with new inputs / routing == eager bitwise, chained layers, T = 1 .. 48.
-4. Grouping: the device-side group table (r9k_moe_exl3_groups, the setup() both kernels run) == the reference
-   grouping (each expert's local slots in slot order, runs of at most ROWS): one trellis pass a group, so the trellis
-   bytes a call reads = groups x an expert's bytes; T = 1 .. 48, repeats, all-local, none.
-5. The drafter's geometry (128 experts, 3 a token, K = 4: 16 local at EP 8), numerics + graphs, T = 1 .. 48.
-6. Timing (graph replay, us a layer) r9k vs mgemv at T = 1 .. 48, EP routing with a fixed number of local picks over
-   a fixed number of distinct experts (the expected counts for uniform routing at EP 8: T = 48 -> 36 picks over ~25),
-   K = 3 and K = 2; at T = 48 also 36 picks over 12 / 36 experts (time follows the distinct experts, not the picks).
+3. HIP graph: capture at T, replay with new inputs / routing == eager bitwise, chained layers.
+4. Timing (graph replay, us a layer) r9k vs mgemv at T = 1, 2, 4, 6, 8, 16, 24, random EP routing with a fixed
+   number of local picks, K = 3 and K = 2.
 
 Run (VM100, card 5): ~/ds41/exl3/gpu-run.sh 5 python3 tests/test_exl3_moe_r9k.py   (R9K_LIB=libr9k.so with the kernel)
 """
@@ -44,18 +39,9 @@ def set_ep(ep):
     E = TM.E
 
 
-def set_geom(g, topk, ep):
-    """Main layers (384 experts, 6 a token) or the drafter's (128, 3)."""
-    global G, TOPK
-    TM.G, TM.TOPK = G, TOPK = g, topk
-    set_ep(ep)
-
-
 DEV = TM.DEV
 G, TOPK, H, I = TM.G, TM.TOPK, TM.H, TM.I
 set_ep(EP)
-TS_NUM = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 36, 48)
-TS_GRAPH = (1, 2, 4, 6, 8, 16, 24, 36, 48)
 
 
 def check_decode():
@@ -108,51 +94,11 @@ def routing(T, kind, g):
     return TM.routing(T, {"random": False, "all-local": True, "none": "none"}[kind], g)
 
 
-def ref_groups(ids, R):
-    """Each local expert's slots in slot order, cut into runs of R; groups ordered by their first slot."""
-    flat = ids.reshape(-1).tolist()
-    seen, out = {}, []
-    for i, gid in enumerate(flat):
-        if 0 <= gid < E:
-            n = seen.get(gid, 0)
-            seen[gid] = n + 1
-            if n % R == 0:
-                out.append((gid, [i]))
-            else:
-                k = max(j for j, (e, _) in enumerate(out) if e == gid)
-                out[k][1].append(i)
-    return out
-
-
-def check_groups(layer):
-    """The kernels' device-side grouping: one trellis pass a group, never one a pick."""
-    ok = True
-    g = torch.Generator(device=DEV)
-    g.manual_seed(42)
-    g2l = layer.exl3_g2l
-    for T in (1, 2, 6, 8, 24, 36, 48):
-        for kind in ("random", "half", "shared", "all-local", "none"):
-            w, ids = routing(T, kind, g)
-            R = XD.rows_for(T)
-            got = XD.groups(ids, g2l, E, R)
-            want = ref_groups(ids, R)
-            nloc = int(((ids >= 0) & (ids < E)).sum())
-            npick = sum(len(r) for _, r in got)
-            nexp = len({e for e, _ in want})
-            good = got == want and npick == nloc
-            ok &= good
-            if not good or kind in ("random", "half") and T in (6, 24, 48):
-                print(f"  groups T={T:2d} {kind:9s}: {nloc:3d} local picks over {nexp:2d} experts -> {len(got):2d} groups "
-                      f"(trellis passes; {len(got) - nexp} beyond one an expert, R = {R}) "
-                      f"{'== reference' if good else '<-- FAIL ' + str(got[:4]) + ' vs ' + str(want[:4])}")
-    return ok
-
-
 def check_scratch():
-    """reserve() footprint for the default decode rows (48) and 24, 32: sized once, no allocator growth."""
+    """reserve() footprint for the default decode rows (24) and 32: sized once, no allocator growth."""
     ok = True
     dev = DEV
-    for rows in (24, 32, 48):
+    for rows in (24, 32):
         XD._bufs.clear()
         torch.cuda.empty_cache()
         r0 = torch.cuda.memory_reserved()
@@ -170,7 +116,7 @@ def check_scratch():
     return ok
 
 
-def check_numerics(layer, ref, K, Ts=TS_NUM, tol=2e-3):
+def check_numerics(layer, ref, K, Ts=(1, 2, 3, 4, 6, 8, 12, 16, 24, 32), tol=2e-3):
     ok = True
     g = torch.Generator(device=DEV)
     g.manual_seed(500 + K)
@@ -191,12 +137,12 @@ def check_numerics(layer, ref, K, Ts=TS_NUM, tol=2e-3):
                     good = rr < tol and bool(torch.isfinite(y).all())
                     worst = max(worst, rr)
                 ok &= good
-                if not good or T in (1, 6, 24, 48) or kind == "shared":
+                if not good or T in (1, 6, 24) or kind == "shared":
                     print(f"  K={K} T={T:3d} {kind:9s} x*{scale:<3g} local {local:3d} | f32 out: max/|ref| {mr:.3e} "
                           f"rms rel {rr:.3e} {'ok' if good else '<-- FAIL'}")
     # through the method tier (bf16 out), default knobs
     M.DECODE = "r9k"
-    for T in (1, 4, 8, 16, 36, 48):
+    for T in (1, 4, 8, 16):
         for kind in ("random", "all-local"):
             w, ids = routing(T, kind, g)
             x = torch.randn((T, H), device=DEV, generator=g).to(torch.bfloat16)
@@ -211,7 +157,7 @@ def check_numerics(layer, ref, K, Ts=TS_NUM, tol=2e-3):
     return ok
 
 
-def check_graphs(layer, K, Ts=TS_GRAPH):
+def check_graphs(layer, K, Ts=(1, 2, 4, 6, 8, 16, 24)):
     ok = True
     g = torch.Generator(device=DEV)
     g.manual_seed(600 + K)
@@ -248,29 +194,16 @@ def check_graphs(layer, K, Ts=TS_GRAPH):
     return ok
 
 
-def ep_routing(T, nloc, seed, shift=0, nexp=None):
-    """T tokens, exactly nloc local picks, the rest elsewhere. nexp None: experts spread over the E local ones
-    (rotated by shift); else exactly nexp distinct local experts (each picked at least once, never twice by a token)."""
+def ep_routing(T, nloc, seed, shift=0):
+    """T tokens, exactly nloc local picks (distinct (token, expert) pairs; experts spread over the 48, rotated by
+    shift), the rest elsewhere."""
     gen = torch.Generator(device=DEV)
     gen.manual_seed(seed)
     ids = (torch.rand((T, G - E), device=DEV, generator=gen).topk(TOPK, dim=1).indices + E).to(torch.int32)
     flat = ids.view(-1)
-    pos = torch.randperm(T * TOPK, generator=torch.Generator().manual_seed(seed))[:nloc].tolist()
-    if nexp is None:
-        for i, p in enumerate(pos):
-            flat[p] = (7 * i + 3 + p // TOPK + shift) % E
-    else:
-        pool = [(shift + 7 * j) % E for j in range(E)]
-        pool = list(dict.fromkeys(pool))[:nexp]
-        rng = torch.Generator().manual_seed(seed + 1)
-        used = {}
-        for i, p in enumerate(sorted(pos, key=lambda q: torch.rand((), generator=rng).item())):
-            t = p // TOPK
-            have = used.setdefault(t, set())
-            order = [pool[(i + k) % nexp] for k in range(nexp)]
-            e = next((x for x in order if x not in have), order[0])
-            have.add(e)
-            flat[p] = e
+    pos = torch.randperm(T * TOPK, generator=torch.Generator().manual_seed(seed))[:nloc]
+    for i, p in enumerate(pos.tolist()):
+        flat[p] = (7 * i + 3 + p // TOPK + shift) % E
     w = torch.full((T, TOPK), 0.25, device=DEV)
     x = torch.randn((T, H), device=DEV, generator=gen).to(torch.bfloat16)
     return x, w, ids
@@ -295,40 +228,30 @@ def graph_us(f, iters=200, reps=10):
     return (time.perf_counter() - t0) / (iters // reps) / reps * 1e6
 
 
-BENCH_CASES = [(1, 0, None), (1, 1, None), (1, 2, None), (2, 2, None), (4, 3, None), (6, 4, None), (6, 5, 5),
-               (8, 6, None), (16, 12, None), (24, 18, 15), (24, 18, None), (36, 27, 21), (48, 36, 25), (48, 36, 12),
-               (48, 36, 36), (1, 6, None), (6, 36, None), (24, 144, None)]
-
-
-def bench(layer, K, cases=None):
+def bench(layer, K):
     """Graph replay of 10 layer calls, each with its own routing over different experts (consecutive calls rotate
-    the experts by 5, so a replay touches all of them: weights come from DRAM as in a real step, not the 64 MB
-    Infinity Cache). Local picks at EP 8: T = 1 -> 1, T = 6 -> ~4.5 (here 5), T = 24 -> ~18 over ~15 experts,
-    T = 36 -> 27 over ~21, T = 48 -> 36 over ~25; plus all-local rows. GB/s = distinct experts x an expert's trellis
-    bytes / time (the grouping reads each expert once: check_groups)."""
+    the experts by 5, so a replay touches all 48: weights come from DRAM as in a real step, not the 64 MB Infinity
+    Cache). Local picks at EP 8: T = 1 -> 1, T = 6 -> ~4.5 (here 5), T = 24 -> ~18; plus all-local rows."""
     meth = layer.quant_method
     mb_e = 3 * H * I * K / 8 / 1e6
     print(f"  K={K}: {mb_e:.2f} MB of trellis an expert")
     print(f"  {'T':>3} {'local':>5} {'experts':>7} | {'r9k us':>7} {'GB/s':>6} | {'mgemv us':>8}")
     rows = []
-    sel = os.environ.get("BENCH_T")
-    for T, nloc, nx in (cases or BENCH_CASES):
-        if sel and str(T) not in sel.split(","):
-            continue
-        if nx is not None and nx > E or nloc > T * TOPK:
-            continue
-        calls = [ep_routing(T, nloc, 1000 + T * 7 + nloc + i, shift=5 * i, nexp=nx) for i in range(10)]
+    cases = [(1, 0), (1, 1), (1, 2), (2, 1), (2, 2), (4, 3), (6, 4), (6, 5), (8, 6), (16, 12), (24, 18), (1, 6),
+             (6, 36), (24, 144)]
+    for T, nloc in cases:
+        calls = [ep_routing(T, nloc, 1000 + T * 7 + nloc + i, shift=5 * i) for i in range(10)]
         nexp = sum(int(torch.unique(c[2][c[2] < E]).numel()) for c in calls) / len(calls)
         M.DECODE = "r9k"
         us = graph_us(lambda i: meth.apply(layer, *calls[i], None, None))
-        if T * TOPK <= M.MGEMV_SLOTS and os.environ.get("BENCH_MGEMV", "1") == "1":
+        if T * TOPK <= M.MGEMV_SLOTS:
             M.DECODE = "mgemv"
             us_m = graph_us(lambda i: meth.apply(layer, *calls[i], None, None))
         else:
             us_m = float("nan")
         gbs = nexp * mb_e / us * 1e3 if nexp else 0.0
         rows.append((T, nloc, nexp, us, gbs, us_m))
-        print(f"  {T:3d} {nloc:5d} {nexp:7.1f} | {us:7.1f} {gbs:6.0f} | {us_m:8.1f}", flush=True)
+        print(f"  {T:3d} {nloc:5d} {nexp:7.1f} | {us:7.1f} {gbs:6.0f} | {us_m:8.1f}")
     M.DECODE = "r9k"
     return rows
 
@@ -349,9 +272,6 @@ if __name__ == "__main__":
         if not only or "num" in only or "graph" in only:
             layer, ref = TM.make_layer(K, seed)
             print(f"   ({E} local experts, EP {EP})")
-            if K == 3 and (not only or "num" in only or "group" in only):
-                print("-- device-side grouping (one trellis pass a group)")
-                allok &= check_groups(layer)
             if not only or "num" in only:
                 print(f"-- numerics K={K} synthetic")
                 allok &= check_numerics(layer, ref, K)
@@ -371,18 +291,6 @@ if __name__ == "__main__":
             del layer
             torch.cuda.empty_cache()
             set_ep(EP)
-    if not only or "draft" in only:
-        # the DSpark drafter's experts: 128 a layer, 3 a token, K = 4 -> 16 local at EP 8 (R9K_TEST_DRAFT_EP: 32 =
-        # 4 local for a < 1 GiB run)
-        set_geom(128, 3, int(os.environ.get("R9K_TEST_DRAFT_EP", 8 if EP == 8 else 32)))
-        layer, ref = TM.make_layer(4, 77)
-        print(f"-- drafter geometry: {G} experts, top-{TOPK}, K=4, {E} local")
-        allok &= check_groups(layer)
-        allok &= check_numerics(layer, ref, 4)
-        allok &= check_graphs(layer, 4)
-        del layer, ref
-        torch.cuda.empty_cache()
-        set_geom(384, 6, EP)
     real_dir = os.environ.get("EXL3_REAL_DIR", "/ds41/exl3/kerneltest/real")
     if not only or only == "real" or "num" in only:
         for K, f in ((3, "l0-sample.safetensors"), (2, "l18-sample.safetensors")):
@@ -392,8 +300,8 @@ if __name__ == "__main__":
                 continue
             layer, ref = TM.make_layer(K, 0 if K == 3 else 18, real=path)
             print(f"-- numerics on real pack experts ({f}, K={K})")
-            allok &= check_numerics(layer, ref, K, Ts=(1, 2, 6, 8, 24, 36, 48))
-            allok &= check_graphs(layer, K, Ts=(1, 6, 48))
+            allok &= check_numerics(layer, ref, K, Ts=(1, 2, 6, 8, 24))
+            allok &= check_graphs(layer, K, Ts=(1, 6))
             del layer, ref
             torch.cuda.empty_cache()
     print("ALL OK" if allok else "FAILURES")
@@ -412,14 +320,3 @@ if __name__ == "__main__":
 #     r9k K=3       364.8 (407)    538.3 (372)    172.6 (461)    798.1 (424)    2218.9 (277)
 #     mgemv K=3    1000.2           -             201.4          989.1             -
 #     r9k K=2: 1/1 39.8, 6/4 110.9, 6/5 141.1, 16/12 350.3, 24/18 520.1 (ALU-bound: K=2 is only ~5% faster than K=3)
-#
-# Phase 4 package A (2026-11-03, VM100 card 5, r9700/vllm:dev, SCLK offset 0 at the time; ALL OK): decode == reconstruct
-# bit for bit K 1-8; device grouping == the reference at T = 1-48 (one trellis pass a group); f32 rms rel <= 4.2e-4 at
-# T = 1-48 incl. the drafter geometry (128 experts, top-3, K = 4) and real layer-0 / layer-18 experts; graph replay ==
-# eager bitwise to T = 48; scratch at 48 rows 47.5 MiB. Timing, graph replay, us a layer, K = 3 (A4sweep.py: T / local
-# picks / distinct experts; before = the v0.4.0 kernel and tier, which sends T = 48 to exllamav3's fused tier):
-#     T/picks/experts   6/4/4    6/5/5    24/18/15   36/27/21   48/36/25          48/36/12   48/36/36
-#     v0.4.0           123.0    145.6     518.4      795.3     2324.0 (fused)        -          -
-#     package A        118-124  141-152   414-435    616-620    674-741 (449 GB/s)   676       990
-#   K = 2: 24/18/15 548 -> 369, 36/27/21 871 -> 597, 48/36/25 2309 -> 717; drafter (K = 4, 16 local, top-3): T = 20
-#   223 -> 213, T = 40 407 -> 342. Above 8 tokens 2-row groups and 4 gate|up chunks (exl3_decode.rows_for / split_for).
