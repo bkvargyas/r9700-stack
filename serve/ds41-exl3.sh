@@ -7,11 +7,31 @@
 # DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5): acceptance ~3.6 on code (2x), ~2.5 on prose
 # (break-even); DSPARK=0 for a plain run. WARM=1 waits for the server and sends one prefill so the Triton JITs (~7-13 s) land
 # before the first user request.
+# (serve.sh starts the container detached and returns, so the warm-up below runs after it; the launcher used to exec
+# serve.sh, which made WARM a no-op.)
 # DRYRUN=1 prints the docker command without launching. Every knob is overridable from the caller's environment.
 # (serve.sh's MTP / DRAFT paths cannot express method "dspark" without a draft model path: it rides in EXTRA instead)
 mkdir -p "$HOME/exl3-tune"
-SPEC=; [ "${DSPARK:-1}" = 1 ] && SPEC='--speculative-config {"method":"dspark","num_speculative_tokens":5,"enable_adaptive_verification":false}'
-exec env \
+# DSPARK_K = num_speculative_tokens (the verify step is DSPARK_K + 1 tokens a stream); ADAPTIVE = DSpark's
+# enable_adaptive_verification (true/false); SPEC_EXTRA='"k":v,...' appends speculative-config fields (no spaces).
+SPEC=; [ "${DSPARK:-1}" = 1 ] && SPEC="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":${DSPARK_K:-5},\"enable_adaptive_verification\":${ADAPTIVE:-false}${SPEC_EXTRA:+,$SPEC_EXTRA}}"
+# CGSIZES (serve.sh): HIP-graph capture sizes. With the drafter every decode step is a multiple of DSPARK_K + 1 tokens,
+# so the default is 1,2,4 + (DSPARK_K + 1) x 1..NSEQ (k=5, NSEQ 4: 1,2,4,6,12,18,24) instead of vLLM's
+# 1,2,4,6,8,12,16,24,32,40,48; CGSIZES= (empty) restores vLLM's list (notes/exl3-serving.md: same speed, -0.4 GiB
+# of hipMemGetInfo accounting, ~35 MiB of real VRAM).
+if [ "${DSPARK:-1}" = 1 ] && [ -z "${CGSIZES+x}" ]; then
+  q=$(( ${DSPARK_K:-5} + 1 )); CGSIZES=1,2,4; for i in $(seq 1 ${NSEQ-4}); do CGSIZES=$CGSIZES,$(( q * i )); done
+  CGSIZES=$(echo $CGSIZES | tr , '\n' | sort -nu | paste -sd,); export CGSIZES
+fi
+# ALLOC_CONF: PYTORCH_ALLOC_CONF for the workers (e.g. expandable_segments:True).
+[ -n "${ALLOC_CONF-}" ] && DOCKER_ARGS="${DOCKER_ARGS-} -e PYTORCH_ALLOC_CONF=$ALLOC_CONF"
+# MEMPROBE=1: memory audit hooks (bench/ds41/memprobe_ext.py as a stock --worker-extension-cls, dev endpoint
+# POST /collective_rpc); client bench/ds41/memprobe.py. Diagnostic only.
+MP=; if [ "${MEMPROBE:-0}" = 1 ]; then
+  MP="--worker-extension-cls r9k_memprobe.MemProbe"
+  DOCKER_ARGS="${DOCKER_ARGS-} -e VLLM_SERVER_DEV_MODE=1 -v ${REPO-$HOME/r9700-exl3}/bench/ds41/memprobe_ext.py:/usr/local/lib/python3.12/dist-packages/r9k_memprobe.py:ro"
+fi
+env \
   OVERLAYS=${OVERLAYS-emulated-switch} `# host overlay, not the product: VM100 on the .100 PLX box needs the hostcall-free
                                         # RCCL or every collective fails at launch. PATCHED (~/p2p-patched-nightly) must
                                         # match the image's vLLM build: r9700/vllm:exl3 = r9700/vllm:dev + the exllamav3
@@ -36,7 +56,7 @@ exec env \
                                         # of the exl3 linear / MoE paths is unverified; EAGER=0 once it is` \
   PREFIX_CACHE=${PREFIX_CACHE-0} `        # off for bring-up (fewer moving parts; ROCm keeps SWA replay off anyway)` \
   EXTRA="--enable-expert-parallel --engram-config {\"cpu_offload\":true} --tokenizer-mode deepseek_v41
-         --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 $SPEC ${EXTRA-}" `# (later flags override serve.sh's
+         --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 $SPEC $MP ${EXTRA-}" `# (later flags override serve.sh's
                                         # qwen3 parsers; JSON without spaces: serve.sh word-splits EXTRA)` \
   "${@}" \
   bash "$(dirname "$(realpath "$0")")/serve.sh" || exit $?
@@ -46,9 +66,9 @@ if [ "${WARM:-0}" = 1 ]; then
 import json, sys, urllib.request
 port, model = sys.argv[1], sys.argv[2]
 words = " ".join(f"w{i}" for i in range(1500))
-for n in (8, 2500):
-    body = {"model": model, "messages": [{"role": "user", "content": words[:n * 2] + " Say ok."}], "max_tokens": 4,
-            "chat_template_kwargs": {"thinking": False}}
+for n, m in ((8, 96), (2500, 4), (8, 96)):     # decode (the DSpark verify path JITs on its first steps) + one prefill
+    body = {"model": model, "messages": [{"role": "user", "content": words[:n * 2] + " Say ok."}], "max_tokens": m,
+            "ignore_eos": True, "chat_template_kwargs": {"thinking": False}}
     urllib.request.urlopen(urllib.request.Request(f"http://localhost:{port}/v1/chat/completions", json.dumps(body).encode(),
                                                   {"Content-Type": "application/json"}), timeout=600).read()
 print("warm-up done")
