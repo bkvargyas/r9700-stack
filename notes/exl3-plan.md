@@ -393,3 +393,22 @@ Packages (parallel; the owner integrates, then runs the release gate):
 Then (owner): integrate, release gate on the same tree -- GLM-5.3-Flash TP8 (ar8's split path now starts at 32 KB, so GLM's
 multi-token steps take it), Flash-Next TP4 and 27B TP2 (R9kAllReduceN changed) at the v0.3.8 numbers -- then v0.4.0:
 release note, CHANGELOG, README section, annotated tag, GitHub Release, deploy to VM100's production copy.
+
+### Phase 3 results (2026-11-03 03:00 UTC; commits 88f6cb5 P1, 5a943a7 H, 79d25b5 RoPE trim, S's notes/exl3-serving.md)
+- **P1 (scratch):** the r9k expert tier sizes its scratch once for the largest decode call (R9K_EXL3_MOE_R9K_M = 24: four streams
+  x a 6-token verify) from one allocation shared by every layer and the drafter: 23.7 MiB a rank (31.6 at M = 32) instead of
+  ~1.2 GiB of allocator-pool growth from incremental reserve() calls (the buffers themselves were ~30 MiB; every outgrown set
+  stayed in the pool and each mid-size buffer rounded up to a 20 MB block). Numerics and timing unchanged (bit-exact trellis
+  decode, graph replay = eager). Steps above 24 tokens go to the fused tier.
+- **H (hyper-connections):** one HIP launch a seam (`kernels/r9k_mhc.hip`, `r9700_vllm/hc_dsv4.py`): the post update of layer l
+  folded into the delayed pre of layer l+1, the [M, 20480] x [20480, 24] mix as a deterministic last-workgroup reduction, fp32
+  with the torch reference's rounding points; bit-exact residual / collapse / post against torch at M = 1..32. 25.7 -> 8.0 us a
+  seam at M = 1 (~1.4 ms a step back); prefill widths stay on stock's TileLang kernels. `R9K_DSV41_MHC=stock` restores them.
+- **S (serving):** memory audit against the driver's sysfs counter (hipMemGetInfo under-reports free VRAM by 0.9-1.3 GiB on this
+  pin): weights + fixed buffers 27.3 GiB a rank (experts 23.5, drafter 1.1, attention 1.0, RoPE caches 0.5, shared experts 0.34,
+  embed / head 0.16 each, router 0.15, workspace 0.17), torch cache 0.8, C++-held 0.7, non-torch 1.2. Reclaimed: expandable
+  segments -470 MiB, the drafter-shaped graph list -35 MiB (capture 27 -> 19 s), RoPE trim -496 MiB at 32k (owner, 79d25b5),
+  P1's scratch -1.2 GiB. Draft length (table in notes/exl3-serving.md): k = 5 wins; `enable_adaptive_verification` runs on
+  RDNA4 (+22-28 % per stream on four-stream prose, -5-6 % single-stream prose, code unchanged, +78 MiB of varlen graphs, capture
+  71 s). With H: prose 74.6 / 70.1 (adaptive) tok/s single, 38.3 / 46.8 per stream x 4; code 158-159 / 84; GSM8K-style 121 / 114,
+  70 per stream x 4. Final KV budget, the 128k launch and the validation: notes/exl3-serving.md sections 3 and 5 (release note).
