@@ -7,8 +7,11 @@ serving of the official checkpoint is untouched. The classes are built on first 
 ARCHS imports nothing from vllm.models.deepseek_v41 in processes that never serve it. Layer map: notes/exl3-layer-map.md.
 
 With exl3:
-  * construction: ``attn.wo_a`` is built unquantized (bf16_linears): stock ROCm reads its weight directly (_o_proj ->
-    rocm_inv_rope_einsum caches a bf16 copy). Everything else that asks the quant config gets quant/exl3.py /
+  * construction: ``attn.wo_a`` runs the EXL3 method when models/deepseek_v41_rdna4.py install_wo_a_exl3() hooks stock's
+    ``_o_proj`` (R9K_DSV41_WOA=exl3, the default: the pack's eight o-group slices are exactly the TP8 column shards, slice
+    r -> rank r, served by quant/exl3_gemv.py at decode); with R9K_DSV41_WOA=bf16 (or if the hook fails) it is built
+    unquantized (bf16_linears) and stock ROCm reads its weight directly (_o_proj -> rocm_inv_rope_einsum caches a bf16
+    copy). Everything else that asks the quant config gets quant/exl3.py /
     quant/exl3_moe.py (the shared experts go dense there: 2304 / 8 = 288 is not a 128-multiple). The attention layers lose
     their aux streams (serialize_attention): exllamav3's RDNA GEMV is not stream-safe.
   * load_weights: the pack's names are the HF names with each quantized ``.weight`` replaced by ``.trellis/.suh/.svh/.mul1``.
@@ -57,8 +60,8 @@ _RENAME = {"attn.wq_a": ("attn.fused_wqa_wkv", 0), "attn.wkv": ("attn.fused_wqa_
            "ffn.shared_experts.w3": ("ffn.shared_experts.gate_up_proj", 1),
            "ffn.shared_experts.w2": ("ffn.shared_experts.down_proj", None)}
 _SLICE = re.compile(r"^attn\.wo_a\.slice\.(\d+)$")
-# vLLM-side module prefixes built unquantized under exl3: stock ROCm reads wo_a's weight directly (_o_proj ->
-# rocm_inv_rope_einsum caches a bf16 copy), so it must be a plain bf16 linear until _o_proj is routed through the method
+# vLLM-side module prefixes built unquantized under exl3 when wo_a stays bf16 (R9K_DSV41_WOA=bf16): stock ROCm reads
+# wo_a's weight directly (_o_proj -> rocm_inv_rope_einsum caches a bf16 copy)
 BF16_LINEARS = re.compile(r"\.attn\.wo_a$")
 _COLS = 16384  # dequant chunk (output columns, a 128-multiple): bounds the f32 temporaries on the GPU (the head is 129280)
 
@@ -141,16 +144,27 @@ def dequant_bf16(parts: dict[str, torch.Tensor]) -> torch.Tensor:
     return out
 
 
+def bf16_pattern():
+    """The construction scope's bf16 pattern: None (wo_a on EXL3) once deepseek_v41_rdna4.install_wo_a_exl3() has hooked
+    stock's _o_proj (R9K_DSV41_WOA=exl3, default), else BF16_LINEARS (wo_a dequantized to bf16 at load, v0.4.0)."""
+    from . import deepseek_v41_rdna4 as R
+    return None if R.install_wo_a_exl3() else BF16_LINEARS
+
+
 @contextlib.contextmanager
-def bf16_linears(quant_config):
-    """Construction scope: BF16_LINEARS ask the exl3 config and get UnquantizedLinearMethod. The bound method is shadowed
-    on the instance for the duration of the model's __init__ (get_quant_method is only asked at construction)."""
+def bf16_linears(quant_config, pattern=BF16_LINEARS):
+    """Construction scope: linears whose prefix matches ``pattern`` ask the exl3 config and get UnquantizedLinearMethod.
+    The bound method is shadowed on the instance for the duration of the model's __init__ (get_quant_method is only asked
+    at construction). pattern None: nothing is forced to bf16."""
+    if pattern is None:
+        yield
+        return
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
     had = "get_quant_method" in vars(quant_config)
     orig = quant_config.get_quant_method
 
     def get_quant_method(layer, prefix):
-        if isinstance(layer, LinearBase) and BF16_LINEARS.search(prefix):
+        if isinstance(layer, LinearBase) and pattern.search(prefix):
             return UnquantizedLinearMethod()
         return orig(layer, prefix)
 
@@ -283,11 +297,14 @@ def _build():
             if not self._r9k_exl3:
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
                 return
-            with bf16_linears(vllm_config.quant_config):
+            pat = bf16_pattern()
+            with bf16_linears(vllm_config.quant_config, pat):
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
             n = serialize_attention(self)
-            logger.info_once("r9700 exl3: DeepSeek-V4.1 with EXL3 weights; wo_a, head, compressor, indexer.wk "
-                             "dequantized to bf16 at load; %d attention layers on one stream", n)
+            from ..moe import exl3_combine; exl3_combine.install(self)   # package C: fused MoE combine -> one-kernel all-reduce
+            logger.info_once("r9700 exl3: DeepSeek-V4.1 with EXL3 weights; %shead, compressor, indexer.wk "
+                             "dequantized to bf16 at load; %d attention layers on one stream",
+                             "wo_a on EXL3; " if pat is None else "wo_a, ", n)
 
         def load_weights(self, weights):
             if not self._r9k_exl3:
@@ -307,9 +324,10 @@ def _build():
             if not self._r9k_exl3:
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
                 return
-            with bf16_linears(vllm_config.quant_config):
+            with bf16_linears(vllm_config.quant_config, bf16_pattern()):
                 super().__init__(vllm_config=vllm_config, prefix=prefix)
             serialize_attention(self)
+            from ..moe import exl3_combine; exl3_combine.install(self)   # package C: fused MoE combine -> one-kernel all-reduce
 
         def load_weights(self, weights):
             if not self._r9k_exl3:

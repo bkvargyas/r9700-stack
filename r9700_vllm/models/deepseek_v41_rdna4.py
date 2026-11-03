@@ -222,6 +222,65 @@ def _install_mhc() -> bool:
     return True
 
 
+def wo_a_exl3(wo_a, o: torch.Tensor) -> torch.Tensor:
+    """z [T, groups x 1024] = the per-group wo_a projection of o [T, groups x 4096] (this rank's heads, already
+    inverse-RoPE'd) for an EXL3 wo_a (quant/exl3.py Exl3LinearMethod, one part per local o-group, part j reading input
+    group j). One group (TP8): the layer's own apply -- rows 1..GEMV_M on r9k_exl3_gemv, wider calls dequantize the slice
+    and run hipBLAS (exllamav3's reconstruct path). Several groups (TP < 8): one r9k launch with per-group inputs at
+    decode widths, per-part reconstruct + GEMM above."""
+    from r9700_vllm.quant import exl3 as E
+    parts = wo_a.exl3_parts
+    T, kg = o.shape[0], o.shape[1] // len(parts)
+    if len(parts) == 1:
+        return wo_a.quant_method.apply(wo_a, o)
+    y = torch.empty((T, sum(p.n for p in parts)), dtype=o.dtype, device=o.device)
+    plan = getattr(wo_a, "exl3_gemv", None)
+    if T <= E.GEMV_M and E.GEMV == "r9k" and plan is not None and o.stride(1) == 1 and o.stride(0) % 4 == 0:
+        from r9700_vllm.quant.exl3_gemv import r9k_exl3_gemv
+        r9k_exl3_gemv(plan, [o[:, j * kg:(j + 1) * kg] for j in range(len(parts))],
+                      [y[:, p.dst:p.dst + p.n] for p in parts])
+        return y
+    for j, p in enumerate(parts):
+        y[:, p.dst:p.dst + p.n].copy_(p.recon_mm(o[:, j * kg:(j + 1) * kg].to(torch.float16).contiguous()))
+    return y
+
+
+def install_wo_a_exl3() -> bool:
+    """R9K_DSV41_WOA=exl3 (default) | bf16. exl3: the attention's ``_o_proj`` (amd/rocm.py
+    DeepseekV41ROCMAiterMLAAttention) projects through an EXL3 ``wo_a`` (wo_a_exl3: the pack's eight 128-aligned
+    [4096 -> 1024] o-group slices, slice r on rank r at TP8) instead of stock's bf16 path (rocm_inv_rope_einsum ->
+    _get_cached_wo_a_bf16 + einsum). The input is what stock's einsum would get: forward_mqa has already removed the RoPE
+    rotation from every row (the split-K reduce's fused inverse RoPE for decode rows, the standalone pass for the rest),
+    since rocm's _o_proj calls the einsum with inverse_rope=False -- so nothing near the decode RoPE changes. Layers whose
+    wo_a is not EXL3 (bf16, or an MXFP8 QuantizedActivation on gfx950) keep stock's path. Called by the exl3 loader
+    (models/deepseek_v41_exl3.py) before it builds the model: it builds wo_a under the exl3 config only when this
+    returns True; bf16 keeps the v0.4.0 behaviour (wo_a dequantized to bf16 at load, +~220 MiB a rank)."""
+    if os.environ.get("R9K_DSV41_WOA", "exl3") != "exl3":
+        return False
+    try:
+        from vllm.models.deepseek_v41.amd import rocm as R
+        cls = R.DeepseekV41ROCMAiterMLAAttention
+        if getattr(cls._o_proj, "__r9k_patch__", None) == "dsv41_wo_a_exl3":
+            return True
+        orig = cls._o_proj
+
+        def _o_proj(self, attn_out, positions):
+            if isinstance(attn_out, torch.Tensor) and getattr(self.wo_a, "exl3_parts", None):
+                o = attn_out[:, : self.n_local_heads, :]
+                z = wo_a_exl3(self.wo_a, o.reshape(o.shape[0], -1))
+                return self._wo_b_after_wo_a(z)
+            return orig(self, attn_out, positions)
+
+        _o_proj.__r9k_patch__ = "dsv41_wo_a_exl3"
+        _o_proj.__r9k_orig__ = orig
+        cls._o_proj = _o_proj
+        logger.info_once("r9700: deepseek_v41 wo_a on EXL3 (R9K_DSV41_WOA=exl3)")
+        return True
+    except Exception as e:  # pragma: no cover
+        logger.warning("r9700: dsv41 EXL3 wo_a hook not installed (%s); wo_a stays bf16", e)
+        return False
+
+
 def _install_route() -> bool:
     """Package B (Phase 4): ffn_norm + MoE gate GEMV + sqrt-softplus top-k in one launch for <= 32 rows
     (dsv4_glue.py _RouteHook, kernels/r9k_dsv4_glue.hip r9k_dsv4_route) instead of stock's RMSNorm + hipBLASLt gate +

@@ -60,6 +60,10 @@ RECON_M = int(os.environ.get("R9K_EXL3_RECON_M", "16"))  # two GEMV chunks still
 FUSED_M = int(os.environ.get("R9K_EXL3_FUSED_M", "1024"))
 FUSED_M_WIDE = int(os.environ.get("R9K_EXL3_FUSED_M_WIDE", "384"))
 _GEMV_ROWS = 8          # exl3_gemm takes the RDNA GEMV for 1..8 rows (tags 90-92) and the autotuned GEMM above
+# Decode GEMV (package D): R9K_EXL3_GEMV=r9k (default when libr9k has it) runs rows 1..GEMV_M through our multi-matrix
+# kernel (quant/exl3_gemv.py: bf16 in / out, rotations in-kernel, one launch a layer); =exl3 keeps exllamav3's exl3_gemm.
+GEMV = os.environ.get("R9K_EXL3_GEMV", "r9k")
+GEMV_M = int(os.environ.get("R9K_EXL3_GEMV_M", "48"))   # every decode width (4 streams x 6 = 24; 8 x 6 = 48)
 _MM_ROWS = 1024         # hipBLAS f16 GEMM row chunk
 _FIELDS = ("trellis", "suh", "svh")
 _DTYPES = {"trellis": torch.int16, "suh": torch.float16, "svh": torch.float16, "mul1": torch.int32, "mcg": torch.int32}
@@ -137,6 +141,31 @@ def exl3_gemm_f16(a_f16: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor,
         # force_num_sms 0 = device default (-1 would skip the GEMV and the autotuner and set num_sms = -1)
         ext().exl3_gemm(a_f16[i:j], trellis, c[i:j], suh, a_had[i:j], svh, -1, mcg, mul1, 0)
     return c
+
+
+def _gemv_plan(parts, k: int):
+    """The r9k decode-GEMV plan for a layer's parts (quant/exl3_gemv.py), or None when libr9k lacks the kernel, the knob
+    is off or a part is outside its K range (2..6). Reserves the kernel's scratch for GEMV_M rows and runs every row count
+    once, so nothing allocates under graph capture."""
+    if GEMV == "off":
+        return None
+    try:
+        from . import exl3_gemv as G
+        if not G.available():
+            return None
+    except Exception:  # pragma: no cover
+        return None
+    if any(not 2 <= p.K <= 6 or p.mcg == p.mul1 for p in parts):
+        return None
+    plan = G.Exl3GemvPlan(parts, k)
+    plan.reserve(GEMV_M)
+    dev = parts[0].trellis.device
+    x = torch.zeros((GEMV_M, k), dtype=torch.bfloat16, device=dev)
+    y = torch.empty((GEMV_M, plan.n_total), dtype=torch.bfloat16, device=dev)
+    for m in range(1, GEMV_M + 1):
+        G.r9k_exl3_gemv(plan, x[:m], y[:m])
+    logger.info_once("exl3: decode rows 1..%d on r9k_exl3_gemv (R9K_EXL3_GEMV=%s)", GEMV_M, GEMV)
+    return plan
 
 
 @dataclass
@@ -457,6 +486,20 @@ class Exl3LinearMethod(LinearMethodBase):
         for m in range(1, _GEMV_ROWS + 1):
             for tag in Exl3LinearMethod._decode(layer, layer.exl3_abuf[:m].zero_()):
                 assert tag in (90, 91, 92, 93), f"exl3 {layer.prefix}: {m} rows took exl3_gemm path {tag}, not the GEMV"
+        layer.exl3_gemv = _gemv_plan(parts, k)
+
+    @staticmethod
+    def _gemv_apply(layer, x: torch.Tensor, m: int, k: int, n: int) -> torch.Tensor:
+        """Rows 1..GEMV_M: one r9k_exl3_gemv launch a (K, codebook) for every part, bf16 / f16 in, x's dtype out."""
+        from .exl3_gemv import r9k_exl3_gemv
+        a = x.reshape(m, k)
+        if a.dtype not in (torch.bfloat16, torch.float16):
+            a = a.to(torch.float16)
+        if a.stride(1) != 1 or a.stride(0) % 4 or a.data_ptr() % 16:
+            a = a.clone(memory_format=torch.contiguous_format)
+        y = torch.empty((m, n), dtype=x.dtype if x.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                        else torch.bfloat16, device=x.device)
+        return r9k_exl3_gemv(layer.exl3_gemv, a, y)
 
     @staticmethod
     def _decode(layer, a: torch.Tensor) -> list[int]:
@@ -485,7 +528,10 @@ class Exl3LinearMethod(LinearMethodBase):
         lead, k, n = x.shape[:-1], x.shape[-1], layer.exl3_n
         m = x.numel() // k
         parts = layer.exl3_parts
-        if m <= RECON_M:
+        plan = getattr(layer, "exl3_gemv", None)
+        if plan is not None and m <= GEMV_M and GEMV == "r9k" and plan.takes(m):
+            y = self._gemv_apply(layer, x, m, k, n)
+        elif m <= RECON_M:
             # decode: bf16 -> f16 straight into the static input (one kernel, any input strides), the GEMVs into the
             # static f32 C, then one cast to the caller's dtype per output block (one in all when m == 1)
             a = layer.exl3_abuf[:m]
