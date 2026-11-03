@@ -600,3 +600,14 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   rotation is the next step). Open: NB2=4 crashes on main_proj (default 2).
 - Committed as the package D commit on v041 (D's files; build.sh now carries A, B, C and D's exports; C's combine hook wired in the
   EXL3 model classes in the same commit).
+- **Package A on the clean tree (git archive 3f2167a = C + B + A; 17:33-18:35 UTC, `~/ds41/exl3/A4/clean-CBA.log`, `bisect-A.log`):
+  the DSpark drafter accepts nothing -- MAL 1.01, acceptance 0.002 at every width, NSEQ 4 and 8, with and without extra container
+  variables** (prose x1 50-54 tok/s, code 49-55; the target is still right: divergence 22 / 24 / 24, GSM8K 99 / 100). The "any
+  extra -e breaks the drafter" finding was this. Bisect by knob: `R9K_EXL3_MOE_DECODE=mgemv` (A's kernel bypassed) MAL 1.80 / 4.43,
+  prose 87.3 / code 196; `R9K_EXL3_MOE_R9K_M=24` (A's kernel, old cap) MAL 1.71 / 4.49 but prose **62.8** / code 182.6. So A's
+  rewritten kernel (a) corrupts the drafter when the tier is sized for 48 rows (the warm-up at 36 / 48 rows or the 2-row
+  group path leaves the drafter's small calls wrong -- the single-card tests at R9K_TEST_DRAFT_EP=32 did not see it), and (b) costs
+  ~+6 ms a step at the 1-4-row widths the single-stream step actually runs (not in A's table, which starts at T = 6). Held back:
+  commit "Hold back package A's 48-token expert tier" returns the kernel, tier wiring and tests to v0.4.0; the split-path lane
+  rule (+4-13 % at 240-480 KiB), spectune STREAMS and the NSEQ-8 caveat stay. v0.4.2 item: redo the 48-token tier with the
+  drafter geometry (16 local, top-3, K = 4) and T = 1-4 in the acceptance, on a clean tree, server-validated.
