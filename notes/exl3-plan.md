@@ -611,3 +611,8 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   commit "Hold back package A's 48-token expert tier" returns the kernel, tier wiring and tests to v0.4.0; the split-path lane
   rule (+4-13 % at 240-480 KiB), spectune STREAMS and the NSEQ-8 caveat stay. v0.4.2 item: redo the 48-token tier with the
   drafter geometry (16 local, top-3, K = 4) and T = 1-4 in the acceptance, on a clean tree, server-validated.
+- **Plain decode (no drafter), release-candidate tree** (by accident: the hold-back edit had cut the launcher's speculative-config
+  line; `~/ds41/exl3/D4/clean-REL.log`, 18:39-19:10 UTC): **83.2-83.5 tok/s single stream** (v0.4.0's no-drafter probe: 51.7),
+  52.9-60.4 per stream at four (v0.4.0: 31.5), prose = code as expected without speculation; divergence 22 / 24 / 22, GSM8K
+  99 / 100. wo_a on EXL3 vs bf16 at these widths: 83.3 vs 80.5 single, 59.8-60.4 vs 58.0-58.3 at four -> EXL3 stays the default.
+  The launcher is restored (commit after a9ec6a9) and the drafter runs are repeated as REL2.
