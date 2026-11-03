@@ -550,3 +550,10 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
 - Projected a single-stream step: ~214 fewer launches of 1,754 and 1.0-1.3 ms of GPU time (FFN front 0.4-0.7, markov 0.45,
   attention input 0.1). 116 checks pass: norms within 1 bf16 ulp of stock's rms_norm, top-k bit-exact, graphs = eager.
   Committed as 828115a on v041 (B's clean-tree versions of build.sh and deepseek_v41_rdna4.py, without D's hunks).
+- **Real server, v0.4.0 + C + B on a clean tree** (git archive 828115a -> VM100 ~/r9700-exl3-CB; 16:02-16:24 UTC, `~/ds41/exl3/B4/clean-CB.log`;
+  v0.4.0 + C / v0.4.0 in parentheses): adaptive off -- prose x1 **83.2-84.2** (80.2 / 74.6), prose x4 35.2-38.9 per stream (39.1 /
+  38.3), code x1 **178.3-178.9** (174.4 / 158.1), code x4 **87.5-88.7** (85.7 / 84.3; 327-331 aggregate); adaptive on -- prose x1
+  **89.9-92.4** (75.9-83.0 / 72.5-73.0), prose x4 42.8-50.2 (43.5-51.5 / 44.3-45.6), code x1 **179.3** (177 / 152.2), code x4 84.0-85.3
+  (86.6 / 81). Divergence 23 / 24 / 23 (|dlogprob| 0.084 / 0.031 / 0.048), GSM8K 98 / 100. B adds +4-11 % single stream on top of C;
+  four streams unchanged (its fusions fall back to stock above 8 rows). Running total vs v0.4.0: single-stream prose **+24-27 %**
+  (73 -> 90-92), code **+18 %** (152 -> 179); the Sparks' 80.7 / 118 are now beaten by 1.1x / 1.5x single stream.
