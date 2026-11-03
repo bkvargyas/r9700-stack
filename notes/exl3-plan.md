@@ -536,3 +536,17 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   LESSON: an earlier "HEAD + C" server run was really the union of every package's uncommitted edits (the agents' private trees were
   copies of the shared working tree), and it showed a four-stream regression (prose x4 26-29, code x4 63) that the clean tree does
   not have -- so one of A / B / D's in-progress changes is slower at 24 rows; each package is integrated on a clean tree from now on.
+
+### Phase 4 results, package B (decode glue; card 6, graph replay, us a call, warm weights; 2026-11-03; notes/exl3-glue.md)
+- **FFN front in one launch** (`r9k_dsv4_sk`: ffn_norm + router gate GEMV + sqrt-softplus top-k with bias / bias_vl / padding /
+  renormalize / routed scaling + the shared expert's gate_up GEMV + silu-and-mul with clamp; 5 launches -> 1): 39.7 -> 21.0 us at
+  1 row, 38.6 -> 22.2 at 2, 39.3 -> 25.2 at 4, 35.8 -> 27.1 at 6, 40.2 -> 32.3 at 8; stock above 8 rows (the first version lost
+  217-560 us a layer at 24 rows -- the union tree's four-stream regression -- hence R9K_DSV41_ROUTE_MAX_M 8).
+- **DSpark markov head** (one launch a draft step + one final; greedy): five steps 720 -> 245 us at 1 request, 747 -> 313 at 4
+  (an fp8 head copy, R9K_DSV41_MARKOV_FP8=1, is 158 / 394: off by default). Token-identical drafts.
+- **Attention input on the 8 compressor / indexer layers** (attn_norm + compressor kv_score + indexer weights_proj): 29.1 -> 13.4 us
+  at 1 row, 28.3 -> 18.9 at 4, stock from 8. **wq_b + indexer wq_b stacked** on D's GEMV (untimed until D lands). A norm + cast +
+  rotation pre-pass (`dsv4_glue.prepass`) for D's rotated input.
+- Projected a single-stream step: ~214 fewer launches of 1,754 and 1.0-1.3 ms of GPU time (FFN front 0.4-0.7, markov 0.45,
+  attention input 0.1). 116 checks pass: norms within 1 bf16 ulp of stock's rms_norm, top-k bit-exact, graphs = eager.
+  Committed as 828115a on v041 (B's clean-tree versions of build.sh and deepseek_v41_rdna4.py, without D's hunks).
