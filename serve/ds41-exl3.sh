@@ -9,10 +9,33 @@
 # Defaults (notes/exl3-serving.md): HIP graphs, DSpark drafter k=5 with adaptive verification, MAXLEN 32768, NSEQ 4,
 # NBT 2048, KVMEM 1.7 GiB (= 329,008 KV tokens), PYTORCH_ALLOC_CONF=expandable_segments:True, capture sizes 1,2,4 + 6 x 1..4.
 # Long context: MAXLEN=131072 KVMEM=0.8 (313,831 KV tokens, needles retrieved at 126.7k; notes/exl3-serving.md section 3).
-# Eight streams (NSEQ=8) is NOT available on this release: the 48-token step goes through exllamav3's fused MoE tier, which
-# faults in the engine warm-up (HSA memory aperture violation; notes/exl3-plan.md Phase 4 A). Package A's 48-token r9k tier
-# launched it but broke the DSpark drafter in the server (acceptance 1.01 tokens a step) and lost speed at small widths, so
-# it is held back for v0.4.2 (notes/exl3-plan.md). NSEQ <= 4 (24-token steps) is the supported range.
+# DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5); DSPARK=0 for a plain run.
+# NSEQ above 4 is NOT supported on this release: a 48-token step goes through exllamav3's fused MoE tier, which faults in
+# the engine warm-up (HSA memory aperture violation; notes/exl3-plan.md Phase 4 A). The 48-token r9k tier that launches it
+# broke the DSpark drafter in the server (1.01 accepted tokens a step) and is held back for v0.4.2.
+# WARM=1 waits for the server and sends two short decodes and one prefill so the Triton JITs (~7-13 s) and the
+# drafter's first-step warm-up land before the first user request. (serve.sh starts the container detached and returns,
+# so the warm-up runs after it; the launcher used to exec serve.sh, which made WARM a no-op.)
+# DRYRUN=1 prints the docker command without launching. Every knob is overridable from the caller's environment.
+# (serve.sh's MTP / DRAFT paths cannot express method "dspark" without a draft model path: it rides in EXTRA instead)
+ROOT=$(cd "$(dirname "$(realpath "$0")")/.." && pwd)
+mkdir -p "$HOME/exl3-tune"
+# DSPARK_K = num_speculative_tokens (default 5; the verify step is DSPARK_K + 1 tokens a stream; 3/4/6 measured slower);
+# ADAPTIVE = DSpark's enable_adaptive_verification (default true: +22-28 % prose at 4 streams; false buys back ~6 %
+# single-stream prose); SPEC_EXTRA='"k":v,...' appends speculative-config fields (no spaces).
+SPEC=; [ "${DSPARK:-1}" = 1 ] && SPEC="--speculative-config {\"method\":\"dspark\",\"num_speculative_tokens\":${DSPARK_K:-5},\"enable_adaptive_verification\":${ADAPTIVE:-true}${SPEC_EXTRA:+,$SPEC_EXTRA}}"
+# CGSIZES (serve.sh): HIP-graph capture sizes. With the drafter every decode step is a multiple of DSPARK_K + 1 tokens,
+# so the default is 1,2,4 + (DSPARK_K + 1) x 1..NSEQ (k=5, NSEQ 4: 1,2,4,6,12,18,24) instead of vLLM's
+# 1,2,4,6,8,12,16,24,32,40,48; CGSIZES= (empty) restores vLLM's list (notes/exl3-serving.md: same speed, -0.4 GiB
+# of hipMemGetInfo accounting, ~35 MiB of real VRAM).
+if [ "${DSPARK:-1}" = 1 ] && [ -z "${CGSIZES+x}" ]; then
+  q=$(( ${DSPARK_K:-5} + 1 )); CGSIZES=1,2,4; for i in $(seq 1 ${NSEQ-4}); do CGSIZES=$CGSIZES,$(( q * i )); done
+  CGSIZES=$(echo $CGSIZES | tr , '\n' | sort -nu | paste -sd,); export CGSIZES
+fi
+# ALLOC_CONF: PYTORCH_ALLOC_CONF for the workers. Default expandable_segments:True: -470 MiB of VRAM a card (no
+# fragmentation of the load-time temporaries), same speed. ALLOC_CONF= (empty) drops it.
+ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}
+[ -n "${ALLOC_CONF}" ] && DOCKER_ARGS="${DOCKER_ARGS-} -e PYTORCH_ALLOC_CONF=$ALLOC_CONF"
 # MEMPROBE=1: memory audit hooks (bench/ds41/memprobe_ext.py as a stock --worker-extension-cls, dev endpoint
 # POST /collective_rpc); client bench/ds41/memprobe.py. Diagnostic only.
 MP=; if [ "${MEMPROBE:-0}" = 1 ]; then
