@@ -487,3 +487,22 @@ needs the 208 / 240 V feed) and a fused per-layer decode kernel (research). Item
 across ranks instead of replicated) is the route past the Sparks' 524k validated context and is scheduled after v0.4.1.
 Rules unchanged: stock vLLM / ROCm / exllamav3, unmodified checkpoints, plugin only; every package bit-exact or within bf16
 rounding; the Qwen and GLM gates on the same tree before the tag.
+
+### Phase 4, the ledger's verdict (2026-11-03 12:30 UTC; notes/exl3-ledger.md, package Z)
+The default single-stream step is **25.4 ms** (74 tok/s at 1.89 accepted tokens) and **GPU-bound**: the kernels sum to 23.5 ms,
+launch + CPU gaps are <= 1.9 ms, so the "~810 launches at a 4 us floor" picture was wrong (it counted kernels a token; a step is
+1,754-1,866 launches, glue 1.2-1.4 ms of GPU time). Where the 23.5 ms goes: **collectives 9.6 ms (41 %)** -- of which **4.1 ms is one
+kernel, the flat eight-rank all-gather `r9k_ag_oneshot_nrank_kernel<8>`** (the target logits gather at <= 4 verify rows lands on it
+because the message fits R9K_AG_MAX_KB 128 and leaves RCCL, which does the 6-row gather in 0.20 ms; Engram's two gathers 0.65-1.07
+ms each), 81 all-reduces at 71-81 us (40-60 KB) + 106 us (90-160 KB); bf16 GEMMs 4.3 ms (wo_a 1.1, shared experts 1.2, router 0.5,
+heads 1.6 incl. the drafter's markov head 0.54-0.67 = five sequential [129280 x 256] f16 GEMVs + argmax); expert tier 2.6 ms;
+EXL3 GEMVs 2.0 ms at 288-292 GB/s; glue 1.6 ms; decode attention 0.9; hc seams 0.75; drafter 2.6-3.2 ms in all. At four streams
+(40.0 ms): collectives 13.3, expert tier 7.1, **EXL3 GEMVs 5.0 because every EXL3 linear dequantizes its whole matrix above 16 rows**
+(7.6 ms at a true 24-row verify), bf16 5.5. Adaptive verification costs 8-12 % single-stream only because of the slow gather
+(74 vs 81 tok/s), and wins at four streams (202 vs 155). NSEQ 8 (T = 48) does not launch on v0.4.0 (HSA memory aperture
+violation in the sparse-MLA warm-up; v0.4.0's r9k tier also caps at 42 tokens).
+**Re-prioritised:** C first fixes the all-gather (route <= 128 KB gathers back to RCCL as the stop-gap, then a proper one-kernel
+all-gather; ~3.5-4 ms a step = ~15 %), then the one-kernel all-reduce; D's multi-row GEMV must cover M <= 48 so the dequant path
+never runs in decode (~5 ms at four streams), then wo_a; A fixes the NSEQ 8 launch fault before its T = 48 tier work; B's pool is
+the 1.6 ms of glue plus the drafter's head path (markov head, lm_head gather), not launch gaps. New floor estimate after A-D:
+single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~290-310 aggregate).
