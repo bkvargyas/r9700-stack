@@ -580,3 +580,23 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   different rejection-sampler path. A's launcher export of R9K_EXL3_MOE_R9K_M was the union tree's four-stream regression. Being
   reproduced on the clean C+B+A tree (clean-CBA.sh: `-e FOO_DUMMY=1` and `-e R9K_A4_DUMMY=48`).
 - Committed as 3f2167a on v041 (A's files + the build.sh export; the trace / lane-cap hunks were in b9c07e8).
+
+### Phase 4 results, package D (EXL3 decode GEMV M = 1..48, wo_a on EXL3; card 7 at -500 MHz, graph replay, cold ring; 2026-11-03)
+- **`kernels/r9k_exl3_gemv.hip`** (P1's trellis device functions, MIT): one launch takes up to 16 (matrix, rows, columns) groups, grid =
+  128-column tiles x input chunks; each block rotates its input chunk into LDS (x * suh, Hadamard; a pre-rotated f16 input is only
+  copied, for B's pre-pass), streams the trellis to f32 partials, and the last block of a tile sums them in a fixed order, applies the
+  output Hadamard + svh and stores bf16 / f16 / f32 at the group's column offset. M = 1..8: the fdot row tile; M = 9..48: WMMA
+  16x16x16 f16 (gfx12 layout) with a per-wave LDS transpose, one decode feeding three 16-row tiles, 2 x 128 columns a block.
+  Deterministic, graph replay = eager bitwise. Bit-exact decode vs reconstruct; rms rel 0.6-2.1e-6 vs fp32 on the same rotated
+  input at every M; 2.1-2.6e-4 with the in-kernel rotation (exllamav3's own path: 3.0-3.8e-4).
+- **us a call, exllamav3 path (with its casts; the dequant path above 16 rows) -> ours:** fused_wqa_wkv 26.3 -> 18.9 at M=1 (304 GB/s),
+  35.3 -> 23.8 at 6, **119.5 -> 44.3 at 24**, 121 -> 66 at 48; wq_b / indexer wq_b 19.9 -> 11.4 / 22.9 -> 14.7 / 51.9 -> 26.2 /
+  58.1 -> 36.9; wo_b the same; drafter K6 similar; engram wkv (25 tiles, odd) 31.8 -> 24.0 at M <= 16, dequant kept above;
+  mtp main_proj (59 MB) 115.8 -> 108.7 at 1, exllamav3 kept at 3-8, 660 -> 289 at 24. **wo_a bf16 einsum -> EXL3: 18.0 -> 12.1 at 1,
+  17.7 -> 14.9 at 6, but 18.1 -> 27.8 at 24 and 18.4 -> 37.3 at 48** (-230 MiB a rank; R9K_DSV41_WOA=bf16 restores v0.4.0).
+  Synthetic layer (wqa_wkv + wq_b + wo_a + wo_b): 86 -> 54 us at M=1, 104 -> 66 at 6, **243 -> 122 at 24**, 254 -> 178 at 48;
+  launches 13-24 -> 4. Projection a step: -1.5 ms at M=1, -1.7 at 6, **-5.8 at 24**, -3.7 at 48; ~390 fewer launches at M=6.
+  The 450 GB/s target at M <= 8 is not met (285-340; a ~9 us fixed latency chain a launch: prefetching the first tiles before the
+  rotation is the next step). Open: NB2=4 crashes on main_proj (default 2).
+- Committed as the package D commit on v041 (D's files; build.sh now carries A, B, C and D's exports; C's combine hook wired in the
+  EXL3 model classes in the same commit).
