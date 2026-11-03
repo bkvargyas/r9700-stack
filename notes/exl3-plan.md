@@ -526,8 +526,13 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   first phase; no residual add before the all-reduce on this pin): T = 1 **18.5 us vs 40.9** for add + stage kernels; no gain at
   60 KiB, hence the 48 KiB cap (fused for T <= 4). One launch a layer saved. Hook r9700_vllm/moe/exl3_combine.py, installed from
   the EXL3 model classes (integration step), R9K_EXL3_MOE_AR=0 to disable.
-- **Real server, HEAD + C only** (VM100 ~/r9700-exl3-C, defaults, 13:09 UTC; `~/ds41/exl3/C4/integ-C.log`): spectune prose x1
-  **80.8 / 88.7 tok/s** (v0.4.0: 72.5-73.0), code x1 **187.8 / 188.8** (152.2), prose x4 44.1 / **51.5** per stream (118 / **190**
-  aggregate; 166-167), code x4 68.5 / 69.3 (255-256 aggregate; **296-298 before**, acceptance length 3.2-3.3 vs 4.1: adaptive
-  verification trims the four-stream code verify harder once the steps are faster -- re-measured with ADAPTIVE=false below).
-  divergence 23 / 24 / 24, GSM8K 98 / 100. Committed as b9c07e8 on v041.
+- **Real server, v0.4.0 + C on a clean tree** (git archive of v041 a970cd5 -> VM100 ~/r9700-exl3-C2, combine hook wired; 14:37-14:55
+  UTC, `~/ds41/exl3/C4/clean-C2.log`; v0.4.0 in parentheses): adaptive off -- prose x1 **80.1-80.3** (74.6), prose x4 39.0-39.3 per
+  stream (38.3), code x1 **173.5-175.3** (158.1), code x4 85.5-85.9 (84.3); adaptive on -- prose x1 **75.9-83.0** (72.5-73.0), prose x4
+  **43.5-51.5** (44.3-45.6; 159-188 aggregate), code x1 **176.6-177.7** (152.2), code x4 **86.6** (81; 316-320 aggregate). Divergence
+  22 / 24 / 24. Single stream +8-16 %, four streams +0-13 %, no regression: the all-gather fix is worth less on the server than the
+  per-call arithmetic said (the logits gather only hits the slow kernel at <= 4 verify rows, i.e. with adaptive trimming) and the
+  one-kernel all-reduce saves ~20-30 us x 81 calls. Committed as b9c07e8 + a970cd5 (build.sh) on v041.
+  LESSON: an earlier "HEAD + C" server run was really the union of every package's uncommitted edits (the agents' private trees were
+  copies of the shared working tree), and it showed a four-stream regression (prose x4 26-29, code x4 63) that the clean tree does
+  not have -- so one of A / B / D's in-progress changes is slower at 24 rows; each package is integrated on a clean tree from now on.
