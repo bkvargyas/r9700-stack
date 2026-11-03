@@ -222,6 +222,40 @@ def _install_mhc() -> bool:
     return True
 
 
+def _install_route() -> bool:
+    """Package B (Phase 4): ffn_norm + MoE gate GEMV + sqrt-softplus top-k in one launch for <= 32 rows
+    (dsv4_glue.py _RouteHook, kernels/r9k_dsv4_glue.hip r9k_dsv4_route) instead of stock's RMSNorm + hipBLASLt gate +
+    topk_softplus_sqrt. Bound on DeepseekV4DecoderLayer at construction (target and drafter layers).
+    R9K_DSV41_ROUTE=stock keeps stock's."""
+    from r9700_vllm import dsv4_glue as G
+    return G.install_route()
+
+
+def _install_attn_in() -> bool:
+    """Package B (Phase 4): on compressor / indexer layers attn_norm + the compressor's kv_score GEMV + the indexer's
+    weights_proj in one launch for <= 32 rows (dsv4_glue.py _AttnInHook, r9k_dsv4_norm_gemv); the attention's
+    _run_parallel_input_projections takes the results. R9K_DSV41_ATTN_IN=stock keeps stock's."""
+    from r9700_vllm import dsv4_glue as G
+    return G.install_attn_in()
+
+
+def _install_markov() -> bool:
+    """Package B (Phase 4): DSpark's greedy sequential Markov sampling (five dependent [129280 x 256] bias GEMVs + add +
+    argmax + copies) as one launch a draft step (dsv4_glue.py markov_sample_sequential, r9k_dsv4_markov_step); other
+    sampling modes keep stock's loop. R9K_DSV41_MARKOV=stock keeps stock's; R9K_DSV41_MARKOV_FP8=1 reads an fp8 copy of
+    the head (half the bytes; drafts only, the target verifies every token)."""
+    from r9700_vllm import dsv4_glue as G
+    return G.install_markov()
+
+
+def _install_qb_stack() -> bool:
+    """Package B (Phase 4): on indexer layers the attention's wq_b and the indexer's wq_b (same qr input) run as one
+    r9k_exl3_gemv launch (dsv4_glue.py _QbStack; needs package D's GEMV, else stock's two applies).
+    R9K_DSV41_QB_STACK=0 turns it off."""
+    from r9700_vllm import dsv4_glue as G
+    return G.install_qb_stack()
+
+
 def patch() -> bool:
     try:
         from vllm.platforms.rocm import on_rdna4
@@ -260,6 +294,30 @@ def patch() -> bool:
                 done.append("mhc:r9k-seam(M<=32)")
         except Exception as e:  # pragma: no cover
             logger.warning("r9700: dsv41 r9k mhc kernels not installed (%s); stock TileLang", e)
+    if os.environ.get("R9K_DSV41_ROUTE", "r9k") == "r9k":
+        try:
+            if _install_route():
+                done.append("route:r9k-ffn_norm+gate+topk+shared-gate_up(M<=8)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 r9k router not installed (%s); stock gate + top-k", e)
+    if os.environ.get("R9K_DSV41_ATTN_IN", "r9k") == "r9k":
+        try:
+            if _install_attn_in():
+                done.append("attn_norm+kv_score+weights_proj:one-launch(M<=6)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 attention-input fusion not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_MARKOV", "r9k") == "r9k":
+        try:
+            if _install_markov():
+                done.append("dspark-markov:one-launch-a-step" + ("(fp8 head)" if os.environ.get("R9K_DSV41_MARKOV_FP8") == "1" else ""))
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 r9k Markov head not installed (%s)", e)
+    if os.environ.get("R9K_DSV41_QB_STACK", "1") == "1":
+        try:
+            if _install_qb_stack():
+                done.append("wq_b+indexer.wq_b:one-gemv")
+        except Exception as e:  # pragma: no cover
+            logger.warning("r9700: dsv41 wq_b stack not installed (%s)", e)
     if os.environ.get("R9K_DSV41_DEBUG_DECODE", "0") == "1":
         try:
             if _install_debug_decode():
