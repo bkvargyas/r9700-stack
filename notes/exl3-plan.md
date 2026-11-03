@@ -530,4 +530,4 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   **80.8 / 88.7 tok/s** (v0.4.0: 72.5-73.0), code x1 **187.8 / 188.8** (152.2), prose x4 44.1 / **51.5** per stream (118 / **190**
   aggregate; 166-167), code x4 68.5 / 69.3 (255-256 aggregate; **296-298 before**, acceptance length 3.2-3.3 vs 4.1: adaptive
   verification trims the four-stream code verify harder once the steps are faster -- re-measured with ADAPTIVE=false below).
-  divergence 23 / 24 / 24, GSM8K 98 / 100. Committed as 2f0 (see git log) on v041.
+  divergence 23 / 24 / 24, GSM8K 98 / 100. Committed as b9c07e8 on v041.
