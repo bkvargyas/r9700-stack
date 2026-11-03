@@ -412,3 +412,78 @@ release note, CHANGELOG, README section, annotated tag, GitHub Release, deploy t
   RDNA4 (+22-28 % per stream on four-stream prose, -5-6 % single-stream prose, code unchanged, +78 MiB of varlen graphs, capture
   71 s). With H: prose 74.6 / 70.1 (adaptive) tok/s single, 38.3 / 46.8 per stream x 4; code 158-159 / 84; GSM8K-style 121 / 114,
   70 per stream x 4. Final KV budget, the 128k launch and the validation: notes/exl3-serving.md sections 3 and 5 (release note).
+
+## Phase 4 -- 2x the Sparks (the v0.4.1 program; Brian 2026-11-03: "We just need to beat the DGX numbers ... We should beat it by 2x")
+
+Targets (two DGX Sparks on TensorFold, the same pack, times two) against v0.4.0: single-stream prose **161** tok/s (we are at
+70-75), code **236** (158), four-stream aggregate prose **308** (187), code **332** (336, done), prompt processing **4.2k**
+(3.4k; not in items 1-4). Speculation gives ~2.0 accepted tokens a step on prose and ~4.4 on code with the checkpoint's drafter,
+so prose is step latency: 27 ms today for a 6-token verify step plus the draft (74.6 tok/s x 2.06 tokens), 12.5 ms for 2x. At
+four streams the 24-token step is 38 ms (46.8 x 1.78).
+
+Physics of one verify step on one rank (estimates from the layer map; the ledger below replaces them with measurements):
+experts 4.3 local a layer at T=6 (34 distinct of 384 for 36 picks) x 12.2 MiB x 40 = 2.2 GB; attention and dense linears
+(fused_wqa_wkv 5.7 MB, wq_b 3.3, wo_a **8.4 bf16**, wo_b 3.3, indexer, shared experts **8.8 bf16**, router 3.9 bf16, hc 3.9 f32)
+~1.5 GB; the drafter ~0.2 GB: **~4 GB = 6.3 ms at 640 GB/s**, plus 80 all-reduces at an ideal ~12 us = 1 ms. The floor is
+~7.5 ms a step = ~270 tok/s on prose. We spend 27 because the step is ~810 launches (51,932 over 64 steps) at a ~4 us
+graph-node floor each (~3.2 ms of nothing), the collectives are three kernels a call (8 KB 21 us, 32 KB 47, 60 KB 37; x 80 = 1.7-3.8
+ms), the attention GEMVs run at 150-270 GB/s through exllamav3's per-call path with casts around them, the drafter repeats the
+whole structure for three layers, and the expert kernel sits on the -500 MHz clock. At 24 tokens the all-reduce is 240 KB
+(83 us x 80 = 6.6 ms of the 38) and the expert kernel reads ~15 local experts a layer (7.3 GB, 11.5 ms).
+
+**Z -- the step ledger first (owner, eight cards, ~1 h after the v0.4.0 deploy).** On the real server with graphs: (1) per-kernel
+GPU time of one 6-token verify step and of the draft, by category (expert tier, EXL3 GEMVs, hipBLAS bf16, attention decode,
+indexer, collectives by size, hc seams, norms / casts / glue, sampler), from rocprof kernel traces of an eager step and the
+captured graph's node list (hipGraphGetNodes through a worker extension like memprobe_ext.py; one line a node: kernel, grid,
+bytes); (2) the wall-clock split: graph replay time vs the CPU gaps between replays (scheduler, rejection sampler, async
+scheduling) from the torch profiler on the model runner; (3) the same at 24 tokens (four streams) and 48 (eight, NSEQ 8 launch);
+(4) with ADAPTIVE true and false. Output: notes/exl3-ledger.md with a table "us a step by category, T = 6 / 24 / 48" and the
+launch list; every package below quotes its row of that table before and after.
+
+Packages (parallel Opus agents; the owner integrates on the eight cards and re-measures; v0.4.1 ships when the four are in
+and the gate holds):
+- **A -- eight-stream verify steps** (owns `r9700_vllm/moe/exl3_decode.py`, `kernels/r9k_moe_exl3.hip`, `tests/test_exl3_moe_r9k.py`,
+  the NSEQ-8 recipe in `serve/ds41-exl3.sh`; card 5, then the eight cards for the collective part when quiet). The r9k expert
+  tier to T = 48 (R9K_EXL3_MOE_R9K_M 48, scratch ~48 MiB; a 48-token step has ~36 local picks over ~25 distinct experts a rank
+  a layer -- confirm the device-side grouping reads each expert's trellis once per group, not once per pick, and that the
+  per-tile workgroups keep >= 400 GB/s at 20-30 groups), graph sizes 1,2,4 + 6 x 1..8, KV for 8 x 32k (262k; v0.4.0 has
+  329k+). Then the collective at 480 KB (48 x 5120 bf16; today ~130 us on the split path, RCCL ~160): measure the split path's
+  stage breakdown (pair reduce-scatter, host exchange, pair all-gather, the two barriers) and stream the host stage with more
+  workgroups and 16-byte loads; target <= 90 us at 480 KB, <= 50 us at 240 KB (the four-stream message, 83 today). Acceptance:
+  spectune at 8 streams (new column) prose aggregate >= 310 tok/s and code >= 340; sanity at 9 and 16 streams; a 10-minute
+  8-client soak; divergence unchanged.
+- **B -- launch fusion** (owns `r9700_vllm/quant/exl3.py` (apply path), `r9700_vllm/models/deepseek_v41_rdna4.py` (new hooks),
+  new `kernels/r9k_dsv4_glue.hip` + `r9700_vllm/dsv4_glue.py`, tests; card 6; the launch list from Z). From the ledger's per-layer
+  launch list, fold the glue: RMSNorm (attn_norm / ffn_norm / q_norm / kv_norm) + the EXL3 input Hadamard (`had_r_128` with
+  `suh`) + the bf16 -> f16 cast into one pre-pass kernel a GEMV group (3 launches -> 1); the router (gate GEMV [5120 -> 384] f16
+  + bias + sigmoid + group top-k + weight normalization) into one kernel in the style of r9k's Qwen / GLM routing kernels (4-6
+  -> 1); the MoE combine (pick weights x per-slot partials + the shared expert + residual) into the expert kernel's epilogue or
+  the collective's load stage (with C); the attention projections of a layer as one multi-matrix launch where exllamav3's
+  `exl3_mgemm` does not already stack them (fused_wqa_wkv + indexer wq_b share K = 5120 / 1280 -- check). Target: ~810 -> <= 350
+  launches a step, ~2 ms. Everything bit-exact or within bf16 rounding of today's path (divergence.py, GSM8K 200).
+- **C -- collectives** (owns `r9700_vllm/comm/r9k_ar8.py`, `r9700_vllm/comm/r9k_ar.py`, `kernels/r9k_ar.hip`, `tests/test_ar8.py`;
+  all eight cards for short tests, timing when the box is quiet). (1) A single-kernel all-reduce for messages <= 64 KB: the pair
+  stage, the quartet host exchange and the pair all-gather as three phases of one kernel with device-scope acquire / release
+  flags (the mechanism r9k_ar.hip already uses between kernels), one or two workgroups a rank, a spin timeout knob for debugging
+  (every rank launches it in graph order, so all eight are resident). Targets: 8 KB 21 -> <= 10 us, 32 KB 47 -> <= 24, 60 KB
+  37 -> <= 26; ~1.5-2 ms a step over 80 calls. (2) The fused MoE reduction with B: the collective's first phase reads the
+  expert tier's per-slot f32 partials with the pick weights (+ the shared expert's output and the residual) instead of a
+  pre-reduced bf16 buffer -- deterministic (fixed pick order), one fewer write + read of [T, 5120] and 2-3 launches a layer.
+  Bit-exact across ranks, within 1 bf16 ulp of the rank-ordered fp32 reference, graph replay of chained calls, the GLM /
+  Flash-Next / 27B gates untouched (`R9K_AR8_ONESHOT=0` keeps the three-kernel path).
+- **D -- attention GEMV bandwidth** (owns a new `kernels/r9k_exl3_gemv.hip` + `r9700_vllm/quant/exl3_gemv.py`, the M <= 8 path
+  in `r9700_vllm/quant/exl3.py`, the `wo_a` override in `r9700_vllm/models/deepseek_v41_exl3.py`, tests; card 7). Our own
+  multi-row trellis GEMV from P1's expert kernel (the same device functions, MIT with attribution): a list of (matrix, input,
+  output) per launch, Hadamard / suh / svh in-kernel, bf16 in and out (no casts), one workgroup a 128-output tile streaming K,
+  >= 450 GB/s on trellis bytes at M = 1..8 (exllamav3's path: 150-270). Then `wo_a` back to EXL3: the pack's eight 128-aligned
+  slices are exactly the o-groups (= ranks), so rank r serves slice r as a [4096 -> 1024] EXL3 GEMV through an `_o_proj`
+  override of stock's bf16 `_get_cached_wo_a_bf16` path (the loader already routes slices to an EXL3 wo_a with shard_id g):
+  -320 MiB a rank and 8.4 -> 2.6 MB a layer read. Target: the attention + dense GEMV row of the ledger halved (~2 ms a step),
+  bit-exact against `reconstruct` + torch matmul in fp32.
+
+Expected after A-D: the 6-token step 27 -> ~15-17 ms (prose single ~105-120 tok/s, code ~220, four-stream prose ~300, eight-stream
+prose > 310 aggregate). The rest of the way to 161 on prose is item 5 (full SCLK: the expert kernel is ALU-bound at -500 MHz;
+needs the 208 / 240 V feed) and a fused per-layer decode kernel (research). Item 6 (decode context parallel: the KV striped
+across ranks instead of replicated) is the route past the Sparks' 524k validated context and is scheduled after v0.4.1.
+Rules unchanged: stock vLLM / ROCm / exllamav3, unmodified checkpoints, plugin only; every package bit-exact or within bf16
+rounding; the Qwen and GLM gates on the same tree before the tag.
