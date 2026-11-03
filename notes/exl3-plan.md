@@ -526,3 +526,8 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   first phase; no residual add before the all-reduce on this pin): T = 1 **18.5 us vs 40.9** for add + stage kernels; no gain at
   60 KiB, hence the 48 KiB cap (fused for T <= 4). One launch a layer saved. Hook r9700_vllm/moe/exl3_combine.py, installed from
   the EXL3 model classes (integration step), R9K_EXL3_MOE_AR=0 to disable.
+- **Real server, HEAD + C only** (VM100 ~/r9700-exl3-C, defaults, 13:09 UTC; `~/ds41/exl3/C4/integ-C.log`): spectune prose x1
+  **80.8 / 88.7 tok/s** (v0.4.0: 72.5-73.0), code x1 **187.8 / 188.8** (152.2), prose x4 44.1 / **51.5** per stream (118 / **190**
+  aggregate; 166-167), code x4 68.5 / 69.3 (255-256 aggregate; **296-298 before**, acceptance length 3.2-3.3 vs 4.1: adaptive
+  verification trims the four-stream code verify harder once the steps are faster -- re-measured with ADAPTIVE=false below).
+  divergence 23 / 24 / 24, GSM8K 98 / 100. Committed as 2f0 (see git log) on v041.
