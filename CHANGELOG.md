@@ -9,6 +9,24 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
+## [0.4.1] - 2026-11-03
+
+Release notes with the ledger and the validation record: [notes/release-v0.4.1.md](notes/release-v0.4.1.md).
+
+### Changed
+- **DeepSeek-V4.1-Flash: the serving step measured (notes/exl3-ledger.md) and cut down.** The eight-rank all-gather that cost 4.1 ms
+  of a 25.4 ms single-stream step (the flat kernel: every rank storing into seven peers across the root complexes) is replaced by a
+  one-kernel all-gather that never crosses a root complex (16-129 us; `R9K_AG8_OS_KB`, `R9K_AG8_FLAT_KB`); a one-kernel eight-rank
+  all-reduce for messages up to 64 KiB (14.6-34 us vs 21-46; `R9K_AR8_ONESHOT`) with the MoE combine fused into it
+  (`moe/exl3_combine.py`); the decode glue in one launch each (`kernels/r9k_dsv4_glue.hip`: the FFN front 40 -> 21 us a layer, the
+  DSpark markov head 720 -> 245 us, the attention input of the indexer layers 29 -> 13 us); our own EXL3 decode GEMV for 1-48 rows
+  (`kernels/r9k_exl3_gemv.hip`: attention linears 26 -> 19 us at one row, 120 -> 44 at 24 rows where every matrix was dequantized
+  each step) with `wo_a` back on EXL3 (`R9K_DSV41_WOA`); the split-path all-reduce at 240-480 KiB 5-13 % faster. __CL_SPEED__
+- GLM-5.3-Flash TP8 takes the new small collectives (same bits; re-gated).
+
+### Held back
+- A 48-token expert-tier kernel (eight-stream steps) that broke the DSpark drafter in the server; NSEQ above 4 stays unsupported.
+
 ## [0.4.0] - 2026-11-03
 
 Release notes with the validation record: [notes/release-v0.4.0.md](notes/release-v0.4.0.md).
