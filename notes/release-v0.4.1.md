@@ -57,9 +57,27 @@ bandwidth are v0.4.2's.
 
 ## Validation
 
-__REL_VALIDATION__
+**DeepSeek-V4.1-Flash TP8, the launcher defaults on the tagged tree** (MAXLEN 32768, KVMEM 1.7, DSpark k = 5 with adaptive
+verification, NSEQ 4; VM100 `~/ds41/exl3/S/validate-41.log`, 2026-11-03 22:02-22:34 UTC): spectune per-stream decode prose
+**86.8-96.7** single / 48.1-57.2 at four (179-212 aggregate), code **201.7-202.6** / 99.7-99.9 (368-369), GSM8K-style 144.7 /
+71.7-83.8. Prompt processing 3,563 tok/s on one 12k prompt, 3,333 aggregate on four. divergence.py 22 / 24 / 22 (the misses are
+near-ties: |dlogprob| 0.06-0.15 between the two candidates). Needles 3 / 3 at 8k, 16k and 28k. Strict sanity 0 bad of 25 at 5
+streams and 0 of 80 at 8, twice. Soak (8 clients, 200-28k-token prompts, 926 s): 180 requests, 0 errors, median prompt 14.3k
+tokens, 2,901 prompt tok/s, worst card 0.86 GiB free (v0.4.0: 0.69). GSM8K 200: **193 / 200 = 96.5 %** (v0.4.0's runs: 194, 195,
+196; within the noise of 200 problems). 0 server errors.
 
-__GATE41__
+**The other three configurations on the same tree and image** (`~/gate-041.sh` -> `~/gate041.log`, 19:47-21:48 UTC; v0.4.0's gate
+in parentheses):
+
+- **Qwen3.8-27B-NVFP4 TP2:** BetterBench combined **196.4** (195.7), update p99 24.5 ms; strict sanity 0 bad of 2,460; soak 220
+  requests in 945 s, 0 errors, 3,040 prompt tok/s. 0 server errors.
+- **Qwen3.8-Flash-Next TP4:** KV cache 477,417 tokens; BetterBench combined **185.3** (189.7 / v0.3.8 184.6), update p99 15.1 ms;
+  strict sanity 0 bad of 2,460; soak 404 requests in 904 s, 0 errors, 6,516 prompt tok/s. 0 server errors.
+- **GLM-5.3-Flash TP8 (32k production recipe; its 1-row logits gather and its small all-reduces now take the one-kernel
+  collectives):** decode-only **93.2 tok/s** median (v0.4.0's gate 88.1), four streams 172 then **234** tok/s aggregate (139 /
+  177), 12.7k needle correct at 123.5 tok/s at depth (117) and 83 % acceptance; strict sanity (thinking on) 0 bad of 780; soak 170
+  requests in 973 s, 0 errors (159). 0 server errors. KV cache 176,443 tokens (210,051: the one-kernel collectives' pools take
+  ~0.2 GiB a card that vLLM's profile now leaves to the cache).
 
 ## Known limits
 
