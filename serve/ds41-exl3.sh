@@ -9,6 +9,10 @@
 # Defaults (notes/exl3-serving.md): HIP graphs, DSpark drafter k=5 with adaptive verification, MAXLEN 32768, NSEQ 4,
 # NBT 2048, KVMEM 1.7 GiB (= 329,008 KV tokens), PYTORCH_ALLOC_CONF=expandable_segments:True, capture sizes 1,2,4 + 6 x 1..4.
 # Long context: MAXLEN=131072 KVMEM=0.8 (313,831 KV tokens, needles retrieved at 126.7k; notes/exl3-serving.md section 3).
+# Eight streams (an option, not the default): NSEQ=8 -> capture sizes 1,2,4 + 6 x 1..8 (6..48), the r9k expert tier up to
+# 48 tokens a step (the plugin default R9K_EXL3_MOE_R9K_M 48: 8 streams x the 6-token verify; scratch ~48 MiB a rank),
+# the 48-token step's [48, 5120] bf16 all-reduces (480 KB) on ar8's split path; KV for 8 x 32k = 262k tokens fits the
+# default KVMEM 1.7 (329k). Example: NSEQ=8 WARM=1 serve/ds41-exl3.sh
 # DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5); DSPARK=0 for a plain run.
 # WARM=1 waits for the server and sends two short decodes and one prefill so the Triton JITs (~7-13 s) and the
 # drafter's first-step warm-up land before the first user request. (serve.sh starts the container detached and returns,
@@ -33,6 +37,10 @@ fi
 # fragmentation of the load-time temporaries), same speed. ALLOC_CONF= (empty) drops it.
 ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}
 [ -n "${ALLOC_CONF}" ] && DOCKER_ARGS="${DOCKER_ARGS-} -e PYTORCH_ALLOC_CONF=$ALLOC_CONF"
+# R9K_EXL3_MOE_R9K_M (the largest step the r9k expert tier takes; larger steps go to exllamav3's fused tier) is not set
+# here: the plugin's default 48 covers NSEQ <= 8 at k = 5. (Exporting it into the container, even as 48, left the
+# DSpark drafter accepting nothing in 4 of 4 launches on 2026-11-03 -- MAL 1.01 vs 1.8; cause not found; package A
+# report, 2026-11-03.) Do not export it until that is understood.
 # MEMPROBE=1: memory audit hooks (bench/ds41/memprobe_ext.py as a stock --worker-extension-cls, dev endpoint
 # POST /collective_rpc); client bench/ds41/memprobe.py. Diagnostic only.
 MP=; if [ "${MEMPROBE:-0}" = 1 ]; then

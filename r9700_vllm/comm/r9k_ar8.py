@@ -149,6 +149,7 @@ class R9kAllReduce8:
             self._flanes = L.r9k_ar8_fused_lanes()
             self._fk = int(os.environ.get("R9K_AR8_FUSED_K", "8"))
             self._fw = int(os.environ.get("R9K_AR8_FUSED_W", "512"))
+            self._fw1 = int(os.environ.get("R9K_AR8_FUSED_W1", "1024"))
         ok = not self.pair.disabled and (self.cross is None or not self.cross.disabled)
         oks = [None] * self.world_size
         dist.all_gather_object(oks, (ok, self.pair.max_bytes, self.host_max, self.split_min, self.host_min), group=group)
@@ -264,6 +265,12 @@ class R9kAllReduce8:
         cq = -(-(-(-(nbytes // 16) // 2)) // 4)               # words of a part: ceil(ceil(n16 / 2) / 4)
         nl = max(1, min(self._flanes, -(-cq // (self._fk * self._fw))))
         k = max(1, min(64, -(-cq // (nl * self._fw))))
+        if nl == 1:
+            # one lane (parts <= _fk x _fw words, messages <= ~512 KiB): sub-steps of R9K_AR8_FUSED_W1 (1024) words.
+            # The stage trace (tests/test_ar8.py PARTS=5, 2026-11-03) shows each role's host-memory reads as the cost
+            # and every extra sub-step or lane as one more round of host flag polls: 240 KiB 81.7 us at 4 x 480 words
+            # -> 77.1 at 2 x 960; 480 KiB 140.0 at 8 x 480 -> 122.5 at 4 x 960; more lanes lose at both sizes.
+            k = max(1, min(64, -(-cq // self._fw1)))
         return nl, k
 
     def _split(self, flat: torch.Tensor, trace: torch.Tensor | None = None) -> torch.Tensor:

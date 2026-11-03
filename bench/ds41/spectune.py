@@ -8,7 +8,7 @@ first-token-to-end summed over its requests (a spec step emits several tokens a 
 wall time (includes prefills). Acceptance comes from the server's /metrics spec-decode
 counters, differenced around each run: mean acceptance length = 1 + accepted / drafts, per-position acceptance rates.
 Prints one line per (workload, streams, rep) and a JSON line (prefix RESULT) for the notes table."""
-import json, re, sys, threading, time, urllib.request
+import os, json, re, sys, threading, time, urllib.request
 
 B = sys.argv[1].rstrip("/"); MODEL = sys.argv[2]; LABEL = sys.argv[3]; REPS = int(sys.argv[4]) if len(sys.argv) > 4 else 2
 U = B + "/v1/chat/completions"
@@ -102,7 +102,7 @@ def run(wl, ns):
 
 
 for wl in (sys.argv[5].split(",") if len(sys.argv) > 5 else ("prose", "code", "gsm")):
-    for ns in (1, 4):
+    for ns in [int(v) for v in os.environ.get("STREAMS", "1,4").split(",")]:   # STREAMS=1,4,8 for the NSEQ-8 recipe
         for rep in range(REPS):
             r = run(wl, ns); r["rep"] = rep
             print(f"{LABEL:14s} {wl:5s} x{ns}  {r['tokens']:5d} tok  agg {r['agg_tok_s']:6.1f} tok/s  per-stream {r['per_stream_tok_s']:6.1f}"
