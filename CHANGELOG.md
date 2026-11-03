@@ -9,6 +9,43 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
+## [0.4.0] - 2026-11-03
+
+Release notes with the validation record: [notes/release-v0.4.0.md](notes/release-v0.4.0.md).
+
+### Added
+- **DeepSeek-V4.1-Flash on eight cards from a published EXL3 pack** (`quant/exl3.py`, `quant/exl3_moe.py`,
+  `models/deepseek_v41_exl3.py`, `models/deepseek_v41_rdna4.py`, `kernels/r9k_moe_exl3.hip`, `kernels/r9k_mhc.hip`,
+  `attn/dsv4_decode.py`, `serve/ds41-exl3.sh`; notes/exl3-plan.md). The 552B MoE (384 routed experts, Engram n-gram tables,
+  DSpark drafter, 1M-position RoPE) at 2.9 bits a weight (LibertAIDAI/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw, 196 GiB) resident
+  on 8x 32 GB: tensor parallel 8 with expert parallel (48 whole experts a rank a layer), Engram tables in pinned host memory
+  through vLLM's offload, the EXL3 trellis format served through exllamav3's gfx1201 extension (MIT, built into the image)
+  for the linears and our own batched expert decode kernel (bit-exact trellis decode, two launches a layer), the 6-bit head
+  and the shared experts dequantized to bf16 at load. Single stream **70-75 tok/s** (prose) / **158 tok/s** (code) with the
+  checkpoint's DSpark drafter (k = 5, adaptive verification), **187 / 336 tok/s** aggregate at four streams, prefill 3.4k
+  tok/s, GSM8K 97-98 %, needles retrieved to 28k (128k under validation). Two DGX Sparks on TensorFold serve the same pack at
+  80.7 / 118 single-stream and 154 / 166 at four streams.
+- **RDNA4 fixes to stock's DeepSeek-V4/V4.1 path** (`models/deepseek_v41_rdna4.py`): the sparse-attention indexer's
+  architecture gate opened (its op is Triton/torch); the prefill indexer logits through aiter's Triton kernel instead of a
+  [heads, M, N] torch fallback that ran out of memory; decode attention through stock's split-K kernels with RDNA4 tuning
+  (180 -> 19 us a layer) -- which also fixes a stock bug: on every ROCm GPU outside gfx942/gfx950 the decode fallback reports
+  fused-inverse-RoPE'd rows it never un-rotates, so decode attention output reached the output projection still rotated
+  (coherent text that doubles words and loops); hyper-connection seams in one HIP launch (25.7 -> 8.0 us at one token).
+- **Eight-rank all-reduce for 32 KB - 2 MB messages** (`comm/r9k_ar8.py`, `comm/r9k_ar.py`, `kernels/r9k_ar.hip`): pair
+  reduce-scatter, quartet exchange through pinned host pools, pair all-gather, fused into one kernel: 8-token steps 123 -> 47 us,
+  240 KB 83 us (RCCL 124), 1 MB 230 (240); 2 MB and up stay on RCCL. Multi-token verify steps and 4+ streams no longer fall
+  onto RCCL at 1-2 ms a call.
+- `bench/ds41/`: divergence.py (greedy decode vs fresh prefill of every prefix -- the test that found the stock decode bug),
+  needle.py, tprobe.py (usage-based, spec-decode safe), longdecode.py, ask*.py, gsm8k_ds41.py, spectune.py.
+
+### Changed
+- `docker/Dockerfile` builds exllamav3 v1.6.6's extension for gfx1201 into the image.
+- EXL3 linears: static per-layer buffers, one multi-matrix GEMV for stacked projections, 8-row GEMV chunks to 16 rows then
+  dequantize + 1024-row hipBLAS chunks (the autotuned trellis GEMM is slower than both on gfx1201).
+
+### Fixed
+- An oversize call on the flat N-rank collective without its 4-rank object fell over; it now goes to RCCL.
+
 ## [0.3.8] - 2026-10-31
 
 Release notes with the validation record: [notes/release-v0.3.8.md](notes/release-v0.3.8.md).
