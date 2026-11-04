@@ -699,3 +699,30 @@ experts / a routing-histogram placement; vLLM's EPLB as the reference) is the bi
   prose x1 102.8, x4 191.5; strict sanity 9 streams 0 bad of 45, 16 streams 0 of 80; 10-min 8-client 200-28k soak 128 ok,
   0 errors, 3,149 prompt tok/s; self-test after the soak unchanged. The 8-stream spectune raised an IndexError (more streams
   than prompts; fixed in spectune.py, to be measured at the gate). Launcher: NSEQ 8 supported, default stays 4.
+
+### v0.4.2 results, package G (split-path eight-rank all-reduce 160 KiB - 2 MiB; 2026-11-04; `~/ds41/exl3/G/{mb,final1.log,accG.out}`)
+- **Targets not met** (240 KiB 76.7 -> 67.1 us, target 50; 480 KiB 122.5 -> 116.3, target 90; 1 MiB 230 -> 202, target 150).
+- **What limits the fabric** (microbenchmarks): each switch's uplink moves ~14 GB/s each way (reads and writes do not share it);
+  one GPU reading host memory reaches 13.4 GB/s with >= 2 blocks of 1024 threads (the old trace's 3 GB/s was not a per-lane
+  request limit); pair traffic stays inside the switch (~12 GB/s each way); ~2.7 us a flag hop GPU -> GPU through host memory.
+  Copy engines lose (15-20 us latency, ~12 GB/s); push vs local root complex no difference; wider loads no gain; each rank
+  owning 1/8 is already the current kernel. The old path is not link-bound (floor ~27 us at 240 KiB): the time is two dependent
+  host round trips plus per-sub-step release / poll latency.
+- **Built: the "hub" path** (`r9k_ar8_hub` kernel + one CPU reducer thread a rank in kernels/r9k_ar.hip; `_setup_hub` / `_hub` in
+  r9700_vllm/comm/r9k_ar8.py; routing (128 KiB, 1536 KiB], agreed over the group). Pair reduce-scatter and pair all-gather stay
+  peer-to-peer; the quartet sum runs on CPU threads over the pinned host pools, chunk by chunk behind per-chunk flags; 1 S up +
+  1 S down a switch with one host hop instead of two; same two roundings in the same order, **bit-identical to the fused split
+  kernel** (18 bf16 sizes + fp16 / fp32, 2 ulp of the reference, identical across ranks; mixed bursts and graph replay pass).
+  Quiet box, graphs, best of 3, us: 160 KiB 59.9 -> 51.5, 240 KiB 76.7 -> 67.1, 480 KiB 122.5 -> 116.3, 1000 KiB 230 -> 202,
+  1280 KiB 283 -> 255; GLM 16 / 48 / 160 x 6144: 65.8 / 146 / 399 -> 57.1 / 131 / 408. With the CPU sum skipped 240 KiB is still
+  61.8, so the CPU costs ~6 us; the rest is the pair-sum role publishing chunks at ~6 GB/s a rank plus quartet skew.
+- **Server:** DeepSeek NSEQ 4 on v042 + G: prose x1 104.8-105.1 (v042 104-105), x4 231.8 (234); code x1 218.6 at MAL 4.46
+  (208-210 at 4.24: the acceptance length, not the collective), x4 422-428 (411); self-test ok; divergence 20 / 24 / 24; GSM8K 97
+  (1 truncated). GLM TP8 A/B same tree, hub on / off: decode mean 107.7 / 107.1, 8 streams 174 / 172, **16 streams 220 / 228**,
+  prefill 3,149 / 3,148, strict sanity 0 / 0 bad of 150, GSM8K 250 97.6 / 98.0 %.
+- **Risk:** each rank runs a CPU reducer thread that spins while calls arrive (then polls every 20 us); with TPR=4 (32 spinning
+  threads on 32 vCPUs) calls took ~4 ms. **Shipped opt-in (`R9K_AR8_HUB=1`), default off:** v0.4.1's fused split path is
+  untouched and remains the default; tests/test_ar8.py exercises the hub by default (HUB=0 tests the fused path). A segv in
+  the test (pools freed while reducer threads still read them) is fixed by holding the pools at module scope and joining the
+  threads at exit. Next (v0.4.3): batch the pair-sum publishes or publish from a separate flag block; no design measured here
+  reaches 50 us at 240 KiB on this fabric.

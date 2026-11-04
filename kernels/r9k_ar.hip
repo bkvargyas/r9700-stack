@@ -1516,3 +1516,352 @@ extern "C" int r9k_ag8_os(const long* pair_s, const long* pair_f, const long* ho
                      (const uint4*)in, (uint4*)out, n16, cols16, nd, aos_ticks(tmo_ms), (u32*)diag);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
+
+// ---------------------------------------------------------------- hub all-reduce for 8 ranks on 4 switches (package G)
+// (2026-11-04; comm/r9k_ar8.py R9kAllReduce8._hub.) The split path's three stages with the middle one -- each quartet's
+// all-reduce of its half through pinned host memory -- done by CPU threads instead of a GPU two-shot:
+//   R0 push     our input's partner half -> the partner's pair pool RS area (P2P, switch-local), chunk by chunk; flag PP[k]
+//   R1 pair-sum wait PP[k]; pair sum of chunk k of our half (even + odd in rank order, fp32, one rounding) -> our host pool
+//               `in` area; flag IN[k] (our host pool)
+//   CPU         the thread that owns chunk k (quartet member k % 4, r9k_hub_start) waits for IN[k] of the four members,
+//               sums their pair sums in quartet order (fp32, one rounding) into its host pool `res` area; flag RES[k]
+//   R2 fetch    wait RES[k] (owner's host pool); chunk k -> out and the partner's pair pool AG area (P2P); flag PA[k]
+//   R3 receive  wait PA[k] from the partner; its half's chunk k from our AG area -> out
+// Why (package G microbenchmarks, VM100 ~/ds41/exl3/G/mb, 2026-11-04): a switch's uplink moves ~14 GB/s each way
+// (kernel loads, kernel stores and the copy engines alike; reads and writes do not share it), the pair traffic stays inside
+// the switch (two partners exchange at ~12 GB/s each), a host-memory flag hop costs ~2.7 us GPU -> GPU and ~1.8 us GPU ->
+// CPU. The GPU two-shot moves 1 S up + 1.5 S down a switch (S = message) behind two dependent host hops; here it is 1 S up
+// + 1 S down behind one, and the sum runs on the CPU (~10 GB/s of input a thread). Same two roundings in the same order as
+// r9k_ar8_fused (pair sum, then the four pair sums in quartet order), so the bits equal it.
+// Flags are the call number c (seq[block] + 1; all HB_LM * 4 counters advance every call), compared by signed difference.
+// The CPU side is flag-driven per chunk (it needs no call count): chunk k is ready when IN[k] of all four members equals
+// one value v newer than the last it reduced; the chunk's length, dtype and start ride in LEN / START[v & 1][k], written before IN[k].
+// Reuse (parity c & 1 for every area): an area of parity c & 1 is rewritten in call c + 2 only after a wait that its
+// readers satisfy once their call c ended -- RS: the partner pushes call c + 2 after its call c + 1 R1 waited for our call
+// c + 1 push, i.e. after our call c (whose R2 depended on all our R1 reads through the CPU); AG: likewise through the
+// partner's call c + 1 push; IN: the owner read it before RES[k], which we waited for in call c; RES: the owner writes call
+// v only when all four members published IN for v, i.e. ended their previous calls.
+// Pools (words of 16 bytes, hslot = the largest half): pair (VRAM IPC) [2][RS hslot | AG hslot], flags PP[HB_MAXCH] |
+// PA[HB_MAXCH]; host (pinned, the quartet's four, also mapped for the CPU) [2][IN hslot] | [2][RES hslot], flags
+// IN[HB_MAXCH] | RES[HB_MAXCH] | LEN[2][HB_MAXCH] | START[2][HB_MAXCH].
+#define HB_LM 16             // lanes a role (grid 4 * HB_LM)
+#define HB_MAXCH 256         // chunks of a half
+#define HB_TS 34             // trace words a block: start, then (after wait, after work) for its first 16 chunks
+
+struct HbGeo { long h0, hn; };
+__device__ __forceinline__ HbGeo hb_geo(long n16, int half) {
+  HbGeo g; const long c2 = (n16 + 1) / 2;
+  g.h0 = min((long)half * c2, n16); g.hn = min(g.h0 + c2, n16) - g.h0; return g;
+}
+
+template <typename T>
+__global__ void __launch_bounds__(1024) r9k_ar8_hub_kernel(
+    R9kArPeers PP_, R9kArPeers HQ, int rank, int* __restrict__ seq, long hslot, const uint4* __restrict__ in,
+    uint4* __restrict__ out, long n16, long cw, int nl, u32 lenw, unsigned long long* tr) {
+  const int role = blockIdx.x / HB_LM, L = blockIdx.x % HB_LM, tid = threadIdx.x, nt = blockDim.x;
+  __shared__ int s_seq;
+  if (tid == 0) s_seq = seq[blockIdx.x]++;
+  __syncthreads();
+  if (L >= nl) return;
+#define HB_T(i) do { if (tr && tid == 0 && (i) < HB_TS) tr[(long)blockIdx.x * HB_TS + (i)] = wall_clock64(); } while (0)
+  HB_T(0);
+  const u32 c = (u32)s_seq + 1u;
+  const int pos = rank & 1, p = rank >> 1, mate = pos ^ 1, par = s_seq & 1;
+  const HbGeo gm = hb_geo(n16, pos), go = hb_geo(n16, mate);
+  const long rs = (long)par * 2 * hslot, ag = rs + hslot;                 // pair pool areas
+  const long hin = (long)par * hslot, hres = 2 * hslot + (long)par * hslot;   // host pool areas
+  constexpr int NE = 16 / sizeof(T);
+  int jj = 0;
+  if (role == 0 || role == 3) {           // partner's half
+    const long nch = (go.hn + cw - 1) / cw;
+    for (long k = L; k < nch; k += nl, jj++) {
+      const long a = k * cw, e = min(a + cw, go.hn);
+      if (role == 0) {
+        HB_T(1 + 2 * jj);
+        arf_copy(PP_.scratch[mate] + rs + 0, in + go.h0, a, e, tid, nt);
+        __syncthreads();
+        HB_T(2 + 2 * jj);
+        if (tid == 0) arf_put(&PP_.flags[mate][k], c);
+      } else {
+        if (tid == 0) arf_wait(&PP_.flags[pos][HB_MAXCH + k], c);
+        __syncthreads();
+        HB_T(1 + 2 * jj);
+        arf_copy(out + go.h0, PP_.scratch[pos] + ag, a, e, tid, nt);
+        if (tr) { __syncthreads(); HB_T(2 + 2 * jj); }
+      }
+    }
+  } else {                                // our half
+    const long nch = (gm.hn + cw - 1) / cw;
+    for (long k = L; k < nch; k += nl, jj++) {
+      const long a = k * cw, e = min(a + cw, gm.hn);
+      if (role == 1) {
+        if (tid == 0) arf_wait(&PP_.flags[pos][k], c);
+        __syncthreads();
+        HB_T(1 + 2 * jj);
+        const uint4* rcv = PP_.scratch[pos] + rs;
+        const uint4* own = in + gm.h0;
+        uint4* dst = HQ.scratch[p] + hin;
+        for (long i = a + tid; i < e; i += nt) {
+          const uint4 x0 = own[i], x1 = rcv[i];
+          float acc[NE];
+#pragma unroll
+          for (int x = 0; x < NE; x++) acc[x] = 0.f;
+          arf_add<T>(acc, pos == 0 ? x0 : x1);
+          arf_add<T>(acc, pos == 0 ? x1 : x0);
+          dst[i] = arf_round<T>(acc);
+        }
+        if (tid == 0) {
+          HQ.flags[p][2 * HB_MAXCH + par * HB_MAXCH + k] = (u32)(e - a) | lenw;     // for the CPU: length | dtype,
+          HQ.flags[p][4 * HB_MAXCH + par * HB_MAXCH + k] = (u32)a;                  // start (words in the half)
+        }
+        __syncthreads();
+        HB_T(2 + 2 * jj);
+        if (tid == 0) arf_put(&HQ.flags[p][k], c);
+      } else {                            // role 2: fetch the result chunk from its owner's host pool
+        const int o = (int)(k & 3);
+        if (tid == 0) arf_wait(&HQ.flags[o][HB_MAXCH + k], c);
+        __syncthreads();
+        HB_T(1 + 2 * jj);
+        const uint4* src = HQ.scratch[o] + hres;
+        uint4* dpa = PP_.scratch[mate] + ag;
+        long i = a + tid;
+        for (; i + 3 * nt < e; i += 4 * nt) {
+          const uint4 v0 = src[i], v1 = src[i + nt], v2 = src[i + 2 * nt], v3 = src[i + 3 * nt];
+          out[gm.h0 + i] = v0; out[gm.h0 + i + nt] = v1; out[gm.h0 + i + 2 * nt] = v2; out[gm.h0 + i + 3 * nt] = v3;
+          dpa[i] = v0; dpa[i + nt] = v1; dpa[i + 2 * nt] = v2; dpa[i + 3 * nt] = v3;
+        }
+        for (; i < e; i += nt) { const uint4 v0 = src[i]; out[gm.h0 + i] = v0; dpa[i] = v0; }
+        __syncthreads();
+        HB_T(2 + 2 * jj);
+        if (tid == 0) arf_put(&PP_.flags[mate][HB_MAXCH + k], c);
+      }
+    }
+  }
+#undef HB_T
+}
+
+extern "C" int r9k_ar8_hub_lanes() { return HB_LM; }
+extern "C" int r9k_ar8_hub_max_chunks() { return HB_MAXCH; }
+extern "C" int r9k_ar8_hub_trace_words() { return 4 * HB_LM * HB_TS; }
+
+// pair_scratch / pair_flags: the pair's 2 VRAM pools (>= 4 * hslot words; flags >= 2 * HB_MAXCH u32), host_scratch /
+// host_flags: the quartet's 4 host pools (device pointers; >= 4 * hslot words; flags >= 6 * HB_MAXCH u32); seq: 4 *
+// HB_LM ints; cw: words a chunk (the half must fit HB_MAXCH chunks); nl <= HB_LM lanes a role; nthreads 0 = by chunk.
+// trace: r9k_ar8_hub_trace_words() uint64 (wall clock ticks) or 0.
+extern "C" int r9k_ar8_hub(const long* pair_scratch, const long* pair_flags, const long* host_scratch,
+                           const long* host_flags, int rank, long seq, long hslot, long in, long out, long numel,
+                           int dtype, long stream, long cw, int nl, int nthreads, long trace) {
+  const int esz = dtype == 2 ? 4 : 2;
+  const long nbytes = numel * esz;
+  if (nbytes % 16) return -1;
+  if (rank < 0 || rank >= 8) return -5;
+  const long n16 = nbytes / 16;
+  if (n16 <= 0) return 0;
+  const long c2 = (n16 + 1) / 2;
+  if (c2 > hslot) return -7;
+  if (cw <= 0 || (c2 + cw - 1) / cw > HB_MAXCH) return -8;
+  if (nl <= 0 || nl > HB_LM) return -2;
+  if (nthreads <= 0) {
+    long t = ((cw + AR_WAVE - 1) / AR_WAVE) * AR_WAVE;
+    nthreads = (int)(t < 64 ? 64 : (t > 1024 ? 1024 : t));
+  }
+  if (nthreads > 1024 || nthreads % AR_WAVE) return -3;
+  if (dtype < 0 || dtype > 2) return -4;
+  R9kArPeers P{}, H{};
+  for (int q = 0; q < 2; q++) { P.scratch[q] = (uint4*)pair_scratch[q]; P.flags[q] = (u32*)pair_flags[q]; }
+  for (int q = 0; q < 4; q++) { H.scratch[q] = (uint4*)host_scratch[q]; H.flags[q] = (u32*)host_flags[q]; }
+  const u32 lenw = (u32)dtype << 28;
+  hipStream_t st = (hipStream_t)stream;
+#define HB_LAUNCH(T)                                                                                       \
+  hipLaunchKernelGGL((r9k_ar8_hub_kernel<T>), dim3(4 * HB_LM), dim3(nthreads), 0, st, P, H, rank, (int*)seq,    \
+                     hslot, (const uint4*)in, (uint4*)out, n16, cw, nl, lenw, (unsigned long long*)trace)
+  switch (dtype) {
+    case 0: HB_LAUNCH(__hip_bfloat16); break;
+    case 1: HB_LAUNCH(_Float16); break;
+    default: HB_LAUNCH(float); break;
+  }
+#undef HB_LAUNCH
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// ---- the CPU side of the hub all-reduce: threads that reduce the quartet's chunks (host code, r9k_hub_start)
+// Thread j of tpr in quartet member p owns the chunks k with k % 4 == p and (k / 4) % tpr == j. It scans them: chunk k
+// is ready when the four members' IN[k] hold one value v newer than its last; then RES[k] area (parity v & 1) = the four
+// pair sums in quartet order (fp32, one rounding, round-to-nearest-even like the GPU's conversions) and RES[k] = v. With
+// nothing ready for spin_us it sleeps sleep_us between scans (the first call after an idle spell waits up to that long).
+#include <atomic>
+#include <cstring>
+#include <thread>
+#include <vector>
+#include <immintrin.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/prctl.h>
+#include <time.h>
+
+namespace {
+struct HubCfg {
+  char* scratch[4];
+  u32* flags[4];
+  int p, j, tpr;
+  long hslot, spin_us, sleep_us;
+  int cpu, nop;
+  std::atomic<int> stop{0}, exited{0};
+  std::atomic<unsigned long> chunks{0}, red_ns{0}, red_bytes{0};
+};
+
+inline u32 hb_ld(const u32* f) { return __atomic_load_n(f, __ATOMIC_ACQUIRE); }
+inline void hb_st(u32* f, u32 v) { __atomic_store_n(f, v, __ATOMIC_RELEASE); }
+inline float bf2f(uint16_t h) { u32 u = (u32)h << 16; float f; memcpy(&f, &u, 4); return f; }
+inline uint16_t f2bf(float f) {
+  u32 u; memcpy(&u, &f, 4);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40);      // NaN stays a (quiet) NaN
+  return (uint16_t)((u + 0x7fffu + ((u >> 16) & 1u)) >> 16);
+}
+
+__attribute__((target("avx2,f16c"))) void hb_red_bf16_avx2(const uint16_t* const* src, uint16_t* dst, long ne) {
+  long i = 0;
+  const __m256i bias = _mm256_set1_epi32(0x7fff), one = _mm256_set1_epi32(1), qn = _mm256_set1_epi32(0x400000);
+  for (; i + 8 <= ne; i += 8) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int q = 0; q < 4; q++)
+      acc = _mm256_add_ps(acc, _mm256_castsi256_ps(_mm256_slli_epi32(
+                                   _mm256_cvtepu16_epi32(_mm_loadu_si128((const __m128i*)(src[q] + i))), 16)));
+    const __m256i u = _mm256_castps_si256(acc);
+    __m256i r = _mm256_add_epi32(u, _mm256_add_epi32(_mm256_and_si256(_mm256_srli_epi32(u, 16), one), bias));
+    const __m256 nan = _mm256_cmp_ps(acc, acc, _CMP_UNORD_Q);
+    r = _mm256_blendv_epi8(r, _mm256_or_si256(u, qn), _mm256_castps_si256(nan));
+    r = _mm256_srli_epi32(r, 16);
+    _mm_storeu_si128((__m128i*)(dst + i), _mm_packus_epi32(_mm256_castsi256_si128(r), _mm256_extracti128_si256(r, 1)));
+  }
+  for (; i < ne; i++) {
+    float acc = 0.f;
+    for (int q = 0; q < 4; q++) acc += bf2f(src[q][i]);
+    dst[i] = f2bf(acc);
+  }
+}
+__attribute__((target("avx2,f16c"))) void hb_red_f16_avx2(const uint16_t* const* src, uint16_t* dst, long ne) {
+  long i = 0;
+  for (; i + 8 <= ne; i += 8) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int q = 0; q < 4; q++) acc = _mm256_add_ps(acc, _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(src[q] + i))));
+    _mm_storeu_si128((__m128i*)(dst + i), _mm256_cvtps_ph(acc, _MM_FROUND_TO_NEAREST_INT));
+  }
+  for (; i < ne; i++) {
+    __m128 acc = _mm_setzero_ps();
+    for (int q = 0; q < 4; q++) acc = _mm_add_ss(acc, _mm_cvtph_ps(_mm_cvtsi32_si128(src[q][i])));
+    dst[i] = (uint16_t)_mm_cvtsi128_si32(_mm_cvtps_ph(acc, _MM_FROUND_TO_NEAREST_INT));
+  }
+}
+__attribute__((target("avx2"))) void hb_red_f32_avx2(const float* const* src, float* dst, long ne) {
+  long i = 0;
+  for (; i + 8 <= ne; i += 8) {
+    __m256 acc = _mm256_setzero_ps();
+    for (int q = 0; q < 4; q++) acc = _mm256_add_ps(acc, _mm256_loadu_ps(src[q] + i));
+    _mm256_storeu_ps(dst + i, acc);
+  }
+  for (; i < ne; i++) { float acc = 0.f; for (int q = 0; q < 4; q++) acc += src[q][i]; dst[i] = acc; }
+}
+
+void hb_reduce(HubCfg* C, int par, long k, u32 lenw, long a) {
+  const long w = lenw & 0x0fffffffu;
+  const int dt = (int)(lenw >> 28);
+  const char* src[4];
+  for (int q = 0; q < 4; q++) src[q] = C->scratch[q] + ((long)par * C->hslot + a) * 16;
+  char* dst = C->scratch[C->p] + (2 * C->hslot + (long)par * C->hslot + a) * 16;
+  if (dt == 0) hb_red_bf16_avx2((const uint16_t* const*)src, (uint16_t*)dst, w * 8);
+  else if (dt == 1) hb_red_f16_avx2((const uint16_t* const*)src, (uint16_t*)dst, w * 8);
+  else hb_red_f32_avx2((const float* const*)src, (float*)dst, w * 4);
+}
+
+void hb_worker(HubCfg* C) {
+  if (C->cpu >= 0) {
+    cpu_set_t s; CPU_ZERO(&s); CPU_SET(C->cpu, &s);
+    pthread_setaffinity_np(pthread_self(), sizeof(s), &s);
+  }
+  prctl(PR_SET_TIMERSLACK, 1000UL);              // 1 us: the idle sleeps stay short
+  std::vector<long> ks;
+  for (long k = 0; k < HB_MAXCH; k++) if ((k & 3) == C->p && (k / 4) % C->tpr == C->j) ks.push_back(k);
+  std::vector<u32> done(ks.size(), 0);
+  auto now_us = [] { timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec * 1000000L + t.tv_nsec / 1000; };
+  long busy = now_us(), scans = 0;
+  while (!C->stop.load(std::memory_order_relaxed)) {
+    bool any = false;
+    for (size_t x = 0; x < ks.size(); x++) {
+      const long k = ks[x];
+      const u32 v = hb_ld(&C->flags[0][k]);
+      if (v == done[x]) continue;
+      bool ok = true;
+      for (int q = 1; q < 4 && ok; q++) ok = hb_ld(&C->flags[q][k]) == v;
+      if (!ok) continue;
+      // all four members published chunk k of call v (none can be past v: their call v waits for this chunk)
+      const int par = (int)((v - 1u) & 1u);      // the GPU's parity is seq & 1 with v = seq + 1
+      const u32 lenw = __atomic_load_n(&C->flags[0][2 * HB_MAXCH + par * HB_MAXCH + k], __ATOMIC_RELAXED);
+      const long a = (long)__atomic_load_n(&C->flags[0][4 * HB_MAXCH + par * HB_MAXCH + k], __ATOMIC_RELAXED);
+      timespec r0, r1;
+      clock_gettime(CLOCK_MONOTONIC, &r0);
+      if (!C->nop) hb_reduce(C, par, k, lenw, a);
+      hb_st(&C->flags[C->p][HB_MAXCH + k], v);
+      clock_gettime(CLOCK_MONOTONIC, &r1);
+      C->red_ns.fetch_add((r1.tv_sec - r0.tv_sec) * 1000000000L + (r1.tv_nsec - r0.tv_nsec), std::memory_order_relaxed);
+      C->red_bytes.fetch_add((lenw & 0x0fffffffu) * 16 * 4, std::memory_order_relaxed);
+      done[x] = v;
+      any = true;
+      C->chunks.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (any) { busy = now_us(); scans = 0; continue; }
+    _mm_pause();
+    if (++scans < 256) continue;
+    scans = 0;
+    if (C->sleep_us > 0 && now_us() - busy > C->spin_us) {
+      timespec d{0, C->sleep_us * 1000};
+      nanosleep(&d, nullptr);
+    }
+  }
+  C->exited.store(1);
+}
+}  // namespace
+
+// host_scratch / host_flags: HOST virtual addresses of the quartet's 4 host pools (the same memory the kernel addresses
+// through device pointers), by quartet member; p = our member index; tpr threads (j = 0 .. tpr-1), cpu0 >= 0 pins thread j
+// to cpu0 + j. Returns an opaque handle (0 on failure).
+extern "C" long r9k_hub_start(const long* host_scratch, const long* host_flags, int p, int tpr, long hslot,
+                              long spin_us, long sleep_us, int cpu0) {
+  if (p < 0 || p > 3 || tpr <= 0 || tpr > 16 || hslot <= 0) return 0;
+  if (!__builtin_cpu_supports("avx2") || !__builtin_cpu_supports("f16c")) return 0;
+  auto* list = new std::vector<HubCfg*>();
+  for (int j = 0; j < tpr; j++) {
+    HubCfg* C = new HubCfg();
+    for (int q = 0; q < 4; q++) { C->scratch[q] = (char*)host_scratch[q]; C->flags[q] = (u32*)host_flags[q]; }
+    C->p = p; C->j = j; C->tpr = tpr; C->hslot = hslot; C->spin_us = spin_us; C->sleep_us = sleep_us;
+    C->cpu = cpu0 >= 0 ? cpu0 + j : -1;
+    const char* e = getenv("R9K_AR8_HUB_NOP");                 // timing experiments only: publish without reducing
+    C->nop = e && e[0] == '1';
+    list->push_back(C);
+    std::thread(hb_worker, C).detach();
+  }
+  return (long)list;
+}
+
+// chunks reduced so far by this handle's threads (tests); r9k_hub_stats: {chunks, ns spent reducing, input bytes}
+extern "C" long r9k_hub_chunks(long h) {
+  if (!h) return -1;
+  long n = 0;
+  for (HubCfg* C : *(std::vector<HubCfg*>*)h) n += (long)C->chunks.load();
+  return n;
+}
+extern "C" void r9k_hub_stats(long h, long* out) {
+  out[0] = out[1] = out[2] = 0;
+  if (!h) return;
+  for (HubCfg* C : *(std::vector<HubCfg*>*)h) {
+    out[0] += (long)C->chunks.load(); out[1] += (long)C->red_ns.load(); out[2] += (long)C->red_bytes.load();
+  }
+}
+
+// stop the threads and wait (up to ~1 s) until they left their loops: call before the pools are unmapped (atexit)
+extern "C" void r9k_hub_stop(long h) {
+  if (!h) return;
+  for (HubCfg* C : *(std::vector<HubCfg*>*)h) C->stop.store(1);
+  for (HubCfg* C : *(std::vector<HubCfg*>*)h)
+    for (int i = 0; i < 100000 && !C->exited.load(); i++) { timespec d{0, 10000}; nanosleep(&d, nullptr); }
+}

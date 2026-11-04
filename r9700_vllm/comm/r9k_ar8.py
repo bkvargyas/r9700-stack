@@ -28,6 +28,8 @@ roundings in the same order as the small path, so the bits are those of the thre
 cross step moves 1 S up / 1.5 S down, the all-reduce floor for four switches with GPU-side sums. Measured (HIP graphs,
 us, tests/test_ar8.py): 240 KB 83 (RCCL 124), 640 KB 157 (182), 1 MB 230 (240), 2 MB 418 (402). Larger messages
 (prefill) and anything this object declines run on RCCL (should() is False); R9K_AR8=0 keeps the flat kernel.
+Since 2026-11-04 (package G) messages in (128 KiB, 1.5 MiB] take the HUB path instead: the same three stages with the middle
+one summed by CPU threads on the host pools (R9kAllReduce8._hub; 240 KiB 67 us, 480 116, 1 MB 202; same bits).
 """
 from __future__ import annotations
 
@@ -41,6 +43,7 @@ from vllm.logger import init_logger
 from .r9k_ar import R9kAllReduceN, _DTYPE
 
 logger = init_logger("vllm." + __name__)
+_HUB_KEEP: list = []                   # host / pair pools of the hub path, alive until exit (see _setup_hub)
 
 
 class R9kAllReduce8:
@@ -168,6 +171,7 @@ class R9kAllReduce8:
         # graph capture (a buffer grown later would leave captured graphs pointing at freed memory)
         self._zbuf = torch.zeros(self.pair_cap, dtype=torch.uint8, device=self.pair.device) if self.pair_pos else None
         self._setup_oneshot(group, pairs, crosses, device)     # package C: the one-kernel small path (collective)
+        self._setup_hub(group, pairs, crosses, device)         # package G: CPU-reduced split path (collective)
         self.disabled = False
         logger.info("r9700: ar8 hierarchical all-reduce installed (rank %d: pair %d, %s, %s intermediate; %s)",
                     self.rank, self.rank // 2, "cross-chain sender" if self.pair_pos == 0 else "idle in the small path",
@@ -296,6 +300,129 @@ class R9kAllReduce8:
         part = buf[off:off + ln]
         self.cross_host.all_reduce(part, out=part)           # our quartet's total of that half, in place
         return self.pair.all_gather_chunks(buf)
+
+    # ------------------------------------------------------------------ hub path (package G, 2026-11-04)
+    # R9K_AR8_HUB (0 = off; opt-in in v0.4.2: the 240 KiB / 480 KiB / 1 MiB targets were not met, the server-level gain is
+    # within noise at four streams and GLM at 16 streams measured 3.5 % lower, and each rank runs a spinning CPU reducer
+    # thread; notes/exl3-plan.md v0.4.2 G). R9K_AR8_HUB=1: messages in (R9K_AR8_HUB_MIN_KB, R9K_AR8_HUB_MAX_KB] run the split path with its middle stage -- each
+    # quartet's all-reduce of its half -- done by CPU threads on the pinned host pools (kernels/r9k_ar.hip r9k_ar8_hub +
+    # r9k_hub_start): pair reduce-scatter (P2P) -> our pair sums to our host pool -> the owning CPU thread sums the
+    # quartet's four in quartet order -> every member fetches the result -> pair all-gather (P2P). Same roundings in the
+    # same order as the fused split kernel, so the same bits. Why (kernels/r9k_ar.hip, before r9k_ar8_hub_kernel): a switch's
+    # uplink moves ~14 GB/s each way; the GPU two-shot moves 1 S up + 1.5 S down a switch behind two dependent host hops,
+    # this path 1 S + 1 S behind one. Each rank runs R9K_AR8_HUB_TPR (1) reducer threads, spinning while calls come (until
+    # R9K_AR8_HUB_SPIN_MS (50) after the last chunk), then polling every R9K_AR8_HUB_SLEEP_US (20). R9K_AR8_HUB_CW: words
+    # (16 B) a chunk (0 = 512), R9K_AR8_HUB_NL: lanes a role (0 = by size), R9K_AR8_HUB_CPU0 (-1): pin thread j of TP
+    # rank r to cpu0 + r * tpr + j.
+    # Measured 2026-11-04 (tests/test_ar8.py HUBBENCH, quiet box, HIP graphs, us; fused split kernel / RCCL in parentheses):
+    # 100 KiB 40.1 (45.8 / 101.6), 160 51.5 (59.9 / 110.5), 240 67.1 (76.7 / 124.1), 320 80.1 (91.0 / 135.3), 480 116.3
+    # (122.5 / 161.0), 640 142.4 (156.5 / 181.9), 1000 202.3 (230.0 / 240.0), 1280 254.8 (283.1 / 281.3), 2000 398.0 (419.8
+    # / 401.7), 1920 (GLM 160 x 6144) 408.4 (399.3 / 383.1) -> default window (128 KiB, 1536 KiB]; above it the split path
+    # as before. R9K_AR8_HUB_NOP=1 (timing only, WRONG RESULTS) publishes without reducing: 240 KiB 61.8, so the CPU sum is
+    # ~6 us of the 67; the rest is the GPU side (R1's per-chunk host writes + release, the quartet's skew).
+    hub_on = False
+    hub_min = 0
+    hub_max = 0
+
+    def _setup_hub(self, group, pairs, crosses, device) -> None:
+        from .r9k_ar import R9kPool
+        L = self.pair.L
+        want = os.environ.get("R9K_AR8_HUB", "0") == "1" and hasattr(L, "r9k_ar8_hub") and hasattr(L, "r9k_hub_start")
+        cfg = (want, float(os.environ.get("R9K_AR8_HUB_MIN_KB", "128")), float(os.environ.get("R9K_AR8_HUB_MAX_KB", "1536")),
+               int(os.environ.get("R9K_AR8_HUB_CW", "0")), int(os.environ.get("R9K_AR8_HUB_NL", "0")),
+               int(os.environ.get("R9K_AR8_HUB_TPR", "1")))
+        cfgs = [None] * self.world_size
+        dist.all_gather_object(cfgs, cfg, group=group)       # every rank must take the same branch (pools are collective)
+        if not all(c[0] for c in cfgs) or len(set(cfgs)) != 1:
+            if any(c[0] for c in cfgs):
+                logger.warning("r9700: ar8 hub path off: ranks disagree on R9K_AR8_HUB* (%s)", cfgs)
+            return
+        _, mn_kb, mx_kb, self._hub_cw, self._hub_nl, tpr = cfg
+        mx = min(int(mx_kb * 1024), self.pair_cap)
+        P = ctypes.POINTER(ctypes.c_long)
+        L.r9k_ar8_hub.restype = ctypes.c_int
+        L.r9k_ar8_hub.argtypes = [P] * 4 + [ctypes.c_int] + [ctypes.c_long] * 5 + [ctypes.c_int, ctypes.c_long,
+                                                                                   ctypes.c_long, ctypes.c_int,
+                                                                                   ctypes.c_int, ctypes.c_long]
+        L.r9k_hub_start.restype = ctypes.c_long
+        L.r9k_hub_start.argtypes = [P, P, ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long, ctypes.c_long,
+                                    ctypes.c_int]
+        for f in ("r9k_ar8_hub_lanes", "r9k_ar8_hub_max_chunks", "r9k_ar8_hub_trace_words"):
+            getattr(L, f).restype = ctypes.c_int
+        L.r9k_hub_chunks.restype = ctypes.c_long
+        L.r9k_hub_chunks.argtypes = [ctypes.c_long]
+        if hasattr(L, "r9k_hub_stats"):
+            L.r9k_hub_stats.restype = None
+            L.r9k_hub_stats.argtypes = [ctypes.c_long, ctypes.POINTER(ctypes.c_long)]
+        self._hub_lm, self._hub_maxch = L.r9k_ar8_hub_lanes(), L.r9k_ar8_hub_max_chunks()
+        hslot = (mx // 16 + 1) // 2 + 1                      # words of the largest half
+        self._hub_hslot = hslot
+        pp = R9kPool(pairs[self.rank // 2], device, 4 * hslot * 16, 2 * self._hub_maxch * 4)
+        hp = R9kPool(crosses[self.pair_pos], device, 4 * hslot * 16, 6 * self._hub_maxch * 4, host=True)
+        ok = pp.ok and hp.ok and len(hp._host_maps) == 4
+        h = 0
+        if ok:
+            import mmap
+            page = mmap.PAGESIZE
+            sb = (4 * hslot * 16 + page - 1) // page * page
+            # host virtual addresses of the four quartet pools (r9k_ar.py _share_host maps them in member order)
+            hs = [ctypes.addressof(ctypes.c_char.from_buffer(m)) for m in hp._host_maps]
+            self._hub_hs = (ctypes.c_long * 4)(*hs)
+            self._hub_hf = (ctypes.c_long * 4)(*[a + sb for a in hs])
+            cpu0 = int(os.environ.get("R9K_AR8_HUB_CPU0", "-1"))
+            h = L.r9k_hub_start(self._hub_hs, self._hub_hf, self.rank // 2, tpr, hslot,
+                                int(float(os.environ.get("R9K_AR8_HUB_SPIN_MS", "50")) * 1000),
+                                int(os.environ.get("R9K_AR8_HUB_SLEEP_US", "20")),
+                                cpu0 + self.rank * tpr if cpu0 >= 0 else -1)
+            ok = h != 0
+        oks = [None] * self.world_size
+        dist.all_gather_object(oks, ok, group=group)
+        if not all(oks):
+            if h:
+                L.r9k_hub_stop.restype = None
+                L.r9k_hub_stop.argtypes = [ctypes.c_long]
+                L.r9k_hub_stop(h)
+            logger.warning("r9700: ar8 hub path: setup failed on some rank; GPU split path kept")
+            return
+        self._hub_pools = (pp, hp)
+        self._hub_h = h
+        # the reducer threads read the host pools until stopped: the pools must outlive them. Keep the pools referenced
+        # from the module (an R9kAllReduce8 dropped earlier would unmap them under running threads) and stop the threads
+        # at interpreter exit, before module teardown.
+        _HUB_KEEP.append((pp, hp, self._hub_hs, self._hub_hf))
+        import atexit
+        L.r9k_hub_stop.restype = None
+        L.r9k_hub_stop.argtypes = [ctypes.c_long]
+        atexit.register(L.r9k_hub_stop, h)
+        self._hub_seq = torch.zeros(4 * self._hub_lm, dtype=torch.int32, device=self.pair.device)
+        self.hub_min, self.hub_max = int(mn_kb * 1024), mx
+        self.hub_on = True
+        logger.info("r9700: ar8 hub all-reduce (CPU-reduced quartet stage) for %d-%d KiB (rank %d: %d reducer thread%s)",
+                    self.hub_min >> 10, self.hub_max >> 10, self.rank, tpr, "" if tpr == 1 else "s")
+
+    def hub_geometry(self, nbytes: int) -> tuple[int, int]:
+        """(words a chunk, lanes a role) for a message: chunks of R9K_AR8_HUB_CW words (default 512, more when the
+        half would exceed the chunk table), lanes R9K_AR8_HUB_NL (by size: one per ~4 chunks, 1..8)."""
+        # the sweep of 2026-11-04 (tests/test_ar8.py HUBSWEEP, quiet box): 512-word chunks win at 240 / 480 / 1000 KiB,
+        # 4 lanes to 480 KiB (67 / 112 us; 8 lanes 74 / 115), 8 lanes at 1000 KiB (205; 4 lanes 219)
+        c2 = -(-(nbytes // 16) // 2)
+        cw = self._hub_cw or 512
+        cw = max(cw, -(-c2 // self._hub_maxch))
+        nl = self._hub_nl or (4 if c2 <= 16384 else 8)
+        return cw, min(nl, self._hub_lm)
+
+    def _hub(self, flat: torch.Tensor, trace: torch.Tensor | None = None) -> torch.Tensor:
+        out = torch.empty_like(flat)
+        n = flat.numel() * flat.element_size()
+        cw, nl = self.hub_geometry(n)
+        pp, hp = self._hub_pools
+        rc = self.pair.L.r9k_ar8_hub(pp.sp, pp.fp, hp.sp, hp.fp, self.rank, self._hub_seq.data_ptr(), self._hub_hslot,
+                                     flat.data_ptr(), out.data_ptr(), flat.numel(), _DTYPE[flat.dtype],
+                                     torch.cuda.current_stream().cuda_stream, cw, nl, 0,
+                                     0 if trace is None else trace.data_ptr())
+        if rc:
+            raise RuntimeError(f"r9k_ar8_hub failed ({rc}) n={n}")
+        return out
 
     # ------------------------------------------------------------------ one-kernel small path (package C, 2026-11-03)
     # R9K_AR8_ONESHOT (1; 0 = the stage kernels as before): every message up to R9K_AR8_OS_KB (64) is ONE kernel
@@ -521,6 +648,8 @@ class R9kAllReduce8:
         flat = x.view(-1)
         if self.os_on and x.numel() * x.element_size() <= self.os_max:      # group-wide state only (_setup_oneshot)
             return self._oneshot(flat).view_as(x)
+        if self.hub_on and self.hub_min < x.numel() * x.element_size() <= self.hub_max:   # group-wide state only
+            return self._hub(flat).view_as(x)
         if self.split and x.numel() * x.element_size() > self.split_min:     # group-wide state only (see above)
             return self._split(flat).view_as(x)
         work = flat.float() if self.fp32 and x.dtype != torch.float32 else flat

@@ -6,12 +6,14 @@ reference (the pair sum is rounded once before the cross step); graph replay of 
 sizes that switch between the host stage's one-shot and two-shot; a burst of back-to-back calls of varying size
 (ranks drift out of step); every message size routes the same way on every rank (should()/_takes agree);
 DeepSeek-V4.1 sizes [tokens, 5120] up to 400 tokens (4 MB: above R9K_AR8_HOST_MAX_KB, so RCCL)."""
+import ctypes
 import os
 import sys
 import time
 
 import torch
 import torch.distributed as dist
+os.environ.setdefault("R9K_AR8_HUB", os.environ.get("HUB", "1"))   # the test exercises the hub path by default (serving default: off); HUB=0 tests the fused split path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -369,6 +371,176 @@ def oneshot_bench(ar8, flat, rank, world, dev):
         ar8._os_wpb, ar8._os_nb, ar8._os_nt, ar8.os_xp = wpb0, nb0, nt0, xp0
 
 
+def hub_cases(ar8, rank, world, dev, check):
+    """Package G: the hub path (CPU-reduced quartet stage) against the fused GPU split kernel -- bit-identical (same
+    roundings, same order) -- at DeepSeek / GLM sizes and odd sizes, bf16 / fp16 / fp32; a burst of mixed hub / split /
+    one-kernel calls with no host sync; graph replay of chained mixed calls; every size routes identically."""
+    bad = 0
+    sizes = [(t, 5120) for t in (10, 16, 24, 32, 40, 48, 64, 100, 128, 200)] + [(t, 6144) for t in (16, 24, 48, 160)] + \
+        [(1, 12296), (3, 13336), (1, 1000008)]
+    for dt in (torch.bfloat16, torch.float16, torch.float32):
+        for i, (t, w) in enumerate(sizes):
+            n = t * w
+            nb = n * torch.tensor([], dtype=dt).element_size()
+            if not (ar8.hub_on and ar8.hub_min < nb <= ar8.hub_max and ar8._takes(torch.empty(n, dtype=dt, device=dev))):
+                continue
+            x = inp(rank, 1300 + i, n, dt, dev)
+            got = ar8._hub(x)
+            want_bits = ar8._split(x) if ar8.fused else None
+            torch.cuda.synchronize()
+            same = want_bits is None or torch.equal(got.view(torch.int16 if dt != torch.float32 else torch.int32),
+                                                    want_bits.view(torch.int16 if dt != torch.float32 else torch.int32))
+            if not same:
+                bad += 1
+            if dt == torch.bfloat16:
+                check(f"hub {t} x {w} ({nb >> 10} KiB) bits=fused:{same}", got, ref(world, 1300 + i, n, dt, dev), ulps=2)
+            else:
+                g_ = [torch.empty_like(got) for _ in range(world)]
+                dist.all_gather(g_, got)
+                ident = all(torch.equal(g_[0], q) for q in g_)
+                r_ = ref(world, 1300 + i, n, torch.float32, dev)
+                # error against the scale of the pair sums (two roundings, as for bf16 in check())
+                err = ((got.float() - r_).abs() / (world * 12.0)).max().item()
+                ok = ident and same and err < (2 * 2 ** -10 if dt == torch.float16 else 2 * 2 ** -23)
+                bad += not ok
+                if rank == 0:
+                    print(f"hub {dt} {t} x {w}: identical={ident} bits=fused:{same} max err / (8 x 12) {err:.2g}", flush=True)
+    # routing: every rank agrees on every size
+    for nb in (96 << 10, (96 << 10) + 16, 160 << 10, 2 << 20, (2 << 20) + 16):
+        x = torch.empty(nb // 2, dtype=torch.bfloat16, device=dev)
+        r_ = (ar8.should(x), ar8._takes(x), ar8.hub_on and ar8.hub_min < nb <= ar8.hub_max)
+        allr = [None] * world
+        dist.all_gather_object(allr, r_)
+        if len(set(allr)) != 1:
+            bad += 1
+            if rank == 0:
+                print(f"hub routing {nb} B DISAGREES {allr}", flush=True)
+    # burst: mixed paths back to back, no host sync
+    bs = [5120 * t for t in (24, 2, 48, 200, 6, 100, 24, 64, 1, 16, 128, 10, 24)]
+    outs = [ar8.all_reduce(inp(rank, 1400 + i, n, torch.bfloat16, dev)) for i, n in enumerate(bs)]
+    for i, (n, y) in enumerate(zip(bs, outs)):
+        check(f"hub burst {i} n={n}", y, ref(world, 1400 + i, n, torch.bfloat16, dev), ulps=2)
+    # graph replay of chained mixed calls
+    gsz = [5120 * t for t in (24, 48, 4, 100, 24, 200, 16)]
+    xs = [inp(rank, 1500 + r, n, torch.bfloat16, dev) for r, n in enumerate(gsz)]
+    for x in xs:
+        ar8.all_reduce(x)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        ys = [ar8.all_reduce(x) for x in xs]
+        y2 = ar8.all_reduce(ys[1].mul(0.125))
+    for _ in range(7):
+        g.replay()
+    torch.cuda.synchronize()
+    for r, (n, y) in enumerate(zip(gsz, ys)):
+        check(f"hub graph {n // 5120} tok", y, ref(world, 1500 + r, n, torch.bfloat16, dev), ulps=2)
+    check("hub graph chained", y2, ys[1].float().mul(0.125).to(torch.bfloat16).float().mul(world).to(torch.bfloat16), ulps=2)
+    if rank == 0:
+        print(f"hub cases: {'PASS' if bad == 0 else f'{bad} FAILED'} (reducer chunks so far: "
+              f"{ar8.pair.L.r9k_hub_chunks(ar8._hub_h)})", flush=True)
+    return bad
+
+
+def hub_bench(ar8, rank, world, dev):
+    """us per all-reduce (HIP graphs, best of 3, max over ranks): RCCL / fused GPU split / hub, and the hub's stage trace
+    (per role: first wait done, done; us from the kernel's first block, median of 20 calls)."""
+    if rank == 0:
+        print(f"{'tokens':>7} {'width':>6} {'KiB':>6} {'rccl':>8} {'split':>8} {'hub':>8}  (us, HIP graphs, best of 3)", flush=True)
+    for spec in os.environ.get("HUBTOKS", "10x5120,16x5120,24x5120,32x5120,48x5120,64x5120,100x5120,103x5120,128x5120,200x5120").split(","):
+        tok, _, w = spec.partition("x")
+        tok, w = int(tok), int(w or 5120)
+        n = tok * w
+        x = inp(rank, 1600 + tok, n, torch.bfloat16, dev)
+        rows = [graph_time(lambda: dist.all_reduce(x.clone())),
+                graph_time(lambda: ar8._split(x)) if ar8.fused and n * 2 <= ar8.host_max else float("nan"),
+                graph_time(lambda: ar8._hub(x)) if n * 2 <= ar8.hub_max else float("nan")]
+        tt = [None] * world
+        dist.all_gather_object(tt, rows)
+        if rank == 0:
+            m = [max(t[i] for t in tt) for i in range(3)]
+            f = lambda v: f"{v:>8.1f}" if v == v else f"{'-':>8}"
+            print(f"{tok:>7} {w:>6} {n * 2 >> 10:>6} {f(m[0])} {f(m[1])} {f(m[2])}", flush=True)
+    if os.environ.get("HUBSWEEP"):
+        cw0, nl0 = ar8._hub_cw, ar8._hub_nl
+        for tok in [int(t) for t in os.environ.get("HUBSWEEPTOKS", "24,48,100").split(",")]:
+            n = tok * 5120
+            x = inp(rank, 1650 + tok, n, torch.bfloat16, dev)
+            for kv in os.environ["HUBSWEEP"].split(","):
+                ar8._hub_cw, ar8._hub_nl = (int(v) for v in kv.split("x"))
+                cw, nl = ar8.hub_geometry(n * 2)
+                t = graph_time(lambda: ar8._hub(x))
+                tt = [None] * world
+                dist.all_gather_object(tt, t)
+                st = (ctypes.c_long * 3)()
+                ar8.pair.L.r9k_hub_stats(ar8._hub_h, st)
+                stats = [None] * world
+                dist.all_gather_object(stats, list(st))
+                if rank == 0:
+                    ch, ns, by = (sum(v[i] for v in stats) for i in range(3))
+                    print(f"  hub sweep {tok:3d} tok {n * 2 >> 10:5d} KiB  chunk {cw:5d} words  lanes {nl:2d}: {max(tt):7.1f} us"
+                          f"   (CPU so far: {ch} chunks, {ns / max(ch, 1) / 1000:.1f} us a chunk, {by / max(ns, 1):.1f} GB/s)",
+                          flush=True)
+        ar8._hub_cw, ar8._hub_nl = cw0, nl0
+    L = ar8.pair.L
+    khz = L.r9k_wallclock_khz() or 100000
+    tw = L.r9k_ar8_hub_trace_words()
+    LM = ar8._hub_lm
+    names = ("R0 push", "R1 pair-sum", "R2 fetch", "R3 receive")
+    for tok in [int(t) for t in os.environ.get("HUBTRACE", "24,48,100").split(",")]:
+        n = tok * 5120
+        x = inp(rank, 1700 + tok, n, torch.bfloat16, dev)
+        cw, nl = ar8.hub_geometry(n * 2)
+        trs = [torch.zeros(tw, dtype=torch.int64, device=dev) for _ in range(20)]
+        for _ in range(3):
+            ar8._hub(x)
+        torch.cuda.synchronize()
+        dist.barrier()
+        for tr in trs:
+            ar8._hub(x, trace=tr)
+        torch.cuda.synchronize()
+        rows = []
+        for tr in trs:
+            tt = tr.view(4, LM, -1)[:, :nl].cpu().double()
+            t0 = tt[:, :, 0].min()
+            tt = torch.where(tt > 0, (tt - t0) / (khz / 1000.0), torch.zeros_like(tt))
+            rows.append(torch.stack([tt[:, :, 1].max(1).values, tt[:, :, 2].min(1).values, tt[:, :, 2:].amax((1, 2))], 1))
+        med = torch.stack(rows).median(0).values
+        allm = [None] * world
+        dist.all_gather_object(allm, med.tolist())
+        if os.environ.get("HUBCHUNKS"):
+            # per chunk of our half (rank 0 and 1): R1 published (IN), R2 wait done (RES seen), R2 done; per chunk of the
+            # partner's half: R0 pushed, R3 wait done (PA seen); median over the 20 calls, us from the first block
+            per = []
+            for tr in trs:
+                tt = tr.view(4, LM, -1).cpu().double()
+                t0 = tt[:, :nl, 0].min()
+                tt = torch.where(tt > 0, (tt - t0) / (khz / 1000.0), torch.full_like(tt, float("nan")))
+                c2 = -(-(n // 8) // 2)
+                nch = -(-c2 // cw)
+                m = torch.full((nch, 5), float("nan"), dtype=torch.float64)
+                for k in range(min(nch, nl * 16)):
+                    L_, jj = k % nl, k // nl
+                    m[k] = torch.tensor([tt[1, L_, 2 + 2 * jj], tt[2, L_, 1 + 2 * jj], tt[2, L_, 2 + 2 * jj],
+                                         tt[0, L_, 2 + 2 * jj], tt[3, L_, 1 + 2 * jj]])
+                per.append(m)
+            pm = torch.stack(per).median(0).values
+            allc = [None] * world
+            dist.all_gather_object(allc, pm.tolist())
+            if rank == 0:
+                for r_ in (0, 1):
+                    print(f"    rank {r_} per chunk: k  R1-IN  R2-seen  R2-done  R0-pushed  R3-seen", flush=True)
+                    for k, row in enumerate(allc[r_]):
+                        print(f"      {k:3d} " + " ".join(f"{v:7.1f}" for v in row), flush=True)
+        if rank == 0:
+            print(f"  hub trace {tok:3d} tok {n * 2 >> 10:4d} KiB, chunk {cw} words, {nl} lanes a role "
+                  f"(us from the first block: first wait done / first chunk done / all done)", flush=True)
+            for r_ in (0, 1):
+                for i, nm in enumerate(names):
+                    print(f"    rank {r_} {nm:12s} {allm[r_][i][0]:7.1f} {allm[r_][i][1]:7.1f} {allm[r_][i][2]:7.1f}", flush=True)
+            print(f"    kernel span (max over ranks of R3 done): {max(m_[3][2] for m_ in allm):7.1f} us", flush=True)
+
+
 def main():
     dist.init_process_group("nccl")
     rank, world = dist.get_rank(), dist.get_world_size()
@@ -483,12 +655,16 @@ def main():
             bad += oneshot_cases(ar8, rank, world, dev, check)
         if os.environ.get("AG", "1") == "1" and getattr(ar8, "ag_os_on", False):
             bad += ag_cases(ar8, rank, world, dev)
+        if os.environ.get("HUB", "1") == "1" and getattr(ar8, "hub_on", False):
+            bad += hub_cases(ar8, rank, world, dev, check)
     if rank == 0:
         print("RESULT", "PASS" if bad == 0 else f"FAIL ({bad})", flush=True)
     if os.environ.get("OSBENCH", "0") == "1" and getattr(ar8, "os_on", False):
         oneshot_bench(ar8, flat, rank, world, dev)
     if os.environ.get("AGBENCH", "0") == "1" and getattr(ar8, "ag_os_on", False):
         ag_bench(ar8, rank, world, dev)
+    if os.environ.get("HUBBENCH", "0") == "1" and getattr(ar8, "hub_on", False):
+        hub_bench(ar8, rank, world, dev)
     if os.environ.get("BENCH", "1") == "1":
         if rank == 0:
             print(f"{'tokens':>7} {'width':>6} {'KiB':>6} {'rccl':>8} {'flat-1s':>8} {'flat-2s':>8} {'ar8':>8} {'cross':>8}"
