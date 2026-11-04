@@ -35,6 +35,13 @@ fi
 # ALLOC_CONF: PYTORCH_ALLOC_CONF for the workers. Default expandable_segments:True: -470 MiB of VRAM a card (no
 # fragmentation of the load-time temporaries), same speed. ALLOC_CONF= (empty) drops it.
 ALLOC_CONF=${ALLOC_CONF-expandable_segments:True}
+# EP_MAP: expert-parallel placement map (package H3, v0.4.2, notes/exl3-ep-skew.md): which rank holds which of the 384 experts
+# a layer, chosen from recorded prose + code routing so the per-step expert load is more even across the eight ranks (the
+# post-MoE all-reduce waits on the slowest rank: -0.6 ms a step at one stream, -1.0 at four; same experts, same weights, not
+# bit-identical to the linear layout because each rank's bf16 partial sum groups the picks differently). EP_MAP= (empty)
+# restores the linear placement. The map pays only for traffic like the one it was built from; bench/ds41/epskew/ rebuilds it.
+EP_MAP=${EP_MAP-/opt/r9700/bench/ds41/epskew/map-ds41-v041-prose-code.json}
+[ -n "${EP_MAP}" ] && export R9K_EXL3_EP_MAP=$EP_MAP
 [ -n "${ALLOC_CONF}" ] && DOCKER_ARGS="${DOCKER_ARGS-} -e PYTORCH_ALLOC_CONF=$ALLOC_CONF"
 # MEMPROBE=1: memory audit hooks (bench/ds41/memprobe_ext.py as a stock --worker-extension-cls, dev endpoint
 # POST /collective_rpc); client bench/ds41/memprobe.py. Diagnostic only.

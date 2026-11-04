@@ -72,6 +72,9 @@ def register() -> None:
             for arch, qualname in EXL3_ARCHS.items():
                 ModelRegistry.register_model(arch, qualname)
             done.append("quant:exl3" + ("+" + ",".join(EXL3_ARCHS) if EXL3_ARCHS else ""))
+            from .moe import exl3_placement      # R9K_EXL3_EP_MAP: load-time expert placement (off when unset)
+            if exl3_placement.install():
+                done.append("exl3:ep_map")
         except Exception as e:  # pragma: no cover
             log.warning("r9700_vllm: exl3 not registered: %r", e)
     if not _disabled("dsv41"):
