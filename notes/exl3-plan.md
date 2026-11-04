@@ -650,3 +650,27 @@ experts / a routing-histogram placement; vLLM's EPLB as the reference) is the bi
   T=2)", 0 skips. Ledger workload step **18.07 ms** (v0.4.1 19.11) at one stream, **31.25** (32.26) at four. spectune prose x1
   **98.1** tok/s (MAL 1.74), x4 54-59 per stream (188-219 aggregate); code x1 **208** (4.45), x4 106-107 (393-395 aggregate).
   divergence 23 / 24 / 24, GSM8K 98 / 100. Committed on v042.
+
+### v0.4.2 results, package H3 (expert-parallel rank skew; 2026-11-04 02:50-06:34 UTC; notes/exl3-ep-skew.md; commit bc34a56)
+- **What the wait is.** Z2's per-rank traces, matched call by call: the segment before the post-MoE all-reduce skews across the
+  eight ranks exactly as much as the expert tier does (to 0.01-0.02 ms); the slow-tier rank is the late rank in 93-98 % of calls.
+  Tier skew 2.20 / 2.97 / 4.25 / 6.22 ms a step at 2-4 / 6 / 9-16 / 24 rows. The slow rank moves from call to call (every rank
+  is hottest in 9-16 % of calls; the drafter's rank 6 is the exception at 52-60 %); the part a static placement can reach is
+  0.5 ms at one stream and 1.3 at four, the rest is per-step routing noise. The tier's cost on a rank fits as distinct experts +
+  rows (R2 0.99) from a routing recorder (`bench/ds41/epskew/epskew_ext.py`, a device ring buffer the HIP graphs replay).
+- **Remedies costed** (`skew_place.py` on 12 prose + 12 code recorded prompts): (a) a load-time placement map from the routing
+  histogram, 0 memory: model -0.62 ms held-out at one stream / -1.60 at four; a map trained on one domain does nothing (or a
+  little harm) on the other. (b) replicas with a per-step least-loaded copy: -0.24 / -0.43 more at 8 copies a layer for 0.49 GiB
+  a rank (the worst card has ~0.86 GiB free at KVMEM 1.7; 16 / 32 copies do not fit). (c) stock EPLB: unsupported for
+  Exl3MoEMethod, load-blind replica choice, simulated worse than the static map. (d) overlapping the post-MoE all-reduce with
+  the next layer: impossible, the hc seam consumes the all-reduced output.
+- **Shipped: `R9K_EXL3_EP_MAP`** (`r9700_vllm/moe/exl3_placement.py`, a wrapper on `Exl3MoEMethod.create_weights` that maps
+  the per-rank local experts through the JSON map at load; same experts, same weights, nothing in the forward path).
+  Measured A/B on the clean v0.4.1 + H3 tree: ledger step **19.11 -> 18.52 ms** at one stream, **32.43 -> 31.41** at four;
+  post-MoE all-reduce 86 -> 70 us; spectune prose x1 94.4 -> 100.5 tok/s, prose x4 214.8 -> 222, code x4 372.5 -> 391.9;
+  divergence 24 / 23 / 23, GSM8K 98. Not bit-identical to the linear layout (each rank's bf16 partial sum groups the picks
+  differently). On by default in `serve/ds41-exl3.sh` (`EP_MAP=`, empty restores the linear placement); the map
+  `bench/ds41/epskew/map-ds41-v041-prose-code.json` was trained on prose + code at one stream and should be regenerated from
+  the served mix (`run_skew.sh TAG hist:...` + `skew_place.py`, ~15 min of card time).
+- **Left after the map:** ~1.9 ms a step at one stream / ~2.9 at four of per-step routing noise; shrinks only with fewer bytes a
+  distinct expert (A2 / F) or replicas chosen for free in the tier prologue (A2's prologue + 0.5 GiB a rank).
