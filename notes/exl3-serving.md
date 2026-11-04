@@ -181,3 +181,25 @@ capture width) so the capture peak falls back under the steady-state peak -- tha
 
 
 
+
+## 3b. v0.4.2: the capture-time transient removed; KVMEM 2.0 at 32k (package E, 2026-11-04)
+
+The DSpark speculator's graph capture routes a (k + 1) x NBT = 12,288-token dummy batch to one expert, which took the heavy-expert
+dequant path `_expert_dq` with per-call `torch.empty` temporaries (`ah` 120 MiB, `g` / `u` 56 MiB each, `xe` 120 MiB, `y` 240 MiB):
+that ~0.5 GiB transient, not the serving peak, capped KVMEM at 1.7 (section 3). Now the path runs in pieces of exactly 4,096 rows
+(`R9K_EXL3_MOE_DQ_ROWS`), the last piece ending at the expert's last row and overlapping the one before (the atomic path adds the
+overlap once), using the fused tier's idle state / intermediate buffers as scratch -- no allocation per call. 4,096 rows and not
+1,024 because hipBLAS changes its reduction with M for these f16 shapes below 4,096 (result classes M 1-127 / 128-4095 with
+exceptions / >= 4096) while every M >= 4,096 matches M = 4,096 on every row (checked at 13 values to 24,576): the pieces are
+bit-identical to v0.4.1's one-piece call (card 7: K = 2 / 3 / 4 at 1 .. 12,289 rows, both paths, graph replay = eager, a full
+`apply()` at T = 5,000; `bench/ds41/dqchunk_test.py`, `dqchunk_probe.py`). Timing 12,288 rows 31.8 -> 30.9 ms.
+
+| tree | MAXLEN | KVMEM | KV tokens | capture window, worst card | after the 4 x 12k burst | 15-min 8-client soak |
+|---|---:|---:|---:|---|---|---|
+| v0.4.1 | 32768 | 1.7 | 329,008 | card 8: 31,978 MiB used, 646 MiB free | | 0.86 GiB free (validate-41) |
+| E | 32768 | 1.7 | 329,008 | card 3: 31,787 MiB, 837 MiB free (card 8 -242 MiB) | | |
+| **E** | **32768** | **2.0** | **387,069** | card 5: 32,109 MiB, 515 MiB free | 31,854 MiB, **0.75 GiB free** | 184 ok, 0 errors, 2,894 prompt tok/s, 0.75 GiB free; spectune prose 95.7 / code 191 (MAL 1.82 / 4.26) |
+| E | 32768 | 2.2 | 425,776 | 32,309 MiB, 315 MiB free | 32,054 MiB, 0.56 GiB free | (soak running at the time of writing) |
+
+Default: **KVMEM 2.0 at MAXLEN 32768** (Brian, 2026-11-04: "commit E at 2.0 when the soak passes"). 2.2 is at the 0.5 GiB rule's
+edge and stays an option; the 128k recipe's candidate (1.2) is pending (section 3's 0.8 remains the documented recipe until then).

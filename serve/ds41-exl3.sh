@@ -7,7 +7,7 @@
 # on VM100 they land in $HOME/ds41, which is mounted at /ds41 when that directory exists.
 # 120 V feed: run `bash ~/gpu-offset.sh -500` before any eight-card launch (2x2200 W PSUs, 8-card prefill trips the SCMP).
 # Defaults (notes/exl3-serving.md): HIP graphs, DSpark drafter k=5 with adaptive verification, MAXLEN 32768, NSEQ 4,
-# NBT 2048, KVMEM 1.7 GiB (= 329,008 KV tokens), PYTORCH_ALLOC_CONF=expandable_segments:True, capture sizes 1,2,4 + 6 x 1..4.
+# NBT 2048, KVMEM 2.0 GiB (= 387,069 KV tokens), PYTORCH_ALLOC_CONF=expandable_segments:True, capture sizes 1,2,4 + 6 x 1..4.
 # Long context: MAXLEN=131072 KVMEM=0.8 (313,831 KV tokens, needles retrieved at 126.7k; notes/exl3-serving.md section 3).
 # DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5); DSPARK=0 for a plain run.
 # NSEQ above 4 is NOT supported on this release: a 48-token step goes through exllamav3's fused MoE tier, which faults in
@@ -60,11 +60,12 @@ env \
   NBT=${NBT-2048} `                       # prefill chunk (3.4k tok/s warm prefill at 2048; every soak / needle / GSM8K
                                         # number in notes/exl3-serving.md ran 2048; the topk / candidate buffers and
                                         # the sparse-MLA prefill workspace scale with it)` \
-  KVMEM=${KVMEM-1.7} `                      # GiB a rank, fixed (vLLM's profile estimate is unreliable with load-time dequant):
-                                        # the largest budget whose launch survives the drafter's graph capture (2.0 and
-                                        # 2.2 run card 7 out of memory in the capture's dequant tier) and that keeps the
-                                        # worst card ~0.7 GiB free (sysfs) through a 4-stream prefill burst and the
-                                        # 15-minute soak (notes/exl3-serving.md section 3);
+  KVMEM=${KVMEM-2.0} `                      # GiB a rank, fixed (vLLM's profile estimate is unreliable with load-time dequant):
+                                        # v0.4.2: the heavy-expert dequant path runs in 4,096-row pieces with no per-call
+                                        # allocation (notes/exl3-serving.md section 3b), so the drafter's graph capture no
+                                        # longer needs ~0.5 GiB free: 2.0 survives capture (0.5 GiB free on the worst card
+                                        # during it) and keeps 0.75 GiB free through the 4-stream burst and the 15-minute
+                                        # soak (v0.4.1's 1.7 left 0.86); 2.2 leaves 0.56 after the burst (section 3b);
                                         # ~193k KV tokens a GiB (fp8 SWA + compressed + indexer caches, replicated). For
                                         # MAXLEN=131072 use KVMEM=0.8 (313,831 tokens; 1.0 leaves 0.2 GiB at 128k prompts, 1.5 fails capture).` \
   KVDTYPE=${KVDTYPE-fp8} `                # fp8_ds_mla records (the ROCm V4.1 attention's layout; the probe ran it)` \

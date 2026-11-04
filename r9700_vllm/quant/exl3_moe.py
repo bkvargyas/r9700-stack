@@ -47,6 +47,15 @@ FUSED_ROWS = int(os.environ.get("R9K_EXL3_MOE_FUSED_ROWS", 512))
 # Above FUSED_ROWS tokens (counts read back anyway): experts with more than RECON_ROWS rows take the reconstruct tier
 # (measured on gfx1201, random routing: 8k tokens 27.0 -> 22.9 ms a layer, 16k 50.3 -> 29.5 ms; no gain below 128)
 RECON_ROWS = min(int(os.environ.get("R9K_EXL3_MOE_RECON_ROWS", 128)), FUSED_ROWS)
+# Reconstruct tier pieces: a heavy expert with more than DQ_ROWS rows goes through dequant + hipBLAS in pieces of exactly
+# DQ_ROWS rows (the last one ends at the expert's last row and overlaps the one before it), with the fused tier's state /
+# intermediate buffers (idle once its kernel has run; C x FUSED_ROWS = 4,096 rows on gfx1201) as the scratch, so the tier
+# allocates nothing a call. Exact: on this pin hipBLAS computes every row of an M >= 4,096-row f16 GEMM of these shapes
+# with the same reduction as M = 4,096 (below it the result depends on M: classes 1-127 / 128-4095 / 512, 1536, 3000 ...),
+# so 4,096-row pieces reproduce the one-piece product bit for bit, and up to 4,096 rows the call is one piece as before
+# (bench/ds41/dqchunk_test.py). Was one piece of up to (k + 1) x NBT rows: the DSpark capture's dummy batch puts 12,288
+# rows on one expert and its ~0.6 GiB of transients bounded the KV budget (notes/exl3-serving.md 3b).
+DQ_ROWS = int(os.environ.get("R9K_EXL3_MOE_DQ_ROWS", 4096))
 ATOMIC = os.environ.get("R9K_EXL3_MOE_ATOMIC", "0") == "1"
 # Decode tier for up to DECODE_ROWS tokens (R9K_ROWS for r9k):
 #   r9k    kernels/r9k_moe_exl3.hip (moe/exl3_decode.py): two launches a layer, local slots compacted on device,
@@ -302,27 +311,54 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             self.mcg, self.mul1, self.mcg, self.mul1, self.mcg, self.mul1,
             self.act_limit, num_active, scratch, base, 1, hi, 16)
 
-    def _gemm_dq(self, layer, role: str, r: int, e: int, a: torch.Tensor, out: torch.Tensor):
-        """out = a @ W_e (original basis) through reconstruct + hipBLAS: had(a * suh) @ W_rot, then had(.) * svh."""
+    def _gemm_dq(self, layer, role: str, r: int, e: int, a: torch.Tensor, out: torch.Tensor, ah: torch.Tensor):
+        """out = a @ W_e (original basis) through reconstruct + hipBLAS: had(a * suh) @ W_rot, then had(.) * svh.
+        ah: scratch shaped like a."""
         X = ext()
         trellis = getattr(layer, f"exl3_{role}_trellis")[e]
         k, n = trellis.shape[0] * 16, trellis.shape[1] * 16
-        ah = torch.empty_like(a)
         X.had_r_128(a, ah, getattr(layer, f"exl3_{role}_suh")[e], None, 1.0)
         w = self.dq_temp[:k * n].view(k, n)
         X.reconstruct(w, trellis, self.K[r], self.mcg, self.mul1)
         X.hgemm(ah, w, out)
         X.had_r_128(out, out, None, getattr(layer, f"exl3_{role}_svh")[e], 1.0)
 
-    def _expert_dq(self, layer, e: int, xe: torch.Tensor, out: torch.Tensor):
-        """Unweighted expert MLP for a heavy expert (rows > RECON_ROWS): xe f16 [c, H] -> out f32 [c, H]."""
-        c, I = xe.shape[0], layer._exl3.I
-        g = torch.empty((c, I), dtype=torch.float16, device=xe.device)
-        u = torch.empty_like(g)
-        self._gemm_dq(layer, "gate", 0, e, xe, g)
-        self._gemm_dq(layer, "up", 1, e, xe, u)
-        ext().silu_mul(g, u, g, self.act_limit)
-        self._gemm_dq(layer, "down", 2, e, g, out)
+    def _dq_scratch(self, dev: torch.device, H: int, I: int) -> tuple:
+        """(x rows, Hadamard input, gate, up) flat f16 scratch of DQ_ROWS rows: the fused tier's buffers when they hold
+        that many rows (they do on gfx1201: concurrency 8 x 512), else one shared set for the process."""
+        C, R = self.fused[0].shape[:2]
+        if C * R >= DQ_ROWS:
+            return tuple(b.view(-1) for b in self.fused)
+        return tuple(_shared_buffer(dev, f"moe_dq_{n}", (DQ_ROWS * d,), torch.float16)
+                     for n, d in (("x", H), ("had", H), ("g", I), ("u", I)))
+
+    def _expert_dq(self, layer, e: int, x16: torch.Tensor, tok: torch.Tensor, out: torch.Tensor | None,
+                   weight: torch.Tensor | None = None, acc: torch.Tensor | None = None):
+        """Unweighted expert MLP for a heavy expert (rows > RECON_ROWS) over the rows x16[tok]: out f32 [c, H] gets row
+        i's result (deterministic path), or, with out None, acc.index_add_(tok, y * weight) (R9K_EXL3_MOE_ATOMIC).
+        Up to DQ_ROWS rows one piece, above that pieces of exactly DQ_ROWS rows, the last one overlapping (see DQ_ROWS);
+        scratch from _dq_scratch (this call runs after the fused kernel, on its stream)."""
+        X = ext()
+        H, I = layer._exl3.H, layer._exl3.I
+        sx, sh, sg, su = self._dq_scratch(x16.device, H, I)
+        c = tok.numel()
+        n = min(c, DQ_ROWS)
+        starts = [0] if c <= DQ_ROWS else list(range(0, c - DQ_ROWS, DQ_ROWS)) + [c - DQ_ROWS]
+        done = 0
+        for r0 in starts:
+            t = tok[r0:r0 + n]
+            xe = sx[:n * H].view(n, H)
+            torch.index_select(x16, 0, t, out=xe)
+            g, u = sg[:n * I].view(n, I), su[:n * I].view(n, I)
+            self._gemm_dq(layer, "gate", 0, e, xe, g, sh[:n * H].view(n, H))
+            self._gemm_dq(layer, "up", 1, e, xe, u, sh[:n * H].view(n, H))
+            X.silu_mul(g, u, g, self.act_limit)
+            y = out[r0:r0 + n] if out is not None else torch.empty((n, H), dtype=torch.float32, device=x16.device)
+            self._gemm_dq(layer, "down", 2, e, g, y, sh[:n * I].view(n, I))
+            if out is None:     # the overlapped rows of the last piece are already in acc
+                k0 = done - r0
+                acc.index_add_(0, t[k0:], y[k0:] * weight[r0 + k0:r0 + n].float().unsqueeze(1))
+            done = r0 + n
 
     def _apply_coop(self, layer, x, topk_weights, topk_ids):
         L, E = layer, layer._exl3.E
@@ -415,10 +451,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if num_active:
                 self._run_fused(layer, x16, out, count, token_sorted, weight_sorted, num_active, None, None, hi)
             for e, s, c in heavy:
-                y = torch.empty((c, H), dtype=torch.float32, device=dev)
-                tok = token_sorted[s:s + c]
-                self._expert_dq(layer, e, x16.index_select(0, tok), y)
-                out.index_add_(0, tok, y * weight_sorted[s:s + c].float().unsqueeze(1))
+                self._expert_dq(layer, e, x16, token_sorted[s:s + c], None, weight_sorted[s:s + c], out)
         else:
             # slot of a local assignment = its sorted position (the sentinel bin sorts last); kind 1 = fused (slot
             # weighted by the kernel), 2 = reconstruct tier (unweighted, weighted by the gather)
@@ -428,7 +461,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             if num_active:
                 self._run_fused(layer, x16, out, count, token_sorted, weight_sorted, num_active, scratch, start, hi)
             for e, s, c in heavy:
-                self._expert_dq(layer, e, x16.index_select(0, token_sorted[s:s + c]), scratch[s:s + c])
+                self._expert_dq(layer, e, x16, token_sorted[s:s + c], scratch[s:s + c])
             inv_order = torch.empty_like(order).scatter_(0, order, torch.arange(A, device=dev))
             ext().exl3_moe_gather(out, scratch, local, inv_order, start[:E], start[:E], kind[:E], weight_sorted)
         return out.to(x.dtype)
