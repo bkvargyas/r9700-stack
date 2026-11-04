@@ -200,6 +200,9 @@ bit-identical to v0.4.1's one-piece call (card 7: K = 2 / 3 / 4 at 1 .. 12,289 r
 | E | 32768 | 1.7 | 329,008 | card 3: 31,787 MiB, 837 MiB free (card 8 -242 MiB) | | |
 | **E** | **32768** | **2.0** | **387,069** | card 5: 32,109 MiB, 515 MiB free | 31,854 MiB, **0.75 GiB free** | 184 ok, 0 errors, 2,894 prompt tok/s, 0.75 GiB free; spectune prose 95.7 / code 191 (MAL 1.82 / 4.26) |
 | E | 32768 | 2.2 | 425,776 | 32,309 MiB, 315 MiB free | 32,054 MiB, 0.56 GiB free | (soak running at the time of writing) |
+| E | 131072 | 1.2 | ~471k | card 7: 31,807 MiB (capture fine) | 120k needle 3/3 at 0.34 GiB free, 128.5k needle 3/3 at **0.32 GiB** | prose 102-103 / code 195-196 single (MAL 1.96-1.99 / 4.43-4.46); below the 0.5 GiB rule -> 1.0 queued |
 
-Default: **KVMEM 2.0 at MAXLEN 32768** (Brian, 2026-11-04: "commit E at 2.0 when the soak passes"). 2.2 is at the 0.5 GiB rule's
-edge and stays an option; the 128k recipe's candidate (1.2) is pending (section 3's 0.8 remains the documented recipe until then).
+Default: **KVMEM 2.0 at MAXLEN 32768** (Brian, 2026-11-04: "commit E at 2.0 when the soak passes"). 2.2 survives capture with only
+315 MiB free and its divergence was the weakest run (20 / 24 on prose): not taken. At 128k, 1.2 retrieves at 128.5k but leaves 0.32 GiB
+(v0.4.1's wo_a-on-EXL3 freed ~230 MiB a rank since v0.4.0's 1.0 run, which left 0.21); 1.0 (392k tokens, three full 128k requests)
+is the candidate recipe, pending its needles and soak.
