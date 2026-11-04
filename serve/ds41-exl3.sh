@@ -12,8 +12,9 @@
 # 128.5k, 0.49-0.52 GiB free on the worst card; KVMEM=0.8 = 313,831 tokens for margin; notes/exl3-serving.md section 3b).
 # DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5); DSPARK=0 for a plain run.
 # NSEQ above 4 is NOT supported on this release: a 48-token step goes through exllamav3's fused MoE tier, which faults in
-# the engine warm-up (HSA memory aperture violation; notes/exl3-plan.md Phase 4 A). The 48-token r9k tier that launches it
-# broke the DSpark drafter in the server (1.01 accepted tokens a step) and is held back for v0.4.2.
+# the engine warm-up (HSA memory aperture violation; notes/exl3-plan.md Phase 4 A). The 48-token r9k tier (package A2) is
+# in validation for v0.4.2; the 2026-11-03 drafter collapse blamed on it is a graph-pool-layout latent bug
+# (notes/exl3-drafter-heisenbug.md) that SELFTEST=1 (default) catches after every launch.
 # WARM=1 waits for the server and sends two short decodes and one prefill so the Triton JITs (~7-13 s) and the
 # drafter's first-step warm-up land before the first user request. (serve.sh starts the container detached and returns,
 # so the warm-up runs after it; the launcher used to exec serve.sh, which made WARM a no-op.)
@@ -98,4 +99,13 @@ for n, m in ((8, 96), (2500, 4), (8, 96)):     # decode (the DSpark verify path 
                                                   {"Content-Type": "application/json"}), timeout=600).read()
 print("warm-up done")
 PY
+fi
+# SELFTEST=1 (default) waits for the server (after WARM when set) and runs bench/ds41/drafter_selftest.py: one greedy prose
+# and one code request, MAL from /metrics. The launcher exits 1 (the server keeps running) below MAL 1.3 prose / 3.0 code,
+# i.e. the DSpark drafter accepting nothing while the target text stays sane (notes/exl3-drafter-heisenbug.md); exit 2 when
+# the server cannot be queried. SELFTEST=0 skips it; it is skipped with DSPARK=0 and DRYRUN=1.
+if [ "${SELFTEST:-1}" = 1 ] && [ "${DRYRUN:-0}" != 1 ] && [ "${DSPARK:-1}" = 1 ]; then
+  for i in $(seq 1 120); do curl -s "localhost:${PORT:-8080}/v1/models" >/dev/null 2>&1 && break; sleep 10; done
+  python3 "$ROOT/bench/ds41/drafter_selftest.py" "http://localhost:${PORT:-8080}" "${SERVED_NAME-DeepSeek-V4.1}" || {
+    echo "ds41-exl3.sh: drafter self-test FAILED (the server is still running; SELFTEST=0 skips the check)" >&2; exit 1; }
 fi
