@@ -67,7 +67,8 @@ ATOMIC = os.environ.get("R9K_EXL3_MOE_ATOMIC", "0") == "1"
 #   fused  the exl3_moe fused tier as for prefill
 DECODE = os.environ.get("R9K_EXL3_MOE_DECODE", "r9k")
 DECODE_ROWS = int(os.environ.get("R9K_EXL3_MOE_MGEMM_M", 16))
-R9K_ROWS = int(os.environ.get("R9K_EXL3_MOE_R9K_M", 24))   # 4 streams x a 6-token verify
+R9K_ROWS = int(os.environ.get("R9K_EXL3_MOE_R9K_M", 48))   # 8 streams x a 6-token verify (scratch sized once for it)
+_R9K_SLOTS: list = []  # the kernel's slot capacity (T x topk), read once from libr9k
 MAX_BSZN = 8          # exllamav3_ext/libtorch/blocksparse_mlp.h: exl3_moe_coop scratch bound
 MGEMV_SLOTS = 128     # exl3_mgemv_try_launch: bszm <= 128
 MOE_ACT_SILU = 0  # exllamav3_ext/quant/exl3_moe_common.cuh
@@ -269,7 +270,7 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         if DECODE == "r9k" and self._r9k_ready(layer):
             from ..moe import exl3_decode as XD
             XD.reserve(dev, rows, topk, H, layer._exl3.I)
-        sizes = sorted({t for t in (1, 2, 3, 4, 6, 8, 12, 16, 24, rows) if 0 < t <= rows} | {rows + 1, 64})
+        sizes = sorted({t for t in (1, 2, 3, 4, 6, 8, 12, 16, 24, 36, 48, rows) if 0 < t <= rows} | {rows + 1, 64})
         for T in sizes:
             x = torch.zeros((T, H), dtype=torch.bfloat16, device=dev)
             ids = local.expand(T, -1).contiguous()
@@ -289,6 +290,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
             ok = XD.available() and len(set(self.K)) == 1 and 2 <= self.K[0] <= 6 and (self.mul1 or self.mcg)
             if ok:
                 layer._exl3_r9k_tab = XD.Tables(layer)
+                if not _R9K_SLOTS:
+                    _R9K_SLOTS.append(XD.max_slots())
             elif DECODE == "r9k":
                 logger.warning_once("exl3 moe: r9k decode tier unavailable (libr9k without r9k_moe_exl3_decode, "
                                     "or K %s / codebook unsupported): mgemv decode", tuple(self.K))
@@ -415,7 +418,8 @@ class Exl3MoEMethod(FusedMoEMethodBase):
         # shared_experts: the runner runs them (moe_kernel is None, so mk_can_overlap_shared_experts is False)
         E = layer._exl3.E
         T, H = x.shape
-        if DECODE == "r9k" and 0 < T <= R9K_ROWS and T * topk_ids.shape[1] <= 256 and self._r9k_ready(layer):
+        if DECODE == "r9k" and 0 < T <= R9K_ROWS and self._r9k_ready(layer) \
+                and T * topk_ids.shape[1] <= _R9K_SLOTS[0]:
             return self._apply_r9k(layer, x, topk_weights, topk_ids)
         if 0 < T <= DECODE_ROWS:
             if DECODE in ("mgemv", "r9k") and topk_ids.numel() <= MGEMV_SLOTS:

@@ -82,7 +82,7 @@ def run(wl, ns):
     think, n, prompts = W[wl]
     m0 = metrics(); res = {}
     # prose / code: one prompt a stream; gsm: 16 questions dealt round-robin over the streams (1 stream: questions 0-3)
-    mine = [prompts[i::ns] if wl == "gsm" else [prompts[i]] for i in range(ns)]
+    mine = [prompts[i::ns] if wl == "gsm" else [prompts[i % len(prompts)]] for i in range(ns)]   # 8 streams reuse prompts
     if wl == "gsm" and ns == 1:
         mine = [prompts[:4]]
     th = [threading.Thread(target=stream, args=(mine[i], think, n, res, i)) for i in range(ns)]

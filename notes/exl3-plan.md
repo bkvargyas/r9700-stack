@@ -674,3 +674,28 @@ experts / a routing-histogram placement; vLLM's EPLB as the reference) is the bi
   the served mix (`run_skew.sh TAG hist:...` + `skew_place.py`, ~15 min of card time).
 - **Left after the map:** ~1.9 ms a step at one stream / ~2.9 at four of per-step routing noise; shrinks only with fewer bytes a
   distinct expert (A2 / F) or replicas chosen for free in the tier prologue (A2's prologue + 0.5 GiB a rank).
+
+### v0.4.2 results, package A2 (48-token r9k expert tier; 2026-11-03 20:xx - 11-04 12:57 UTC; notes/exl3-drafter-heisenbug.md)
+- **Package A's kernel was never the cause of the drafter collapse.** On a clean v0.4.1 tree plus 3f2167a's four tier files the
+  server is fine at cap 48 (MAL 1.69-1.89 / 4.2-4.4). The collapse reproduces only on the 3f2167a base (C + B + A, before D),
+  and there v0.4.1's OWN tier with nothing changed but the scratch reserved for 48 rows breaks the same way; a 64 MiB pad after
+  the scratch hides it; eager is fine. ~16 launches (one hypothesis each) excluded the tier, every plugin scratch, counters,
+  collectives, weights, the shared-experts stream, markov / mhc / route hooks: it is computed at run time inside the drafter's
+  layers.0 MoE at T = 5 from a bit-identical input, in particular graph-pool layouts only. Parked as task 71; mitigation
+  `bench/ds41/drafter_selftest.py` (SELFTEST=1 in the launcher; MAL from /metrics; exit 1 below 1.3 prose / 3.0 code).
+- **The tier (kernels/r9k_moe_exl3.hip, exl3_decode.py):** A's kernel (slot cap 512, compacted grouping, batched rotation,
+  2-row groups above 8 tokens) plus a `k_rot` input-rotation pre-pass above XR_T = 8 tokens (each local slot's gate / up
+  input rotated once into an [S, 2, H] f16 scratch instead of in every k_gu block; entry point `r9k_moe_exl3_decode_xr`, the
+  old one kept). Same ops in the same order. Cap R9K_EXL3_MOE_R9K_M 48 (scratch sized once). Card 5, graph replay, us a layer,
+  v0.4.1 -> A2: T=1 39.9 -> 37.6; T=2 66.7 -> 64.0; T=4 101.2 -> 98.3; T=6 134.8 -> 128.5 (the 120 target not met: the
+  per-group trellis stream at 4-5 groups dominates, P / KS launch geometry does not move it); T=24 532 -> 391; T=48 2,333
+  (fused tier) -> 700; drafter T=5 82.4 -> 81.2, T=20 272 -> 239, T=40 1,016 -> 343.
+- **Tests:** tests/test_exl3_moe_r9k.py (lazy f32 reference so EP 8 runs under 1 GiB; groups at every T 1..48; a "warm"
+  routing; `check_server_sequence()` = target warm-up then the exact drafter geometry 128 / 16 local / top-3 / K=4, both
+  rotation paths, graphs at 5-48): ALL OK on card 5 (`~/ds41/exl3/A2/testF.log`).
+- **Server acceptance** (tree tF = `git archive v042` + the four files, launcher defaults, `~/ds41/exl3/A2/acc.out`):
+  NSEQ 4: self-test prose 1.71 / code 3.46; spectune prose x1 **104-105 tok/s** (MAL 1.79-1.82), x4 234 aggregate (one rep
+  137); code x1 **208-210** (4.24), x4 **411-412** aggregate; divergence 22 / 24 / 24; GSM8K 98. NSEQ 8: self-test 1.64 / 4.08;
+  prose x1 102.8, x4 191.5; strict sanity 9 streams 0 bad of 45, 16 streams 0 of 80; 10-min 8-client 200-28k soak 128 ok,
+  0 errors, 3,149 prompt tok/s; self-test after the soak unchanged. The 8-stream spectune raised an IndexError (more streams
+  than prompts; fixed in spectune.py, to be measured at the gate). Launcher: NSEQ 8 supported, default stays 4.

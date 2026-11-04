@@ -7,7 +7,8 @@ this rank are skipped on device, slots sharing an expert are decoded together (u
 per-call memset: graph-capturable, deterministic. Design and numbers: kernels/r9k_moe_exl3.hip, notes/exl3-plan.md.
 
 Knobs (process-wide): R9K_EXL3_DEC_P (group lanes, grid z; default min(slots, 16)), R9K_EXL3_DEC_KS1 / _KS2 (input
-chunks of gate|up and down; default by token count), R9K_EXL3_DEC_ROWS (max slots a group, default 8; 1 = no sharing).
+chunks of gate|up and down; default by token count), R9K_EXL3_DEC_ROWS (max slots a group; default by token count:
+up to 8 at T <= 8, 2 above; 1 = no sharing).
 """
 from __future__ import annotations
 
@@ -22,7 +23,10 @@ _bufs: dict = {}
 P_CAP = int(os.environ.get("R9K_EXL3_DEC_P", 16))
 KS1 = int(os.environ.get("R9K_EXL3_DEC_KS1", 0))
 KS2 = int(os.environ.get("R9K_EXL3_DEC_KS2", 0))
-ROWS = int(os.environ.get("R9K_EXL3_DEC_ROWS", 8))
+ROWS = int(os.environ.get("R9K_EXL3_DEC_ROWS", 0))      # 0 = by token count (rows_for)
+# Above XR_T tokens the gate / up input rotation runs once a local slot (k_rot, a third launch) instead of in every one of
+# k_gu's blocks; 0 = never
+XR_T = int(os.environ.get("R9K_EXL3_DEC_XR_T", 8))
 
 
 def lib() -> ctypes.CDLL:
@@ -39,6 +43,14 @@ def lib() -> ctypes.CDLL:
         L.r9k_moe_exl3_ctr_ints.restype = ctypes.c_int
         L.r9k_moe_exl3_ctr_ints.argtypes = [ctypes.c_int] * 4
         L.r9k_moe_exl3_max_slots.restype = ctypes.c_int
+        if hasattr(L, "r9k_moe_exl3_decode_xr"):
+            L.r9k_moe_exl3_decode_xr.restype = ctypes.c_int
+            L.r9k_moe_exl3_decode_xr.argtypes = ([ctypes.c_long, ctypes.c_int] + [ctypes.c_long] * 3 + [ctypes.c_int] * 6
+                                                 + [ctypes.c_long, ctypes.c_int, ctypes.c_int, ctypes.c_float]
+                                                 + [ctypes.c_long] * 6 + [ctypes.c_int] * 5 + [ctypes.c_long] * 2)
+        if hasattr(L, "r9k_moe_exl3_groups"):
+            L.r9k_moe_exl3_groups.restype = ctypes.c_int
+            L.r9k_moe_exl3_groups.argtypes = [ctypes.c_long] * 2 + [ctypes.c_int] * 5 + [ctypes.c_long] * 2
         L.r9k_exl3_dq_tiles.restype = ctypes.c_int
         L.r9k_exl3_dq_tiles.argtypes = [ctypes.c_long] * 2 + [ctypes.c_int] * 4 + [ctypes.c_long]
         _L = L
@@ -64,15 +76,25 @@ def _fit(segs: int, want: int, ok=lambda k: True) -> int:
 
 
 def rows_for(T: int) -> int:
-    """Slots a group (one expert's weights decoded once for up to this many tokens)."""
-    return max(1, min(ROWS, T, 8))
+    """Slots a group (one expert's weights decoded once for up to this many tokens). Above 8 tokens 2: the 2-row
+    instance's smaller LDS and register footprint beat sharing a third row (gfx1201, 2026-11-03, T = 48 36 picks over
+    25 experts: R 8 790 us, R 4 767, R 2 678; T = 24: 483 / 448 / 430), and 3+ picks of one expert are rare there."""
+    if ROWS:
+        return max(1, min(ROWS, T, 8))
+    return max(1, min(T, 8)) if T <= 8 else 2
+
+
+def use_xr(T: int) -> bool:
+    return 0 < XR_T < T and hasattr(lib(), "r9k_moe_exl3_decode_xr")
 
 
 def split_for(T: int, H: int, I: int) -> tuple[int, int]:
     """(ks1, ks2): input chunks a block takes for gate|up (of H) and down (of I). Few groups need short chunks to
-    put enough blocks in flight (measured on gfx1201, cold weights, 2026-11-02: T = 1 10/6, T = 6 8-10/3, T = 24 8/2)."""
+    put enough blocks in flight (measured on gfx1201, cold weights, 2026-11-02: T = 1 10/6, T = 6 8-10/3, T = 24 8/2;
+    2026-11-03 with 2-row groups above 8 tokens: T = 24 / 48 4/2)."""
     mm = rows_for(T)
-    ks1 = _fit(H // 128, KS1 or (10 if T <= 1 else 8), lambda k: 2 * mm * (H // k) * 2 <= 48 * 1024)
+    # above 8 tokens 4 chunks of gate|up (T = 48: 8 -> 4 with 2 rows, 751 -> 678 us; 2 and 5 lose)
+    ks1 = _fit(H // 128, KS1 or (10 if T <= 1 else 8 if T <= 8 else 4), lambda k: 2 * mm * (H // k) * 2 <= 48 * 1024)
     ks2 = _fit(I // 128, KS2 or (6 if T <= 1 else 3 if T <= 8 else 2))
     return ks1, ks2
 
@@ -80,13 +102,15 @@ def split_for(T: int, H: int, I: int) -> tuple[int, int]:
 def _need(T: int, topk: int, H: int, I: int) -> dict:
     """Element counts covering every call of up to T tokens at the splits split_for() picks. One f32 partial buffer
     serves both kernels (k_gu's partials are dead once k_dn starts: same stream, k_dn never reads them)."""
-    need = {"part": 0, "ar": 0, "os": 0, "ctr": 0}
+    need = {"part": 0, "ar": 0, "os": 0, "ctr": 0, "xr": 0}
     for t in range(1, T + 1):
         S = t * topk
         ks1, ks2 = split_for(t, H, I)
         need["part"] = max(need["part"], S * ks1 * 2 * I, S * ks2 * H)
         need["ar"] = max(need["ar"], S * I)
         need["os"] = max(need["os"], S * H)
+        if use_xr(t):
+            need["xr"] = max(need["xr"], S * 2 * H)
         need["ctr"] = max(need["ctr"], lib().r9k_moe_exl3_ctr_ints(t, topk, H, I))
     return need
 
@@ -107,7 +131,8 @@ def _scratch(dev: torch.device, T: int, topk: int, H: int, I: int):
         _bufs.pop(dev.index)
         del b
     # one allocation carved into 256-byte aligned views (separate mid-size tensors each round up to an allocator segment)
-    layout = (("part", torch.float32), ("os", torch.float32), ("ar", torch.float16), ("ctr", torch.int32))
+    layout = (("part", torch.float32), ("os", torch.float32), ("ar", torch.float16), ("xr", torch.float16),
+              ("ctr", torch.int32))
     offs, n = {}, 0
     for k, dt in layout:
         offs[k] = n
@@ -161,15 +186,37 @@ def moe_decode(x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tens
     y = torch.empty((T, H), dtype=torch.float32 if y_f32 else torch.bfloat16, device=dev)
     R = rows_for(T)
     P = max(1, min(S, P_CAP))
-    rc = lib().r9k_moe_exl3_decode(
+    rc = lib().r9k_moe_exl3_decode_xr(
         x.data_ptr(), int(x.dtype == torch.float16), ids.data_ptr(), w.data_ptr(), g2l.data_ptr(), g2l.numel(), E,
         T, topk, H, I, ctypes.addressof(tables.arr), K, cb, act_limit,
         b["part"].data_ptr(), b["part"].data_ptr(), b["ar"].data_ptr(), b["os"].data_ptr(), b["ctr"].data_ptr(),
-        y.data_ptr(), int(y_f32), R, P, ks1, ks2, torch.cuda.current_stream(dev).cuda_stream)
+        y.data_ptr(), int(y_f32), R, P, ks1, ks2, b["xr"].data_ptr() if use_xr(T) else 0,
+        torch.cuda.current_stream(dev).cuda_stream)
     if rc != 0:
         raise RuntimeError(f"r9k_moe_exl3_decode failed ({rc}): T={T} topk={topk} H={H} I={I} K={K} cb={cb} "
                            f"ks={ks1},{ks2}")
     return y if (out_f32 or y.dtype == x.dtype) else y.to(x.dtype)
+
+
+def groups(topk_ids: torch.Tensor, g2l: torch.Tensor, E: int, R: int | None = None) -> list:
+    """Validation: the slot groups the kernels derive on device for this routing, [(local expert, [slots])] in group
+    order. Every group is one pass over its expert's trellis (in each segment / chunk block), so the trellis bytes a
+    call reads = len(groups) x an expert's bytes."""
+    T, topk = topk_ids.shape
+    R = R or rows_for(T)
+    MM = 8
+    ids = topk_ids.to(torch.int32).contiguous()
+    out = torch.full((2 + T * topk * (2 + MM),), -1, dtype=torch.int32, device=ids.device)
+    rc = lib().r9k_moe_exl3_groups(ids.data_ptr(), g2l.data_ptr(), g2l.numel(), E, T, topk, R, out.data_ptr(),
+                                   torch.cuda.current_stream(ids.device).cuda_stream)
+    assert rc == 0, rc
+    o = out.cpu().tolist()
+    ng = o[1]
+    res = []
+    for g in range(ng):
+        row = o[2 + g * (2 + MM): 2 + (g + 1) * (2 + MM)]
+        res.append((row[0], row[2:2 + row[1]]))
+    return res
 
 
 def dq_tiles(trellis: torch.Tensor, cb: int = 2) -> torch.Tensor:
