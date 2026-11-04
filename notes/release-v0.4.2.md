@@ -40,7 +40,18 @@ eight-card runs at the -500 MHz offset).
   full-length requests; 0.8 = 313,831 before; package E). The load-time dequant path that sized the capture peak (a 12,288-row
   dummy expert at speculator capture) runs in 4,096-row pieces, bit-identical to the one-piece call (hipBLAS's result classes
   checked at 13 row counts). 0.75 GiB free on the worst card through the 32k soak; 0.49-0.52 GiB at the 128k needles and soak.
-- __F__
+- **The EXL3 decode GEMV, traced and trimmed** (`kernels/r9k_exl3_gemv.hip`, `quant/exl3_gemv.py`; package F): a per-block trace of
+  one launch shows that ~3.5 us of every call is the HIP-graph node floor, and that v0.4.1's per-matrix chunking put the fused
+  wqa / wkv launch at 360 blocks of 136 VGPRs, more than are resident at once (some blocks started 14-19 us late). One chunk count
+  for all groups of a launch (`R9K_EXL3_GEMV_SHARED_KS`, 280 blocks), the first trellis tile issued before the input rotation
+  behind an LDS-only barrier (on gfx12 `__syncthreads()` waits on every outstanding global load), a split epilogue for 1-4 rows and
+  scalar load bases (136 -> 85 VGPRs): fused_wqa_wkv 18.9 -> 15.1 us at one row (379 GB/s), wo_a 12.1 -> 10.1, 4-8 rows level
+  with v0.4.1, 24 / 48 rows unchanged; about -0.28 ms a single-stream step. The 450 GB/s target does not fit a one-launch,
+  last-arriver kernel on these shapes: the node floor plus the store -> counter -> partial-load chain (~1.4 us) leaves less than
+  the card's peak for the bytes; fewer launches a layer is the next structure. **The NB2=4 crash on main_proj is fixed**: the WMMA
+  kernel's static transpose buffers (6 KiB a 128-column tile) were not counted in the LDS budget (49 + 24 KiB > 64 KiB,
+  `HSA_STATUS_ERROR_INVALID_ALLOCATION`); NB2=4 is now the default for k >= 8192 (main_proj 404 -> 299 us at 48 rows, 286 -> 221
+  at 24), 2 elsewhere. Bit-exact against exllamav3's reconstruct; graph replay equals eager.
 - **Opt-in: a "hub" eight-rank all-reduce for 160 KiB - 1.5 MiB messages** (`R9K_AR8_HUB=1`; package G): the quartet sum on one CPU
   reducer thread a rank over the pinned host pools, one host hop instead of two, bit-identical to the fused split kernel: 240 KiB
   76.7 -> 67.1 us, 480 KiB 122.5 -> 116.3, 1 MiB 230 -> 202. Off by default: the targets (50 / 90 / 150) were not met, the

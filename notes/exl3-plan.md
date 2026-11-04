@@ -726,3 +726,27 @@ experts / a routing-histogram placement; vLLM's EPLB as the reference) is the bi
   the test (pools freed while reducer threads still read them) is fixed by holding the pools at module scope and joining the
   threads at exit. Next (v0.4.3): batch the pair-sum publishes or publish from a separate flag block; no design measured here
   reaches 50 us at 240 KiB on this fabric.
+
+### v0.4.2 results, package F (EXL3 decode GEMV latency chain, NB2=4; card 7, graph replay, cold ring; `~/ds41/exl3/F/{full-base,full-g,num-g}.log`)
+- **Trace of one launch** (wall_clock64 a block, `tests/test_exl3_gemv.py ONLY=trace`, -DR9K_GEMV_TRACE): graph-node floor 3.54 us
+  for a tiny kernel; wq_b (3.28 MB) v0.4.1 -> F: block start skew 0.76 -> 0.44, x / suh load + rotation 1.24 -> 1.48 (one trellis
+  k-tile in flight), stream 5.08 -> 4.04, partials store + fence 0.40 -> 0.36, arrival atomic 0.24, epilogue 2.0-2.2 -> 1.72 (fence
+  0.28 + partial loads 0.76 + LDS slice-sum / Hadamard / store 0.68), kernel end ~10.2 -> ~9.5. v0.4.1's per-matrix chunking put
+  fused_wqa_wkv at 360 blocks x 136 VGPRs (not all resident; blocks starting 14-19 us late). 450 GB/s does not fit: wq_b <= 7.5 us
+  minus the node leaves 4 us for 3.28 MB (above peak); fused <= 13 minus the node leaves ~9.5 and the stream alone is 8.2 at ~640 GB/s.
+- **Changes:** SHARED_KS planner (one chunk count a launch; fused 360 -> 280 blocks; most of the M = 1 gain); early trellis loads
+  (R9K_GEMV_PI=1) behind an LDS-only barrier (deeper prefetch worse: PI=4 +1-2 us, PI=8 +4-5); split epilogue for row tiles M <= 4
+  (R9K_GEMV_FSPLIT_M=4; slower at 6-8 rows, so D's code above 4 and the whole WMMA path are verbatim); scalar load bases 136 -> 85
+  VGPRs. Dropped: a rolling 4-8 tile register pipeline, BLOCKS 96 / 288, QB=8.
+- **NB2=4 crash:** the WMMA kernel's static transpose buffers (6 KiB a 128-column tile, 24 KiB at NB2=4) were not in the LDS budget;
+  `ks_for` allowed a 49 KiB chunk -> HSA_STATUS_ERROR_INVALID_ALLOCATION (exit 139). Fix: `_lds_mma(nb2) = min(50 KiB, 63 KiB - nb2 x
+  6 KiB)` and the launcher refuses with -1 above 64 KiB. main_proj us at 16 / 24 / 48 rows: NB2=1 434 / 508 / 786, NB2=2 245 / 285 /
+  404, **NB2=4 180 / 221 / 298**; attention shapes NB2=2 best (NB2=4 0-7 % slower). Default 4 when k >= 8192, else 2.
+- **Timing (us, v0.4.1 -> F) at M = 1 / 2 / 4 / 6 / 8 / 24 / 48:** fused_wqa_wkv 18.9 -> 15.1 / 19.2 -> 16.0 / 19.9 -> 18.1 / 24.0 ->
+  22.0 / 26.5 -> 24.6 / 45.1 -> 45.0 / 65.2 -> 65.4; drafter fused K6 20.2 -> 17.0 ... 66.6 -> 67.1; wq_b 11.3 -> 10.9 ... 36.8 ->
+  36.9; wo_a 12.1 -> 10.1 / 12.4 -> 10.9 / 12.7 -> 12.5 / 14.7 -> 15.4 / 16.1 -> 16.4 / 27.8 -> 28.0 / 38.0; wo_b 11.1 -> 11.1 ...;
+  main_proj 106.7 -> 108.2 at 1 row, 286 -> 221 at 24, 404 -> 299 at 48; synthetic layer of 4 linears 53.5 -> 47.3 at 1 row.
+  Projection a step: -0.28 ms at M = 1-2, -0.04 at 4-8, -0.07 / -0.09 at 24 / 48 (main_proj).
+- **Tests:** full test_exl3_gemv.py ALL OK (decode == reconstruct bit for bit; rms gates; stacked parts; apply r9k vs exllamav3;
+  wo_a hook; graph replay x2 == eager). New: ONLY=trace section, a graph-floor probe, a read-only cache flush. Knobs:
+  R9K_EXL3_GEMV_SHARED_KS (1); compile-time R9K_GEMV_PI (1), _QB (4), _FSPLIT (1), _FSPLIT_M (4). Server acceptance: the v0.4.2 gate.

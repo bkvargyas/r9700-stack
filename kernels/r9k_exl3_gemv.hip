@@ -29,6 +29,12 @@
 //      and no host sync) sums the partials in chunk order, applies the output Hadamard and svh and writes the rows in
 //      the group's output dtype at the group's column offset / row stride.
 // Every sum has a fixed order: deterministic, HIP-graph safe. Scratch is shared by every launch on a stream.
+//
+// Package F (v0.4.2, the fdot path's fixed latency; phase trace with -DR9K_GEMV_TRACE, tests/test_exl3_gemv.py
+// ONLY=trace): the first R9K_GEMV_PI k-tiles of trellis and svh are loaded before the rotation and stay in flight
+// across an LDS-only barrier (__syncthreads' fence waits for every outstanding global load on gfx12); the epilogue
+// issues a task's partial loads together (unconditional, no branch between them) and, for m < 4, splits a row's
+// chunks over the block's waves (slice sums in LDS, then summed in slice order). The WMMA path is package D's.
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <cstdint>
@@ -41,13 +47,26 @@ namespace {
 #ifndef R9K_GEMV_TPW
 #define R9K_GEMV_TPW 2             // adjacent 16-column tiles a wave (shared input loads)
 #endif
-#ifndef R9K_GEMV_U
-#define R9K_GEMV_U 0               // k-tiles whose loads go out together (0 = exllamav3's table)
-#endif
 #ifndef R9K_GEMV_KW
 #define R9K_GEMV_KW 1              // waves splitting a block's input chunk (1 = 4 waves a block, 2 = 8)
 #endif
+#ifndef R9K_GEMV_FSPLIT_M
+#define R9K_GEMV_FSPLIT_M 4        // row tiles up to this take the split epilogue (above: package D's finish_rows)
+#endif
+#ifndef R9K_GEMV_FSPLIT
+#define R9K_GEMV_FSPLIT 1          // epilogue: rows < 4 split their partial chunks over the block's waves
+#endif
+#ifndef R9K_GEMV_U
+#define R9K_GEMV_U 0               // k-tiles whose loads go out together (0 = exllamav3's table)
+#endif
+#ifndef R9K_GEMV_PI
+#define R9K_GEMV_PI 1              // fdot path: k-tiles a wave issues before the input rotation
+#endif
+#ifndef R9K_GEMV_QB
+#define R9K_GEMV_QB 4              // epilogue: partial chunks a task keeps in flight
+#endif
 constexpr int TPW = R9K_GEMV_TPW;
+constexpr bool FSPLIT = R9K_GEMV_FSPLIT;
 constexpr int CW = 8 / TPW;                 // column waves: 128 outputs a block
 constexpr int KW = R9K_GEMV_KW;
 constexpr int WAVES = CW * KW;
@@ -337,6 +356,41 @@ __device__ __forceinline__ uint32_t ld_l(const char* base, uint32_t off) { retur
 // keeps a loop-invariant lane offset opaque so the loads stay in the SGPR-base + VGPR-offset form
 __device__ __forceinline__ void opaque(uint32_t& v) { asm volatile ("" : "+v"(v)); }
 
+// One k-tile of the fdot core from registers: the M rows' A words from LDS (A_c already at this k-tile), the decode of
+// the wave's T tiles, the f32 dots (the inner body of exllamav3's exl3_gemv_tiles_rdna step).
+template <int bits, int cb, int M, int T>
+__device__ __forceinline__ void dot_regs(const char* A_c, const uint32_t* a_row, const uint32_t a_off,
+                                         const uint32_t (&raw)[T][LanePlan<bits>::R], const LanePlan<bits>& lp,
+                                         float* accA, float* accB)
+{
+    uint32_t w01[M], w89[M];
+    #pragma unroll
+    for (int r = 0; r < M; ++r)
+    {
+        const char* a = A_c + a_row[r];
+        w01[r] = ld_l(a, a_off);
+        w89[r] = ld_l(a + 16, a_off);
+    }
+    #pragma unroll
+    for (int t = 0; t < T; ++t)
+    {
+        Frag f0, f1;
+        dq_tile<bits, cb>(raw[t], lp, f0, f1);
+        #pragma unroll
+        for (int r = 0; r < M; ++r)
+        {
+            const h2 a01 = as_h2(w01[r]), a89 = as_h2(w89[r]);
+            float& aA = accA[t * M + r];
+            float& aB = accB[t * M + r];
+            aA = fdot2(a01, f0.v[0], aA);
+            aA = fdot2(a89, f0.v[1], aA);
+            aB = fdot2(a01, f1.v[0], aB);
+            aB = fdot2(a89, f1.v[1], aB);
+        }
+    }
+}
+
+
 template <int bits, int cb, int M, bool A_LDS, int U, int T>
 __device__ __forceinline__ void tiles_step(const char* A_c, const uint32_t* a_row, g_char* b_c, const uint32_t b_stride,
                                            uint32_t* off, uint32_t& a_off, const LanePlan<bits>& lp,
@@ -400,9 +454,12 @@ __device__ __forceinline__ constexpr int tiles_u()
 // The core: M rows x T adjacent 16-column tiles over nk k16-tiles. A: rows at byte offsets a_row[r] from A (LDS or
 // global, f16, rotated basis); B: the matrix's first tile of this k-range / column range, b_stride bytes between
 // k-tiles. out[t * M + r] = row r, column lane of tile t (lanes 0-15). All arguments but lane are wave-uniform.
-template <int bits, int cb, int M, bool A_LDS, int T>
+// PI > 0 (package F): the first PI k-tiles' words were loaded by the caller (pre; issued before the input rotation so
+// their DRAM latency overlaps it) and are consumed first; the loop then starts at k-tile PI.
+template <int bits, int cb, int M, bool A_LDS, int T, int PI = 0>
 __device__ __forceinline__ void dot_tiles(const half* A, const uint32_t* a_row_in, const uint16_t* B, uint32_t b_stride,
-                                          const int lane, const int nk, float* out)
+                                          const int lane, const int nk, float* out,
+                                          const uint32_t (*pre)[T][LanePlan<bits>::R] = nullptr)
 {
     constexpr int U = tiles_u<bits, M, T>();
     A = uni_ptr(A);
@@ -426,6 +483,14 @@ __device__ __forceinline__ void dot_tiles(const half* A, const uint32_t* a_row_i
     g_char* b_c = (g_char*) (const char*) B;
     const char* a_c = (const char*) A;
     int k = 0;
+    #pragma unroll
+    for (int p = 0; p < PI; ++p)
+    {
+        dot_regs<bits, cb, M, T>(a_c, a_row, a_off, pre[p], lp, accA, accB);
+        b_c += b_stride_u;
+        a_c += 32;
+    }
+    k = PI;
     if constexpr (U > 1)
     {
         for (; k + U <= nk_u; k += U)
@@ -528,9 +593,81 @@ struct Args
 {
     Grp g[MAXG];
     int ng;
+    unsigned long long* tr;   // R9K_GEMV_TRACE builds: per-block phase stamps [block][TRS] (wall_clock64, 100 MHz)
 };
 
+// Phase trace (compile with -DR9K_GEMV_TRACE; r9k_exl3_gemv_trace sets the buffer): stamp i of this block by thread 0.
+constexpr int TRS = 8;
+#ifdef R9K_GEMV_TRACE
+#define TR(i) do { if (a.tr && threadIdx.x == 0) a.tr[(size_t) blockIdx.x * TRS + (i)] = wall_clock64(); } while (0)
+#else
+#define TR(i) do { } while (0)
+#endif
+
 // Step 1 for rows 0..m-1 of the block's input chunk [k0, k0 + 128 segs): one wave a (row, 128-block), four tasks a
+// wave in flight (their global loads go out together), into LDS rows of xl halves. Split in two so a kernel can issue
+// its first trellis loads between the input loads of the first batch (rot_load) and their use (rot_store): the DRAM
+// latency of the first tiles then overlaps the input's L2 round trip and the Hadamard instead of following them.
+constexpr int B4 = 4;
+struct RotBatch { float v[B4][4], s[B4][4]; };
+
+__device__ __forceinline__ void rot_load(const Grp& g, RotBatch& rb, const int k0, const int segs, const int t0,
+                                         const int lane, const int nwaves)
+{
+    const int ntask = g.m * segs;
+    #pragma unroll
+    for (int j = 0; j < B4; ++j)
+    {
+        const int task = t0 + j * nwaves;
+        if (task >= ntask) break;
+        const int r = task / segs, seg = task % segs;
+        const int kk = k0 + seg * 128 + lane * 4;
+        if (g.xm == 0)
+        {
+            const uint2 u = *(const uint2*) ((const uint16_t*) g.x + (size_t) r * g.xs + kk);
+            rb.v[j][0] = bf16_f(u.x & 0xffff); rb.v[j][1] = bf16_f(u.x >> 16);
+            rb.v[j][2] = bf16_f(u.y & 0xffff); rb.v[j][3] = bf16_f(u.y >> 16);
+        }
+        else ld_h4((const half*) g.x + (size_t) r * g.xs + kk, rb.v[j]);
+        if (g.xm != 2) ld_h4(g.suh + kk, rb.s[j]);
+    }
+}
+
+__device__ __forceinline__ void rot_store(const Grp& g, RotBatch& rb, half* sh_x, const int xl, const int segs,
+                                          const int t0, const int lane, const int nwaves)
+{
+    const int ntask = g.m * segs;
+    #pragma unroll
+    for (int j = 0; j < B4; ++j)
+    {
+        const int task = t0 + j * nwaves;
+        if (task >= ntask) break;
+        const int r = task / segs, seg = task % segs;
+        if (g.xm != 2)
+        {
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) rb.v[j][i] *= rb.s[j][i];
+            had128(rb.v[j], lane);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) rb.v[j][i] *= RS128;
+        }
+        st_h4(sh_x + (size_t) r * xl + seg * 128 + lane * 4, rb.v[j]);
+    }
+}
+
+// the batches after the first (only when m x segs > B4 x waves)
+__device__ __forceinline__ void rotate_rest(const Grp& g, half* sh_x, const int xl, const int k0, const int segs,
+                                            const int wave, const int lane, const int nwaves)
+{
+    for (int t0 = wave + nwaves * B4; t0 < g.m * segs; t0 += nwaves * B4)
+    {
+        RotBatch rb;
+        rot_load(g, rb, k0, segs, t0, lane, nwaves);
+        rot_store(g, rb, sh_x, xl, segs, t0, lane, nwaves);
+    }
+}
+
+// Package D's step 1 (WMMA blocks): rows 0..m-1 of the block's input chunk [k0, k0 + 128 segs): one wave a (row, 128-block), four tasks a
 // wave in flight (their global loads go out together), into LDS rows of xl halves.
 __device__ __forceinline__ void rotate_in(const Grp& g, half* sh_x, const int xl, const int k0, const int segs,
                                           const int wave, const int lane, const int nwaves)
@@ -575,10 +712,10 @@ __device__ __forceinline__ void rotate_in(const Grp& g, half* sh_x, const int xl
     }
 }
 
-// The last arriver's epilogue for output tile nb: per row (rows wave, wave + nwaves, ...), the ks partials summed in
+// Package D's epilogue, unchanged (WMMA blocks and fdot row tiles above R9K_GEMV_FSPLIT_M): for output tile nb, per row (rows wave, wave + nwaves, ...), the ks partials summed in
 // chunk order, the output Hadamard, svh, the store in the group's dtype. A wave works on four rows at once and issues
 // their partial loads four chunks at a time (a serial chain of ks L2 round trips per row was the tail of every launch).
-__device__ __forceinline__ void finish(const Grp& g, const int nb, const int wave, const int lane, const int nwaves)
+__device__ __forceinline__ void finish_rows(const Grp& g, const int nb, const int wave, const int lane, const int nwaves)
 {
     constexpr int RR = 4, QB = 4;
     const int m = g.m, n = g.n, ks = g.ks;
@@ -626,11 +763,129 @@ __device__ __forceinline__ void finish(const Grp& g, const int nb, const int wav
     }
 }
 
+// A workgroup barrier for LDS only. __syncthreads() is a workgroup-scope release / acquire fence + s_barrier, and on
+// gfx12 (WGP mode) that fence waits for every outstanding global load of the wave (s_wait_loadcnt 0): trellis words
+// issued before the barrier would be waited for at it, which defeats issuing them early. Here only the LDS stores are
+// waited for (s_wait_dscnt 0) before the barrier; global loads stay in flight across it (package F).
+__device__ __forceinline__ void bar_lds()
+{
+    asm volatile ("s_wait_dscnt 0x0" ::: "memory");
+    __builtin_amdgcn_s_barrier();
+    asm volatile ("" ::: "memory");
+}
+
+// The last arriver's epilogue for output tile nb: the ks partials of each row summed in chunk order, the output
+// Hadamard, svh, the store in the group's dtype. Every load of a wave's share goes out at once (QB chunks of two tasks),
+// so the epilogue is one L2 round trip, not ks / 4 of them. With red (an LDS scratch of 8 x 128 floats; fdot blocks)
+// and few rows, a row's chunks are cut into S contiguous slices summed by different waves, then the slices in order by
+// the row's wave: m = 1 spreads its 20-40 partials over all waves instead of leaving three idle. The partition depends
+// only on (m, ks, nwaves): deterministic.
+__device__ __forceinline__ void finish(const Grp& g, const int nb, const int wave, const int lane, const int nwaves,
+                                       float* red, unsigned long long* trp = nullptr, const uint2* svp = nullptr)
+{
+    constexpr int QB = R9K_GEMV_QB, TW = 2;  // chunks a task in flight, tasks a wave in flight
+    const int m = g.m, n = g.n, ks = g.ks;
+    const int col = nb * 128 + lane * 4;
+    const size_t qs = (size_t) m * n;
+    int S = 1;
+    if (red && m * 2 <= nwaves * 2) { S = (nwaves * 2) / m; S = S < ks ? S : ks; }
+    const int ntask = m * S;
+    float sv[4];
+    if (svp)          // svh loaded by the caller at kernel start (off the epilogue's dependent chain)
+    {
+        h2 a0 = as_h2(svp->x), a1 = as_h2(svp->y);
+        sv[0] = (float) a0.x; sv[1] = (float) a0.y; sv[2] = (float) a1.x; sv[3] = (float) a1.y;
+    }
+    else ld_h4(g.svh + col, sv);
+    for (int t0 = wave; t0 < ntask; t0 += nwaves * TW)
+    {
+        float v[TW][4];
+        int q_lo[TW], q_hi[TW], row[TW];
+        #pragma unroll
+        for (int i = 0; i < TW; ++i)
+        {
+            const int t = t0 + i * nwaves;
+            const int r = t / S, s = t % S;
+            row[i] = t < ntask ? r : -1;
+            q_lo[i] = s * ks / S;
+            q_hi[i] = (s + 1) * ks / S;
+            v[i][0] = v[i][1] = v[i][2] = v[i][3] = 0.0f;
+        }
+        int span = 0;
+        #pragma unroll
+        for (int i = 0; i < TW; ++i) span = (row[i] >= 0 && q_hi[i] - q_lo[i] > span) ? q_hi[i] - q_lo[i] : span;
+        for (int q0 = 0; q0 < span; q0 += QB)
+        {
+            f4 p[TW][QB];
+            // unconditional loads (an invalid slot reads chunk 0 of row 0 and is not added): no branch between them,
+            // so they all go out before the first wait
+            #pragma unroll
+            for (int i = 0; i < TW; ++i)
+                #pragma unroll
+                for (int j = 0; j < QB; ++j)
+                {
+                    const bool ok = row[i] >= 0 && q_lo[i] + q0 + j < q_hi[i];
+                    const size_t o = ok ? (size_t) row[i] * n + (size_t) (q_lo[i] + q0 + j) * qs : 0;
+                    p[i][j] = __builtin_nontemporal_load((const f4*) (g.part + o + col));
+                }
+            #pragma unroll
+            for (int i = 0; i < TW; ++i)
+                #pragma unroll
+                for (int j = 0; j < QB; ++j)
+                {
+                    const bool ok = row[i] >= 0 && q_lo[i] + q0 + j < q_hi[i];
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) v[i][e] += ok ? p[i][j][e] : 0.0f;
+                }
+        }
+#ifdef R9K_GEMV_TRACE
+        if (trp && threadIdx.x == 0 && t0 == 0) trp[7] = wall_clock64();     // first partials summed
+#endif
+        #pragma unroll
+        for (int i = 0; i < TW; ++i)
+        {
+            if (row[i] < 0) break;
+            if (S > 1) { *(f4*) (red + (t0 + i * nwaves) * 128 + lane * 4) = f4{v[i][0], v[i][1], v[i][2], v[i][3]}; continue; }
+            const int r = row[i];
+            had128(v[i], lane);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) v[i][e] *= RS128 * sv[e];
+            if (g.ym == 2) *(f4*) ((float*) g.y + (size_t) r * g.ys + col) = f4{v[i][0], v[i][1], v[i][2], v[i][3]};
+            else if (g.ym == 1) st_h4((half*) g.y + (size_t) r * g.ys + col, v[i]);
+            else
+                *(uint2*) ((uint16_t*) g.y + (size_t) r * g.ys + col) =
+                    make_uint2(f_bf16(v[i][0]) | (f_bf16(v[i][1]) << 16), f_bf16(v[i][2]) | (f_bf16(v[i][3]) << 16));
+        }
+    }
+    if (S == 1) return;
+    bar_lds();
+    for (int r = wave; r < m; r += nwaves)
+    {
+        float v[4];
+        const f4 h = *(const f4*) (red + (r * S) * 128 + lane * 4);
+        v[0] = h[0]; v[1] = h[1]; v[2] = h[2]; v[3] = h[3];
+        for (int s = 1; s < S; ++s)
+        {
+            const f4 u = *(const f4*) (red + (r * S + s) * 128 + lane * 4);
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) v[e] += u[e];
+        }
+        had128(v, lane);
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) v[e] *= RS128 * sv[e];
+        if (g.ym == 2) *(f4*) ((float*) g.y + (size_t) r * g.ys + col) = f4{v[0], v[1], v[2], v[3]};
+        else if (g.ym == 1) st_h4((half*) g.y + (size_t) r * g.ys + col, v);
+        else
+            *(uint2*) ((uint16_t*) g.y + (size_t) r * g.ys + col) =
+                make_uint2(f_bf16(v[0]) | (f_bf16(v[1]) << 16), f_bf16(v[2]) | (f_bf16(v[3]) << 16));
+    }
+}
+
 template <int bits, int cb, int M>
 __global__ __launch_bounds__(WAVES * 32) void k_gemv(const Args a)
 {
     extern __shared__ __align__(16) char smem[];
-    half* sh_x = (half*) smem;                      // [m][kc] rotated input chunk
+    half* sh_x = (half*) smem;                      // [m][kc] rotated input chunk; later the epilogue's slice sums
     __shared__ int s_last;
     const int wave = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int b = blockIdx.x;
@@ -641,23 +896,54 @@ __global__ __launch_bounds__(WAVES * 32) void k_gemv(const Args a)
     const int m = g.m, n = g.n, ks = g.ks, kc = g.kc;
     const int lb = b - g.blk0, nb = lb / ks, kq = lb % ks;
     const int k0 = kq * kc, segs = kc / 128;
+    TR(0);
 
-    // 1. input chunk -> LDS (one wave a (row, 128-block))
-    rotate_in(g, sh_x, kc, k0, segs, wave, lane, WAVES);
-    __syncthreads();
-
-    // 2. dot: column wave cw takes tiles nb*8 + cw*TPW .., k-wave kw the kw-th part of the chunk
+    // the dot's operands: column wave cw takes tiles nb*8 + cw*TPW .., k-wave kw the kw-th part of the chunk
+    constexpr int T = TPW;
+    constexpr int R = LanePlan<bits>::R;
+    constexpr int PI = R9K_GEMV_PI < 8 / KW ? R9K_GEMV_PI : 8 / KW;   // k-tiles issued before the rotation (nk >= 8/KW)
+    constexpr int tile_bytes = 32 * bits;
+    constexpr int tile_u16 = 16 * bits;
     const int cw = wave % CW, kw = wave / CW;
     const int kcw = kc / KW;
-    const int tile0 = nb * 8 + cw * TPW;
-    constexpr int tile_u16 = 16 * bits;
+    const int tile0 = nb * 8 + cw * T;
     const int n_tiles = n / 16;
     const uint16_t* B = g.tr + ((size_t) ((k0 + kw * kcw) / 16) * n_tiles + tile0) * tile_u16;
+
+    // 1a. the first batch of input loads, svh (for the epilogue, if this block runs it), then the first PI k-tiles of
+    // trellis: their DRAM latency overlaps the input's round trip and the Hadamard instead of following them
+    RotBatch rb;
+    rot_load(g, rb, k0, segs, wave, lane, WAVES);
+    const uint2 svr = *(const uint2*) (g.svh + nb * 128 + lane * 4);
+    uint32_t pre[PI > 0 ? PI : 1][T][R];
+    if constexpr (PI > 0)
+    {
+        const LanePlan<bits> lp = lane_plan<bits>(lane);
+        g_char* b_c = (g_char*) (const char*) uni_ptr(B);
+        const uint32_t kstride = (uint32_t) uni((int) ((uint32_t) n_tiles * tile_bytes));
+        #pragma unroll
+        for (int p = 0; p < PI; ++p)
+        {
+            g_char* bq = uni_ptr(b_c + p * kstride);
+            #pragma unroll
+            for (int t = 0; t < T; ++t)
+                #pragma unroll
+                for (int i = 0; i < R; ++i) pre[p][t][i] = ld_g(bq + t * tile_bytes, lp.off[i]);
+        }
+    }
+    // 1b. rotate into LDS
+    rot_store(g, rb, sh_x, kc, segs, wave, lane, WAVES);
+    rotate_rest(g, sh_x, kc, k0, segs, wave, lane, WAVES);
+    bar_lds();
+    TR(1);
+
+    // 2. stream the chunk
     uint32_t a_row[M];
     #pragma unroll
     for (int r = 0; r < M; ++r) a_row[r] = (uint32_t) (((r < m ? r : m - 1) * kc + kw * kcw) * 2);
     float out[TPW * M];
-    dot_tiles<bits, cb, M, true, TPW>(sh_x, a_row, B, (uint32_t) n_tiles * tile_u16 * 2, lane, kcw / 16, out);
+    dot_tiles<bits, cb, M, true, TPW, PI>(sh_x, a_row, B, (uint32_t) n_tiles * tile_u16 * 2, lane, kcw / 16, out, pre);
+    TR(2);
 
     if constexpr (KW > 1)
     {
@@ -681,13 +967,27 @@ __global__ __launch_bounds__(WAVES * 32) void k_gemv(const Args a)
     // 3. last arriver of the output tile: chunk-ordered sum, output Hadamard, svh, store
     __threadfence();
     __syncthreads();
+    TR(3);
     int* c = g.ctr + nb;
     if (threadIdx.x == 0) s_last = atomicAdd(c, 1) == ks - 1;
     __syncthreads();
+    TR(4);
     if (!s_last) return;
     __threadfence();
     if (threadIdx.x == 0) *c = 0;
-    finish(g, nb, wave, lane, WAVES);
+    TR(6);
+    // M <= FSPLIT_M: the split epilogue (all waves on a row's chunks, svh preloaded); wider row tiles keep package D's
+    // row-per-wave epilogue, which measured faster there (6-8 rows: 16.5 vs 17.3-18.2 us on wq_b)
+    if constexpr (M <= R9K_GEMV_FSPLIT_M)
+    {
+#ifdef R9K_GEMV_TRACE
+        finish(g, nb, wave, lane, WAVES, FSPLIT ? (float*) smem : nullptr, a.tr ? a.tr + (size_t) blockIdx.x * TRS : nullptr, &svr);
+#else
+        finish(g, nb, wave, lane, WAVES, FSPLIT ? (float*) smem : nullptr, nullptr, &svr);
+#endif
+    }
+    else finish_rows(g, nb, wave, lane, WAVES);
+    TR(5);
 }
 
 // Rows 9..48: the same blocks, but the dot runs on WMMA (v_wmma_f32_16x16x16_f16, gfx12 operand layout: A lane L =
@@ -809,7 +1109,7 @@ __global__ __launch_bounds__(CW * NB2 * 32) void k_gemv_mma(const Args a)
     if (!s_last) return;
     __threadfence();
     if (threadIdx.x == 0) *c = 0;
-    finish(g, nb, cw, lane, CW);
+    finish_rows(g, nb, cw, lane, CW);
 }
 
 template <int bits, int cb>
@@ -876,6 +1176,20 @@ int launch_k(int K, int M, int mma, const Args& a, int nblk, size_t sm, hipStrea
 
 }  // namespace
 
+static unsigned long long* s_trace = nullptr;
+// R9K_GEMV_TRACE builds: per-block phase stamps into buf (u64 [blocks][8]) from the next launch on; 0 turns it off.
+// Returns 0, or -1 in a build without the trace.
+extern "C" int r9k_exl3_gemv_trace(long buf)
+{
+#ifdef R9K_GEMV_TRACE
+    s_trace = (unsigned long long*) buf;
+    return 0;
+#else
+    (void) buf;
+    return -1;
+#endif
+}
+
 extern "C" int r9k_exl3_gemv_max_groups(void) { return MAXG; }
 extern "C" int r9k_exl3_gemv_max_rows(void) { return MAXM; }
 extern "C" int r9k_exl3_gemv_max_rows_mma(void) { return MAXM_MMA; }
@@ -895,6 +1209,7 @@ extern "C" int r9k_exl3_gemv(const long* desc, int ng, int M, int K, int cb, int
     if (cb != 1 && cb != 2) return -2;
     Args a;
     a.ng = ng;
+    a.tr = s_trace;
     long poff = 0;
     int coff = 0, nblk = 0;
     size_t sm = 0;
@@ -922,7 +1237,11 @@ extern "C" int r9k_exl3_gemv(const long* desc, int ng, int M, int K, int cb, int
     }
     if (poff > part_floats || coff > ctr_ints) return -3;
     if (KW > 1 && !mma) sm += (size_t) (KW - 1) * CW * TPW * M * 16 * sizeof(float);
-    if (sm > (mma ? 56 * 1024 : 64 * 1024)) return -1;
+    if (!mma && sm < 8 * 128 * sizeof(float)) sm = 8 * 128 * sizeof(float);   // finish's slice sums alias sh_x
+    // WMMA blocks also hold the static transpose buffers (s_b: CW * NB2 waves x TPW tiles x 16 x TB halves); the sum
+    // must fit the 64 KiB of a workgroup (NB2 = 4 with a 49 KiB chunk was an invalid-allocation abort before package F)
+    const size_t st_lds = mma ? (size_t) CW * mma * TPW * 16 * TB * sizeof(_Float16) + 64 : 64;
+    if (sm + st_lds > 64 * 1024) return -1;
     hipStream_t st = (hipStream_t) stream;
     return cb == 2 ? launch_k<2>(K, M, mma, a, nblk, sm, st) : launch_k<1>(K, M, mma, a, nblk, sm, st);
 }

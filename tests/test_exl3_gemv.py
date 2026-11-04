@@ -20,6 +20,7 @@
 Run (VM100, card 7): ~/ds41/exl3/gpu-run.sh 7 python3 tests/test_exl3_gemv.py   (R9K_GEMV_LIB / R9K_LIB = a libr9k.so with
 r9k_exl3_gemv; ONLY=dq,num,real,apply,graph,bench selects parts; EXL3_REAL=/ds41/exl3/D4/real-attn.safetensors)
 """
+import ctypes
 import os
 import sys
 import time
@@ -407,6 +408,79 @@ def bench_layer():
     return res
 
 
+# --------------------------------------------------------------------------------------------------------- 6. trace
+PH = ("start", "rotated", "streamed", "partials", "counter", "epilogue", "fence/1st", "partials in")
+
+
+def trace_launch(name, parts, m, reps=7):
+    """One cold launch (Infinity Cache flushed) with the per-block phase stamps of a -DR9K_GEMV_TRACE build: the timeline
+    relative to the first block's start, medians over reps, in us (wall_clock64 = 100 MHz)."""
+    L = G.lib()
+    L.r9k_exl3_gemv_trace.restype = ctypes.c_int
+    L.r9k_exl3_gemv_trace.argtypes = [ctypes.c_long]
+    k = parts[0].trellis.shape[0] * 16
+    plan = G.Exl3GemvPlan(parts, k)
+    plan.reserve(48)
+    nblk = 0
+    for K, cb, M, mma, desc, gs, *_ in plan.launches(m):
+        for gi, (j, r0, rows) in enumerate(gs):
+            p = plan.parts[j]
+            nb2 = max(1, mma)
+            nblk += p.n // 128 // nb2 * desc[gi * G._NDESC + 10]
+    tr = torch.zeros((nblk, 8), dtype=torch.int64, device=DEV)
+    if L.r9k_exl3_gemv_trace(tr.data_ptr()) != 0:
+        print("  (library built without -DR9K_GEMV_TRACE: no trace)")
+        return None
+    flush = torch.ones(64 * 2**20, dtype=torch.float32, device=DEV)      # 256 MB > the 64 MB Infinity Cache, read
+                                                                         # (a write flush leaves dirty lines behind)
+    x = torch.randn((m, k), device=DEV).to(BF)
+    y = torch.empty((m, plan.n_total), dtype=BF, device=DEV)
+    G.r9k_exl3_gemv(plan, x, y)
+    rows = []
+    walls = []
+    for _ in range(reps):
+        tr.zero_()
+        flush.sum()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        torch.cuda.synchronize()
+        e0.record()
+        G.r9k_exl3_gemv(plan, x, y)
+        e1.record()
+        torch.cuda.synchronize()
+        walls.append(e0.elapsed_time(e1) * 1e3)
+        t = tr.cpu().double()
+        t0 = t[:, 0].min()
+        rel = (t - t0) / 100.0                    # us
+        rel[t == 0] = float("nan")
+        rows.append(rel)
+    L.r9k_exl3_gemv_trace(0)
+    R = torch.stack(rows)                         # [reps, blocks, 8]
+    med = R.nanmedian(0).values                   # per block per stamp
+    def q(col, f):
+        v = med[:, col]
+        v = v[~torch.isnan(v)]
+        return float("nan") if v.numel() == 0 else float(f(v))
+    print(f"  {name} M={m}: {nblk} blocks, event wall {sorted(walls)[len(walls) // 2]:.1f} us (cold, eager)")
+    print(f"    {'stamp':10s} {'first':>7s} {'median':>7s} {'last':>7s}   (us from the first block's start; per-block "
+          f"median over {reps} cold launches)")
+    for i, nm in enumerate(PH):
+        print(f"    {nm:10s} {q(i, torch.min):7.2f} {q(i, torch.median):7.2f} {q(i, torch.max):7.2f}")
+    d = lambda a_, b_: med[:, b_] - med[:, a_]
+    for nm, a_, b_ in (("rotation", 0, 1), ("stream", 1, 2), ("partials+fence", 2, 3), ("counter", 3, 4),
+                       ("epi: fence", 4, 6), ("epi: loads", 6, 7), ("epi: had+store", 7, 5), ("epilogue", 4, 5)):
+        v = d(a_, b_)
+        v = v[~torch.isnan(v)]
+        if v.numel():
+            print(f"    phase {nm:16s} median {v.median().item():6.2f}  max {v.max().item():6.2f} us")
+    return med
+
+
+def graph_floor():
+    """us a graph node for an empty-ish kernel (the per-launch floor every number in the bench includes)."""
+    xs = [torch.zeros(64, device=DEV) for _ in range(12)]
+    return graph_us([lambda t=t: t.add_(1.0) for t in xs], iters=50)
+
+
 if __name__ == "__main__":
     print("device", torch.cuda.get_device_name(), "| lib", os.environ.get("R9K_GEMV_LIB") or os.environ.get("R9K_LIB"),
           "| waves a block", G.lib().r9k_exl3_gemv_waves(), "| blocks target", G.BLOCKS, flush=True)
@@ -444,6 +518,17 @@ if __name__ == "__main__":
         check_graph([[syn["wq_a K5"], syn["wkv K5"]], [syn["wq_b K5"]], [syn["wo_a K5"]], [syn["wo_b K6"]]])
     del syn
     torch.cuda.empty_cache()
+    if want("trace"):
+        print(f"-- per-phase trace of one launch (graph node floor: {graph_floor():.2f} us a tiny kernel)")
+        real = real or real_parts()
+        TS = os.environ.get("R9K_TEST_TRACE_M", "1")
+        for mm in (int(v) for v in TS.split(",")):
+            if "layers.39.attn.wq_a" in real:
+                q1 = real["layers.39.attn.wkv"]
+                q1 = E.Exl3Part(q1.trellis, q1.suh, q1.svh, q1.K, q1.mcg, q1.mul1, 1280, q1.n)
+                trace_launch("fused_wqa_wkv (layers.39, K5)", [real["layers.39.attn.wq_a"], q1], mm)
+                trace_launch("wq_b (layers.0, K5)", [real["layers.0.attn.wq_b"]], mm)
+                trace_launch("wo_b (layers.0, K5)", [real["layers.0.attn.wo_b"]], mm)
     if want("bench"):
         print(f"-- timing: graph replay over a ring of {RING} matrices a shape, us a call (GB/s of trellis, ours)")
         bench_shapes()

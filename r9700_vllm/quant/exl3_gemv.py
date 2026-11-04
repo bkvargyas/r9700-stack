@@ -26,8 +26,9 @@ partials and arrival counters are one scratch set per device (the EXL3 layers al
 
 Knobs: R9K_EXL3_GEMV_BLOCKS (workgroups a matrix aims for, default 192), R9K_EXL3_GEMV_KS (force the input-chunk count;
 diagnostic), R9K_EXL3_GEMV_MMA_FROM (rows from which WMMA runs), R9K_EXL3_GEMV_MMA_ROWS (rows a WMMA group, <= 48),
-R9K_EXL3_GEMV_NB2 (128-column tiles a WMMA block, 1 / 2 / 4; default 2), R9K_EXL3_GEMV_ROWS (rows an fdot group, <= 16),
-R9K_EXL3_GEMV_ODD_M (row ceiling of plans whose tiles do not pair up). Library: R9K_GEMV_LIB, else R9K_LIB, else
+R9K_EXL3_GEMV_NB2 (128-column tiles a WMMA block, 1 / 2 / 4; default 2, 4 for k >= 8192), R9K_EXL3_GEMV_ROWS (rows an fdot group, <= 16),
+R9K_EXL3_GEMV_ODD_M (row ceiling of plans whose tiles do not pair up), R9K_EXL3_GEMV_SHARED_KS (1: the groups of a
+launch share one input-chunk count sized on the launch's total tiles -- package F; 0: per matrix, v0.4.1). Library: R9K_GEMV_LIB, else R9K_LIB, else
 kernels/libr9k.so.
 """
 from __future__ import annotations
@@ -46,9 +47,17 @@ ROWS = int(os.environ.get("R9K_EXL3_GEMV_ROWS", 16))     # max rows a group (row
 MMA_FROM = int(os.environ.get("R9K_EXL3_GEMV_MMA_FROM", 9))   # rows from which the WMMA form runs (up to 48 a group)
 MMA_ROWS = int(os.environ.get("R9K_EXL3_GEMV_MMA_ROWS", 48))   # max rows a WMMA group (16 / 32 / 48)
 ODD_M = int(os.environ.get("R9K_EXL3_GEMV_ODD_M", 16))  # max rows for plans with an odd 128-tile count (see max_m)
-NB2 = int(os.environ.get("R9K_EXL3_GEMV_NB2", 0))   # WMMA blocks: 128-column tiles sharing one input rotation (0 = auto: 2)
+SHARED_KS = int(os.environ.get("R9K_EXL3_GEMV_SHARED_KS", 1))   # one chunk size a launch, sized on its total tiles
+NB2 = int(os.environ.get("R9K_EXL3_GEMV_NB2", 0))   # WMMA blocks: 128-column tiles sharing one input rotation (0 = auto: 2, 4 for k >= 8192)
 _LDS = 48 * 1024        # rotated-input chunk a block: M rows x kc halves
-_LDS_MMA = 50 * 1024    # WMMA form: 16-row tiles x (kc + 8) halves (+ 6 KiB of static transpose buffers)
+_LDS_MMA = 50 * 1024    # WMMA form: 16-row tiles x (kc + 8) halves, at nb2 <= 2 (+ 6 KiB of static transpose buffers
+                        # a 128-column tile: 12 KiB at nb2 = 2, 24 KiB at 4 -- the dynamic budget shrinks with nb2 so the
+                        # sum stays under the 64 KiB a workgroup; NB2 = 4 on main_proj asked for 49 + 24 KiB and the
+                        # launch died with HSA_STATUS_ERROR_INVALID_ALLOCATION, exit 139 -- package F)
+
+
+def _lds_mma(nb2: int) -> int:
+    return min(_LDS_MMA, 63 * 1024 - nb2 * 6 * 1024)
 _XM = {torch.bfloat16: 0, torch.float16: 1}
 _YM = {torch.bfloat16: 0, torch.float16: 1, torch.float32: 2}
 
@@ -81,13 +90,16 @@ def available() -> bool:
         return False
 
 
-def ks_for(k: int, n: int, m: int, row_groups: int = 1, mma: bool = False, nb2: int = 1) -> int:
-    """Input chunks a matrix is split into: enough workgroups to stream it ((n/128) * ks * row_groups >= BLOCKS), chunk a
-    128-multiple whose m x kc f16 rows (WMMA: 16-row tiles, padded rows) fit the LDS budget."""
-    segs, tiles = k // 128, n // 128 // nb2 * row_groups
+def ks_for(k: int, n: int, m: int, row_groups: int = 1, mma: bool = False, nb2: int = 1, tiles: int = 0) -> int:
+    """Input chunks a matrix is split into: enough workgroups to stream it ((n/128) * ks * row_groups >= BLOCKS; with
+    tiles, the block tiles of the whole launch, so the groups of one launch share one chunk size and the launch, not
+    each matrix, aims for BLOCKS), chunk a 128-multiple whose m x kc f16 rows (WMMA: 16-row tiles, padded rows) fit the
+    LDS budget."""
+    segs = k // 128
+    tiles = tiles or n // 128 // nb2 * row_groups
 
     def lds(kc):
-        return (-(-m // 16) * 16 * (kc + 8) * 2 <= _LDS_MMA) if mma else m * kc * 2 <= _LDS
+        return (-(-m // 16) * 16 * (kc + 8) * 2 <= _lds_mma(nb2)) if mma else m * kc * 2 <= _LDS
     good = [d for d in range(1, segs + 1) if segs % d == 0 and lds(k // d)]
     if FORCE_KS and FORCE_KS in good:
         return FORCE_KS
@@ -164,7 +176,9 @@ class Exl3GemvPlan:
         ngr = -(-m // cap)                          # row groups, rows spread evenly
         M = -(-m // ngr)
         if mma:
-            want = NB2 or 2                         # 2 measured best (4: no better, 1: -25 % at 48 rows)
+            # 2 on the attention shapes (4: 0-7 % slower, 1: -25 % at 48 rows); 4 on the long-input main_proj (15360 ->
+            # 5120: 245 / 285 / 404 -> 180 / 221 / 298 us at 16 / 24 / 48 rows; package F, once its LDS sizing was fixed)
+            want = NB2 or (4 if self.k >= 8192 else 2)
             mma = next(v for v in (4, 2, 1) if v <= want and all(p.n // 128 % v == 0 for p in self.parts))
         buckets: dict[tuple[int, int], list] = {}
         for j, p in enumerate(self.parts):
@@ -176,9 +190,11 @@ class Exl3GemvPlan:
                 gs = groups[i:i + maxg]
                 desc = (ctypes.c_long * (_NDESC * len(gs)))()
                 floats = ints = 0
+                nb2 = max(1, mma)
+                tiles = sum(self.parts[j].n // 128 // nb2 for j, _, _ in gs) if SHARED_KS else 0
                 for gi, (j, r0, rows) in enumerate(gs):
                     p = self.parts[j]
-                    ks = ks_for(self.k, p.n, M, ngr, bool(mma), max(1, mma))
+                    ks = ks_for(self.k, p.n, M, ngr, bool(mma), nb2, tiles)
                     d = gi * _NDESC
                     desc[d + 0], desc[d + 1], desc[d + 2] = p.trellis.data_ptr(), p.suh.data_ptr(), p.svh.data_ptr()
                     desc[d + 5], desc[d + 6], desc[d + 7], desc[d + 10] = self.k, p.n, rows, ks
