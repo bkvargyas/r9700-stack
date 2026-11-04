@@ -1,25 +1,27 @@
 #!/bin/bash
 # zrun.sh TAG PROFCFG STREAMS:WINDOW [STREAMS:WINDOW ...]   (VM100; package Z, notes/exl3-ledger.md)
-# One ledger launch: relaunch the DeepSeek server "ds41" from the pristine v0.4.0 copy ~/r9700-exl3-Z with the caller's env
+# One ledger launch: relaunch the DeepSeek server "ds41" from a pristine tree (git archive of a tag; ZTREE) with the caller's env
 # (EAGER, NSEQ, ADAPTIVE, KVMEM, ...), torch profiler on (PROFCFG = graph | eager: eager adds Python stacks + shapes |
 # cuda: GPU activity only, for the wall-clock split without the profiler's CPU overhead),
 # VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 (stock's "gpu_model_runner: forward / sample / draft / ..." annotations), WARM=1;
 # then for each STREAMS:WINDOW run workload.py (timing window, then profile window) and file the rank traces under
-# ~/ds41/exl3/Z/TAG/sN/. Holds ~/gpu-exclusive (created if absent). Leaves the server up (the caller stops it).
+# $ZOUT/TAG/sN/. Holds ~/gpu-exclusive (created if absent). Leaves the server up (the caller stops it).
+# ZTREE (default ~/r9700-exl3-Z, v0.4.0), ZOUT (default ~/ds41/exl3/Z), ZLOCK (the lock's package word, default Z):
+# package Z2 (v0.4.1) runs ZTREE=~/r9700-exl3-Z2 ZOUT=~/ds41/exl3/Z2 ZLOCK=Z2.
 TAG=$1; PC=$2; shift 2
-Z=~/ds41/exl3/Z; D=$Z/$TAG; mkdir -p $D/prof
+Z=${ZOUT:-$HOME/ds41/exl3/Z}; ZT=${ZTREE:-$HOME/r9700-exl3-Z}; ZL=${ZLOCK:-Z}; D=$Z/$TAG; mkdir -p $D/prof
 log() { echo "[$(date -u "+%H:%M:%S")] $*" | tee -a $D/run.log; }
-if [ -e ~/gpu-exclusive ] && ! grep -q "^Z " ~/gpu-exclusive; then log "lock held by someone else: $(cat ~/gpu-exclusive)"; exit 1; fi
-[ -e ~/gpu-exclusive ] || echo "Z step-ledger profiling $(date -u +%H:%M)" > ~/gpu-exclusive
+if [ -e ~/gpu-exclusive ] && ! grep -q "^$ZL " ~/gpu-exclusive; then log "lock held by someone else: $(cat ~/gpu-exclusive)"; exit 1; fi
+[ -e ~/gpu-exclusive ] || echo "$ZL step-ledger profiling $(date -u +%H:%M)" > ~/gpu-exclusive
 bash ~/gpu-offset.sh -500 | tee -a $D/run.log
 if [ "$PC" = eager ]; then ST=true; SH=true; else ST=false; SH=false; fi
 ACT=; [ "$PC" = cuda ] && ACT='"torch_profiler_activities":["CUDA"],'   # GPU activity only: no CPU-side profiler overhead
 PCFG="--profiler-config {\"profiler\":\"torch\",\"torch_profiler_dir\":\"/prof\",$ACT\"torch_profiler_with_stack\":$ST,\"torch_profiler_record_shapes\":$SH,\"torch_profiler_use_gzip\":false,\"torch_profiler_dump_cuda_time_total\":false,\"ignore_frontend\":true}"
 sudo docker rm -f ds41 >/dev/null 2>&1
 log "launch $TAG: EAGER=${EAGER-0} NSEQ=${NSEQ-4} ADAPTIVE=${ADAPTIVE-true} KVMEM=${KVMEM-1.7} DSPARK_K=${DSPARK_K-5} prof=$PC"
-cd ~/r9700-exl3-Z || exit 1
+cd $ZT || exit 1
 t0=$(date +%s)
-VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 KVMEM=${KVMEM-1.7} NAME=ds41 WARM=0 DOCKER_ARGS="-v $D/prof:/prof" EXTRA="$PCFG ${EXTRA-}" \
+REPO=$ZT VLLM_CUSTOM_SCOPES_FOR_PROFILING=1 KVMEM=${KVMEM-1.7} NAME=ds41 WARM=0 DOCKER_ARGS="-v $D/prof:/prof" EXTRA="$PCFG ${EXTRA-}" \
   bash serve/ds41-exl3.sh 2>&1 | tail -3 | tee -a $D/run.log
 for i in $(seq 1 150); do
   sudo docker logs ds41 2>&1 | grep -qa "Application startup complete" && break

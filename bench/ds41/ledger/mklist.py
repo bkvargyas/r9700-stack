@@ -14,8 +14,18 @@ for line in open(sys.argv[1]):
     rows.append(dict(i=int(h[0]), phase=h[1], cat=h[2] if len(h) > 2 else "", name=p[1], grid=p[2], dur=float(p[3]),
                      op=p[5] if len(p) > 5 else "", dims=p[6] if len(p) > 6 else ""))
 MB = 1e6
+GEMV4 = [(5120, 1792, "fused_wqa_wkv 5120->1792"), (1280, 4096, "wq_b 1280->4096 (rank's 32 heads)"),
+         (4096, 1024, "wo_a 4096->1024 (EXL3 o-group slice)"), (1024, 5120, "wo_b 1024->5120 (row split)")]
 def wbytes(r, ctx):
     n, g, d = r["name"], r["grid"], r["dims"]
+    # v0.4.1: r9k_exl3_gemv k_gemv<bits, cb, M> / k_gemv_mma<bits, ...>; a layer with four launches runs them in the
+    # attention's order (fused_wqa_wkv, wq_b, wo_a, wo_b); other layers' stacked groups are left unlabelled
+    m = re.match(r"(?:\(anonymous namespace\)::)?k_gemv(?:_mma)?<(\d)", n)
+    if m:
+        K = int(m.group(1))
+        if r.get("gemv_n") == 4:
+            a, b, lab = GEMV4[r["gemv_i"]]; return a * b * K / 8, lab
+        return None, f"r9k_exl3_gemv group (K={K})"
     m = re.match(r"exl3_gemv_mr_dot_(single|multi)<(\d)", n)
     if m:
         K = int(m.group(2)); gx = int(re.match(r"\[(\d+)", g).group(1))
@@ -66,11 +76,14 @@ def layers(rr):
 F = layers(fw); D = layers(dr)
 out = open(sys.argv[2], "w")
 out.write("# Launch list of one T = 6 verify step (single stream, k = 5), rank 0, eager launch E1 (EAGER=1, ADAPTIVE=false: adaptive\n"
-          "# verification requires full graphs), v0.4.0 tree. Durations are eager kernel times (no graph replay), so the collective\n"
+          "# verification requires full graphs), the ledger's tree (v0.4.0 for Z, v0.4.1 for Z2). Durations are eager kernel times (no graph replay), so the collective\n"
           "# rows include waiting for the slowest rank (eager launches skew the ranks by milliseconds): read their graph numbers in\n"
           "# notes/exl3-ledger.md. Columns: # | category | kernel | grid block | us | weight bytes read (per rank) | GB/s | what | cpu op | input dims\n"
-          f"# source: ~/ds41/exl3/Z/E1/s1-list.txt (all {len(rows)} launches of the step), traces ~/ds41/exl3/Z/E1/s1/\n")
+          f"# source: {sys.argv[1]} (all {len(rows)} launches of the step), rank traces in the s1/ directory next to it\n")
 def dump(title, seg, ctx=""):
+    gv = [r for r in seg if re.match(r"(?:\(anonymous namespace\)::)?k_gemv", r["name"])]
+    for i, r in enumerate(gv):
+        r["gemv_i"], r["gemv_n"] = i, len(gv)
     out.write(f"\n== {title}: {len(seg)} launches, {sum(r['dur'] for r in seg if r['cat'] != 'collective'):.1f} us without collectives\n")
     for q, r in enumerate(seg):
         b, lab = wbytes(r, ctx)

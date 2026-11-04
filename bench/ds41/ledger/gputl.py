@@ -72,6 +72,11 @@ for (a, b) in zip(starts, starts[1:]):
     for e in k[a:b]:
         key = ("F " if e["grp"] == "fwd" else "D " if e["grp"] == "graph" else "E ") + short(e["name"])
         nm[key] += e["dur"]; nc[key] += 1
+from ledger import CATS
+print("  collectives by kernel (us a step, launches a step, us a call):")
+for kk, v in sorted(nm.items(), key=lambda kv: -kv[1]):
+    if re.search(CATS[0][1], kk):
+        print(f"    {v/len(rows):8.1f} {nc[kk]/len(rows):6.1f} {v/nc[kk]:8.1f}  {kk}")
 print("  top kernels (us a step, launches a step; F = forward replay, D = drafter replay, E = eager):")
-for kk, v in sorted(nm.items(), key=lambda kv: -kv[1])[:40]:
+for kk, v in sorted(nm.items(), key=lambda kv: -kv[1])[:60]:
     print(f"    {v/len(rows):8.1f} {nc[kk]/len(rows):6.1f}  {kk}")

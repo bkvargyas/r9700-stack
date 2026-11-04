@@ -17,8 +17,16 @@ import argparse, bisect, collections, glob, json, os, re, statistics, sys
 
 CATS = [  # (category, regex on the kernel name); first match wins
     ("collective", r"r9k_ar|r9k_ag|ncclDevKernel|ar8|allreduce|all_gather|cross_device"),
-    ("expert tier (r9k)", r"r9k_moe|k_gu|k_dn|k_groups|k_dq_tiles|moe_exl3"),
+    # v0.4.1 package B (kernels/r9k_dsv4_glue.hip): the FFN front (ffn_norm + router gate GEMV + top-k + shared gate_up +
+    # silu, <= 8 rows), the attention-input norm / pre-pass, the DSpark markov head
+    ("B FFN front r9k_dsv4_sk (norm + router + top-k + shared w13 + silu)", r"r9k_dsv4_sk"),
+    ("B attention input / norm pre-pass r9k_dsv4_norm", r"r9k_dsv4_norm"),
+    ("B markov head r9k_dsv4_markov", r"r9k_dsv4_markov"),
+    ("expert tier (r9k)", r"r9k_moe|k_gu<|k_gu$|k_dn<|k_dn$|k_groups|k_dq_tiles|moe_exl3"),
     ("expert tier (exllamav3 fused / gather)", r"exl3_moe"),
+    # v0.4.1 package D (kernels/r9k_exl3_gemv.hip, anonymous namespace): k_gemv<bits, cb, M> (M = 1..8 rows) and
+    # k_gemv_mma<bits, cb, RT, NB2> (9..48 rows); exllamav3's own path (exl3_gemv_mr_*, reconstruct, had_*) stays its own row
+    ("EXL3 GEMV r9k_exl3_gemv", r"^k_gemv"),
     ("EXL3 GEMV", r"exl3_gemv|exl3_gemm|exl3_mgemm|had_r_128|had_hf_r_128|had_r|reconstruct_kernel|exl3_"),
     ("hipBLAS/hipBLASLt bf16 GEMM", r"^Cijk_|wvSplitK|hipblaslt|gemm|Gemm|LLMM|wvSpltK"),
     ("hc seams (r9k_mhc / stock mhc)", r"r9k_mhc|mhc_|hc_prenorm|_hc_head|hc_split|_post_update|sinkhorn|r9k_hc"),
@@ -35,7 +43,7 @@ PHASES = ("preprocess", "forward", "postprocess", "sample", "draft", "bookkeep",
 
 def cat_of(name, phase):
     c = "everything else"
-    nm = name.replace("(anonymous namespace)::", "")
+    nm = name.replace("(anonymous namespace)::", "").replace("void ", "")
     for cn, rx in CATS:
         if re.search(rx, nm):
             c = cn; break
@@ -284,6 +292,10 @@ def main():
         print("  collectives (rank0 us/step, min over ranks us/step, calls/step):")
         for k, v in sorted(res["collectives_vs_ranks"].items(), key=lambda kv: -kv[1]["rank0_us_per_step"]):
             print(f"    {v['rank0_us_per_step']:8.1f} {v['min_over_ranks_us_per_step']:8.1f} {v['calls_per_step']:6.1f}  {k}")
+    print("  collectives by kernel (us a step, launches a step, us a call):")
+    for k, us, n in res["kernels"]:
+        if re.search(CATS[0][1], k):
+            print(f"    {us:8.1f} {n:6.1f} {us / n if n else 0:8.1f}  {k}")
     print("  top kernels (us a step, launches a step):")
     for k, us, n in res["kernels"][:45]:
         print(f"    {us:8.1f} {n:6.1f}  {k}")

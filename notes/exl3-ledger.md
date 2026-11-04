@@ -8,6 +8,8 @@ the history of X", thinking off, ignore_eos), 1 and 4 streams, measured mid-deco
 Numbers are per verify step ("a step" = one scheduler step: the target forward, the sampler / rejection sampler, the
 drafter's propose). Card time 11:28-12:27 UTC (one hour; cards idle, lock removed, offset back to 0 after).
 
+**The same ledger on v0.4.1 (package Z2) is the last section, "v0.4.1 (2026-11-03)".** Sections 1-5 below are v0.4.0's.
+
 ## Where the time goes (read your row)
 
 1. **The step is GPU-bound, not launch-bound.** Unprofiled, the default single-stream step is **25.4 ms** (74.3 tok/s at 1.89
@@ -365,3 +367,225 @@ ledger launch; zrun2 adds PROFCFG=cuda), `zall.sh`, `zrest.sh` (the launch seque
 `gputl.py`, `layers.py`, `classavg.py`, `widths.py`, `mklist.py`, `launch-list-T6.txt`.
 VM100 `~/ds41/exl3/Z/`: `E1/ G1/ G3/ G4/ G2/ G2b/` (rank traces under `s<N>/`, analyses next to them), `zall.log`,
 `zrest.log`, `tools/` (the copies that ran). The launches served `~/r9700-exl3-Z` (v0.4.0, untouched by the other packages).
+
+## v0.4.1 (2026-11-03)
+
+Package Z2: the same ledger on the v0.4.1 tag. Measured on VM100 (eight R9700, SCLK -500 MHz, 120 V feed) from a pristine copy
+of the tag (`git archive v0.4.1` = 9be646b -> VM100 `~/r9700-exl3-Z2`, libr9k.so built from it in r9700/vllm:dev: md5
+dea113e9..., the same bytes as the release-validation tree `~/r9700-exl3-REL`), image r9700/vllm:dev, the launcher defaults
+(serve/ds41-exl3.sh, unchanged from v0.4.0: TP8 + EP, MAXLEN 32768, KVMEM 1.7, NSEQ 4, NBT 2048, DSpark k = 5, adaptive
+verification on, HIP graphs, capture sizes 1,2,4,6,12,18,24). Same workload (workload.py, greedy prose, 1 and 4 streams,
+3 s timing window + 3 s profile window mid-decode), same tools (`bench/ds41/ledger/`, now with the v0.4.1 kernel categories;
+sequence `zv041.sh`, analyses `zana.sh`). Rank 0 unless marked; "a step" = one scheduler step (target forward, sampler /
+rejection sampler, drafter propose). Card time 2026-11-04 00:03-00:37 UTC (34 min; cards idle, lock removed, offset back to 0
+after; package G took the box at 00:36).
+
+### Z2.0 What changed since v0.4.0 and what is left (read your row)
+
+1. **The default single-stream step is 19.1 ms (was 25.4): 105.3 tok/s at 2.01 accepted tokens a step (was 74.3 at 1.89).**
+   GPU kernels 17.75 ms (was 23.46), launch + CPU gaps <= 1.36 ms (7 %). Four streams: **32.3 ms (was 40.0), 248 tok/s
+   aggregate (was 202)**, kernels 31.1 ms, gaps <= 1.1 ms. Launches a step 1,132 / 1,318 (was 1,865 / 2,082).
+2. **C's flat-all-gather fix is the biggest single gain: 4.05 -> 0.19 ms a step** (Engram 4 x 22 us + logits 101 us on
+   `r9k_ag8_os_kernel`). That is also why adaptive verification now wins single-stream (105 vs 97 tok/s with it off; v0.4.0:
+   74 vs 81).
+3. **The 81 all-reduces did not get cheaper at rank 0: 5.24 ms a step at T = 6 (64.6 us a call; v0.4.0 5.9).** The one-kernel
+   all-reduce itself takes 23 us a call (min over the eight ranks, 20-40 KiB); **the other ~3.4 ms a step is rank 0 waiting
+   for the slowest rank** -- the post-MoE call averages 68 us against 25 after attention (expert-load imbalance across the EP
+   ranks plus arrival skew). At 24 rows: 152.8 us a call rank 0, 73 min (12.4 ms vs 5.9 a step). **Nobody owns this row.**
+4. **C's fused MoE reduction never runs in the server**: every launch logs "exl3 MoE combine fusion skipped ... (runner shape
+   changed)" for all 43 runners (also in the release-validation logs `D4/clean-REL2.log`, `C4/bisect-C.log`). The likely
+   cause is `moe/exl3_combine.py`'s gate `cfg.tp_size == 8`: with `--enable-expert-parallel` the pin's FusedMoEParallelConfig
+   has tp_size 1, ep_size 8. Trace: `r9k_ar8_os_kernel<bf16, 0>` only (no MoE variant), plus one add a layer.
+5. **D's GEMV removed the dequant path and the casts** (EXL3 GEMVs + wo_a + casts: ~3.3 -> 2.27 ms at T = 6, 7.6 + 1.2 -> 4.63
+   ms at 24 rows), but runs at 250-270 GB/s at 6 rows (wo_a 166) -- below exllamav3's 288-292 per kernel; the gain is the
+   launches it removed. **F's row.**
+6. **B's FFN front works (48 launches, 1.43 ms; plain layer 32 -> 18 launches), B's markov head does not under the default
+   adaptive verification**: with ADAPTIVE=false the drafter runs `r9k_dsv4_markov_kernel` (0.37 ms), with the defaults it runs
+   stock's five [129280 x 256] GEMVs + argmax (0.67 ms) plus adaptive's f32 Cijk GEMM (0.62 ms) -- the drafter tail is 2.07 ms
+   of a 19.1 ms step. (The hook falls back somewhere in `dsv4_glue._markov_why_not`; "probabilistic drafts" is the suspect,
+   not confirmed.) Remaining glue: 325 + 272 (drafter) us, 173 + 61 launches.
+7. **Expert tier: 2.38 ms at T = 6 default (2-4 rows), 3.80 at 6 rows, 7.18 at 9-16 rows, 12.52 at 24 rows** -- unchanged
+   from v0.4.0 (A's tier was held back), now 13-30 % of the step. **A2's row.**
+8. Above 8 rows B's kernels and the 6-row attention-input fusion fall back to stock (shared w13 / w2, router gate, top-k:
+   62 us a layer at 9-24 rows vs 52 at 6); above 192 KiB the logits gathers go to RCCL (target 334-574 us, drafter 479-492):
+   0.8-1.1 ms of the four-stream step.
+9. Unchanged: decode attention 0.87-2.1 ms, hc seams 0.69-1.14 ms, KV 329,008 tokens at KVMEM 1.7 (model 26.32 GiB a rank,
+   graph pools 1.22 GiB, was 1.41). NSEQ 8 is still unsupported (no T = 48 column).
+10. Profiling still inflates the step (+5.5 ms at T = 6: traced period 24.6 vs 19.1; ~6 us between graph nodes): read traced
+    kernel durations, never traced periods.
+
+| v0.4.2 package | its row at T = 6 (default, 1 stream) | at T = 24 (default, 4 streams; 9-16 rows run) | at a true 24-row verify | the ceiling it can reach |
+|---|---:|---:|---:|---|
+| A2 expert tier to 48 tokens (main + drafter) | 2.47 ms (14 %) | 7.44 ms (24 %) | 12.77 ms | no gain owed at 1-6 rows (must hold 50 / 114 us a layer at 2-4 / 6 rows); at 24 rows A's card-5 ratio (518 -> 414-435, -17-20 %) is ~-2.3 ms; its real prize is the 8-stream (48-token) shape that does not launch today |
+| F EXL3 GEMV latency (r9k_exl3_gemv, main + drafter) | 2.66 ms (15 %) | 4.22 ms (14 %) | 5.34 ms | the four attention GEMVs of a layer read 14.9 MB: 63 us at 6 rows (235 GB/s) -> 33 us at 450 GB/s = **-1.2 ms a step** at T = 6 (+ -0.1 drafter); 112 us at 24 rows -> 33 = -3.2 ms |
+| G split-path all-reduce at 240-480 KiB (+ the > 192 KiB gathers) | 0 (all <= 64 KiB, one-kernel) | 9.93 ms rank 0, 4.87 ms min over ranks (88 calls at 90-200 KiB) + RCCL gathers 0.82 ms | 13.30 ms rank 0, 6.38 min | min 54 -> ~40 us at 90-160 KiB = -1.1 ms; at 240 KiB 73 -> 50 us = -1.9 ms; gathers on a host-pool path ~-0.5 ms. Rank skew (rank 0 minus min: 5.1-6.9 ms at four streams) is not G's to win |
+| E KV headroom | no step time | -- | -- | capacity only: 329,008 KV tokens at KVMEM 1.7 (unchanged), worst card ~0.86 GiB free in the release soak |
+| (unowned) rank skew in the 81 target all-reduces (rank 0 minus min over ranks) | ~3.4 ms (64.6 vs 23.2 us a call) | ~4.6 ms (G1) | ~6.5 ms | upper bound if every rank arrived with rank 0's work: T = 6 step ~15.7 ms (~128 tok/s at 2.01); really bounded by how evenly the routed experts spread over the EP ranks |
+| (unowned / B follow-up) drafter tail under adaptive | 1.7 ms (stock markov 0.67 + f32 GEMM 0.62 + lm_head 0.27 + gather 0.15) | 2.1 ms | -- | B's markov kernel under adaptive: -0.3 ms; the adaptive f32 GEMM on a GEMV: ~-0.5 ms |
+| (C follow-up) MoE combine inside the all-reduce | not running (gate fails under EP) | -- | -- | C measured 40.9 -> 18.5 us at T = 1: up to ~-0.9 ms a step at 1-4 rows once it installs |
+| **step, unprofiled** | **19.11 ms** (25.42) | **32.26 ms** (40.00) | **43.48 ms** (52.63) | |
+
+### Z2.1 Launches and method
+
+| tag | launch | workloads | traces (VM100 `~/ds41/exl3/Z2/`) | what it is used for |
+|---|---|---|---|---|
+| G4 | defaults (ADAPTIVE=true), **GPU-only** profiler | 1 and 4 streams, 3 s | `G4/s1/`, `G4/s4/` (8 rank traces each) | the headline table, the wall split |
+| G3 | **ADAPTIVE=false**, CPU+GPU profiler | 1 and 4 streams, 3 s | `G3/s1/`, `G3/s4/` | the true 6- and 24-row verify, per-layer classes, cross-rank minima |
+| G1 | defaults, CPU+GPU profiler | 1 and 4 streams, 3 s | `G1/s1/`, `G1/s4/` | verify widths, per-layer at 2-4 and 9-16 rows, cross-rank minima at the default widths |
+| E1 | EAGER=1, ADAPTIVE=false, stacks + shapes | 1 stream 6 s (the 4-stream profile window failed: stop_profile errored while the traces were written, `E1/s4/` holds 7 partial traces, unused) | `E1/s1/` | kernel names -> call sites, draft-names.json, the launch list |
+
+Logs: `zv041.log` (the sequence), `<tag>/run.log`, `<tag>/launch.log`, `<tag>/s<N>.json` (both windows), `build.log`.
+Analyses next to the traces: `<tag>/s<N>-ledger.txt|json`, `-list.txt`, `-layers.txt`, `-classavg.txt`, `-widths.txt`,
+`G4/s<N>-gputl.txt`, `E1/launch-list-T6.txt` (in the repo as `bench/ds41/ledger/launch-list-T6-v041.txt`).
+Tool changes (bench/ds41/ledger/): `ledger.py` categories for D's `k_gemv` / `k_gemv_mma` (anonymous namespace) and B's
+`r9k_dsv4_sk` / `r9k_dsv4_norm` / `r9k_dsv4_markov`, a collectives-by-kernel listing in `ledger.py` and `gputl.py`;
+`widths.py` reads the verify width off `k_gemv<bits, cb, M>` (M = rows, 1-8) / `k_gemv_mma<.., RT, ..>` (9-48 rows);
+`mklist.py` labels the four attention GEMVs of a layer and their bytes; `zrun2.sh` takes ZTREE / ZOUT / ZLOCK (defaults =
+package Z's); new `zv041.sh`, `zana.sh`. Build note: the tag's `kernels/build.sh` export check failed once on a SIGPIPE race
+(`set -o pipefail` + `nm -D | grep -q`, "MISSING EXPORT: r9k_ag_oneshot_nrank_g" for a symbol that is there); all 129
+exports verified into a file, the .so installed by hand.
+
+**The verify width the GPU ran** (`widths.py`):
+
+| launch | steps | rows verified on the GPU |
+|---|---:|---|
+| G1 1 stream, adaptive | 116 | 4 rows 50.9 %, 2 rows 46.6 %, 6 rows 2.6 % |
+| G1 4 streams, adaptive | 78 | 9-16 rows 92.3 %, 17-24 rows 7.7 % |
+| G3 1 stream, ADAPTIVE=false | 115 | 6 rows 100 % |
+| G3 4 streams, ADAPTIVE=false | 63 | 24 rows 100 % (no dequant path: 0 reconstructs; engram wkv 6 exllamav3 launches) |
+
+### Z2.2 GPU time a step by category, us [launches a step]
+
+Rank 0, graph replay, sum of kernel durations a step (traced; collectives include waiting for the slowest rank, Z2.3).
+G4 columns: `gputl.py` (phases by graph replay; its "sampler" row also holds the forward's eager input prep); G3: `ledger.py`.
+G1 agrees with G4 within 1-3 % on every row (`G1/s1-ledger.txt` 17,691 us, 1,132 launches; `G1/s4-ledger.txt` 31,296, 1,319).
+v0.4.0 in parentheses (section 1).
+
+| category | T=6 default (G4) | T=6 ADAPTIVE=false (G3) | T=24 default (G4) | T=24 ADAPTIVE=false (G3) |
+|---|---:|---:|---:|---:|
+| expert tier r9k k_gu / k_dn | 2,383 [80] (2,503) | 3,798 [80] (3,857) | 7,184 [80] (6,814) | 12,524 [80] (12,636) |
+| EXL3 GEMV r9k_exl3_gemv (k_gemv / k_gemv_mma; incl. wo_a, no casts) | 2,273 [162] | 2,691 [162] | 3,513 [162] | 4,634 [160] |
+| EXL3 exllamav3 path (+ dequant f16 GEMMs) | 0 (1,677 [260]) | 0 (2,068 [260]) | 8 [0.3] (3,593 [490]) | 122 + 85 [8] (3,059 + 4,547 [688]) |
+| B r9k_dsv4_sk (FFN front x 40 + attention input x 8; <= 8 rows) | 1,429 [48] | 1,725 [48] | 0 (stock above 8 rows) | 0 |
+| hipBLAS bf16 (shared w2; above 8 rows also shared w13, router gate, compressor / indexer; target lm_head) | 561 [45] (2,709 [177]) | 878 [45] (3,456) | 2,560 [137] (3,706) | 2,626 [137] (3,605) |
+| router top-k (stock, above 8 rows) | 0 (332 [40]) | 0 (335) | 340 [40] | 342 [40] |
+| decode attention: split-K partial + reduce | 869 [80] (860) | 1,011 [80] (952) | 1,383 [80] (1,276) | 2,107 [80] (1,781) |
+| attention: indexer | 231 [46] | 183 [54] | 112 [46] | 148 [54] |
+| attention: KV writes / RoPE / compressor | 109 [48] | 130 [53] | 116 [48] | 141 [53] |
+| collectives (all-reduces, Engram + logits gathers) | 5,425 [86] (9,568 [149]) | 6,302 [86] (9,007) | 9,558 [86] (13,318) | 13,334 [86] (15,537) |
+| hc seams | 691 [87] (695) | 800 [87] (794) | 861 [87] (846) | 1,142 [87] (1,144) |
+| norms / casts / elementwise glue | 325 [173] (1,240 [564]) | 453 [219] (1,381 [609]) | 489 [261] (1,302) | 659 [312] (2,190) |
+| Engram (hash, lookup) | 21 [5] | 25 [5] | 26 [5] | 29 [5] |
+| sampler / rejection sampler (G4: + eager input prep) | 386 [137] (394) | 111 [35] (121) | 405 [141] (415) | 144 [39] (144) |
+| everything else | 3 [1] | 4 [1] | 6 [1] | 0 |
+| **drafter**: expert tier | 92 [6] (101) | 102 [6] (100) | 260 [6] (258) | 244 [6] (252) |
+| drafter: EXL3 GEMV (r9k_exl3_gemv + exllamav3's main_proj at 5 rows) | 262 + 123 [17] (329) | 263 + 118 [17] (325) | 711 [16] (601 + 823) | 711 [16] (601 + 824) |
+| drafter: hipBLAS (lm_head slice; stock markov head x 5 and adaptive's f32 GEMM when adaptive; shared w2) | 1,464 [11] (1,608) | 308 [5] (985) | 1,675 [20] (1,763) | 500 [14] (1,138) |
+| drafter: B markov head r9k_dsv4_markov | 0 (falls back under adaptive) | 365 [6] | 0 | 404 [6] |
+| drafter: B r9k_dsv4_sk | 83 [3] | 83 [3] | 0 | 0 |
+| drafter: collectives (7 all-reduces + logits gather) | 622 [8] (690) | 626 [8] (685) | 1,408 [8] (1,497) | 1,419 [8] (1,434) |
+| drafter: glue / attention / hc / router / other | 399 [89] (497 [131]) | 215 [59] (489) | 506 [94] (645) | 295 [64] (641) |
+| **GPU kernel time a step** | **17,750** (23,460) | **20,189** (24,866) | **31,120** (37,450) | **41,609** (50,180) |
+| launches a step | **1,132** (1,865) | **1,059** (1,754) | **1,318** (2,082) | **1,256** (2,221) |
+| **step, unprofiled** (timing window) | **19,110** (25,420) | **21,740** (27,270) | **32,260** (40,000) | **43,480** (52,630) |
+
+### Z2.3 Collectives by kernel and size (per call; rank 0, and the minimum over the eight ranks)
+
+| call (a step) | message a rank | kernel / path | rank 0 us | min over ranks | calls | source |
+|---|---|---|---:|---:|---:|---|
+| all-reduce [2-4, 5120] (default, 1 stream) | 20-40 KiB | **one-kernel `r9k_ar8_os_kernel`** (C) | 64.6 (after attention 25.2, after the MoE 68.1) | **23.2** | 81 | G4 s1, G1 s1 classavg / --ranks |
+| all-reduce [6, 5120] | 60 KiB | one-kernel (R9K_AR8_OS_KB 64) | 73.9 (40.7 / 90.8) | 32.8 | 81 | G3 s1 |
+| all-reduce [9-16, 5120] | 90-160 KiB | split path `r9k_ar8_fused_kernel` (one lane, 1024-word sub-steps) | 110.8 (61.7 / 134.8) | 54.4 | 81 | G1 s4 |
+| all-reduce [24, 5120] | 240 KiB | split path | 152.8 (84.8 / 219.4) | 73.1 | 81 | G3 s4 |
+| drafter all-reduce [5, 5120] / [20, 5120] | 50 / 200 KiB | one-kernel / split path | 67.4 / 132.0 | 30.5 / 65.3 | 7 | G4 s1, G3 s1 / G4 s4, G1 s4 |
+| Engram all-gathers [T, 3200] | 6-150 KiB gathered | **one-kernel `r9k_ag8_os_kernel`** (was flat 8-rank 653-1,069 + pair / quartet stages) | 21.6 (2-4 rows), 32.6 (6), 55 (9-16), 96 (24) | 18.2 / 28.9 / 51.6 / 89.5 | 4 | G4 s1, G3 s1, G1 s4, G3 s4 |
+| target logits all-gather [T, 16160] at <= 6 rows | 63-189 KiB | one-kernel ag8 (was flat 8-rank 3,205 at <= 4 rows) | 101 (2-4 rows), 185 (6) | 93 / 175 | 1 | G4 s1, G1 s1, G3 s1 |
+| target logits all-gather at 9-24 rows | 284-758 KiB | RCCL `ncclDevKernel_Generic_4` | 334-337 (9-16), 574 (24) | 329 / 565 | 1 | G4 s4, G1 s4, G3 s4 |
+| drafter logits all-gather [5, 16160] / [20, 16160] | 158 / 631 KiB | one-kernel ag8 / RCCL | 141-151 / 479-492 | 141 / 478 | 1 | G1 s1, G3 s1 / G1 s4, G3 s4 |
+| the flat eight-rank all-gather `r9k_ag_oneshot_nrank_kernel<8>` | | | **0 calls** (v0.4.0: 4,050 us a step) | | 0 | |
+
+Sum of the minima a step (the collective cost if the ranks arrived together): 1.88 ms at T = 6 default (rank 0 5.24 + 0.47
+drafter), 2.65 at 6 rows, 4.41 at 9-16 rows, 5.92 at 24 rows. The rest of the rank-0 time is waiting, and it sits on the
+post-MoE call (classavg: 68 vs 25 us at 2-4 rows, 219 vs 85 at 24 rows; per-layer k_gu on rank 0 ranges 5-64 us at 2-4 rows):
+expert-load imbalance between the EP ranks plus arrival skew from the preceding compute.
+
+### Z2.4 Per call / per layer (graph replay; class means over the 26 plain layers)
+
+| kernel | T=2-4 (G1 s1) | T=6 (G3 s1) | T=9-16 (G1 s4) | T=24 (G3 s4) | bytes a rank | GB/s at T=6 | v0.4.0 at T=6 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| k_gu + k_dn a K=3 layer | 32.4 + 17.7 | 76.3 + 37.5 (6-176 / 4-77 by layer) | 134.4 + 58.0 | 233.5 + 87.2 | distinct local experts x 13.27 MB | -- | 65.0 + 31.1 |
+| fused_wqa_wkv k_gemv (5120 -> 1792, K=5) | 17.4 | 21.5 | 28.7 (k_gemv_mma RT 1) | 41.2 (RT 2) | 5.73 MB | 267 | 19.6 + had_in 2.0 + casts 7.9 |
+| wq_b k_gemv (1280 -> 4096) | 10.5 | 13.2 | 17.5 | 23.1 | 3.28 MB | 248 | 11.4 + 1.4 + 5.0 |
+| **wo_a on EXL3** k_gemv (4096 -> 1024 slice) | 13.3 | 15.8 | 17.9 | 25.0 | 2.62 MB | **166** | 27.8 (bf16, 8.39 MB) |
+| wo_b k_gemv (1024 -> 5120) | 11.1 | 12.9 | 16.6 | 23.0 | 3.28 MB | 254 | 11.4 + 1.5 + 5.0 |
+| **FFN front** r9k_dsv4_sk (ffn_norm + router gate + top-k + shared w13 + silu) + shared w2 | 30.8 + 6.5 | 38.2 + 14.0 | stock: 1.9 + 19.8 + 1.5 + 15.4 + 14.7 + 8.5 = 61.8 | stock 62.4 | 3.93 + 5.90 + 2.95 MB | -- | 55.0 (6 launches) |
+| decode attention partial + reduce | 15.4 + 5.1 | 23.0 + 3.3 | 30.9 + 3.5 | 51.0 + 4.2 | | | 22.8 + 2.6 |
+| all-reduce after attention / after the MoE | 25.2 / 68.1 | 40.7 / 90.8 | 61.7 / 134.8 | 84.8 / 219.4 | | | 46.3 / 98.8 |
+| r9k_mhc seam | 8.2 | 9.7-10.1 | 10.2-11.1 | 13.4-14.6 | 1.97 MB | 200 | 9.7-9.9 |
+| **a plain layer, all launches** | **277 (18)** | **414 (18)** | **595 (22)** | **891 (22)** | | | 449 (32) |
+
+A plain layer at T = 6 is now 18 launches (v0.4.0: 32): seam, rms_norm, wqa_wkv, q_norm (Triton), wq_b, q-norm/RoPE/KV insert,
+attention partial + reduce, wo_a, wo_b, all-reduce, seam, FFN front (sk), shared w2, k_gu, k_dn, add (routed + shared),
+all-reduce. The other classes (G3 s1): layer 0 24 launches, Engram layer 1 19, kv-source layers 2 / 8 / 14 30, layer 13 23,
+layer 20 36, indexer layers 24 / 28 / 32 30, layer 36 32, aux layers 37 / 38 20, last layer 39 26; drafter layers 19 each, its
+last layer + heads 36 (ADAPTIVE=false, B's markov kernel: 5 x 52-131 us + 4) or 62 (defaults: stock markov 5 x (107 + 27.5
+argmax) + adaptive's f32 Cijk MT256x128x8 625 us). The eager launch list of one T = 6 step (E1, 1,013 launches, grid / block,
+bytes, GB/s, cpu op, shapes): `bench/ds41/ledger/launch-list-T6-v041.txt`.
+
+The GEMVs: at 2-4 rows they reach 296-329 GB/s (wo_a 197), at 6 rows 248-267 (wo_a 166), at 24 rows 139-143 -- every one
+carries D's ~9 us fixed chain (rotation into LDS, then the stream); wo_a, the smallest matrix with the longest K, suffers most.
+
+**Launch counts a step by category** (G3 = ADAPTIVE=false, G4 = defaults; T = 6):
+
+| category | target forward + sampler, G3 | drafter, G3 | target forward + sampler, G4 | drafter, G4 | v0.4.0 G3 (target / drafter) |
+|---|---:|---:|---:|---:|---:|
+| norms / casts / elementwise glue | 219 | 38 | 173 | 61 | 609 / 91 |
+| EXL3 GEMV (r9k_exl3_gemv; + exllamav3) | 162 | 15 + 2 | 162 | 15 + 2 | 260 / 26 |
+| B r9k_dsv4_sk | 48 | 3 | 48 | 3 | -- |
+| B markov head | -- | 6 | -- | 0 | -- |
+| hipBLAS bf16 | 45 | 5 | 45 | 11 | 177 / 22 |
+| collectives | 86 (81 all-reduces, 4 Engram + 1 logits gathers) | 8 | 86 | 8 | 90 / 8 |
+| hc seams | 87 | 7 | 87 | 7 | 87 / 7 |
+| expert tier | 80 | 6 | 80 | 6 | 80 / 6 |
+| decode attention | 80 | 6 | 80 | 6 | 80 / 6 |
+| indexer / KV writes / compressor | 107 | 6 | 94 | 6 | 107 / 6 |
+| router top-k | 0 | 0 | 0 | 0 | 40 / 3 |
+| sampler / rejection sampler (G4: + eager input prep) | 35 | -- | 137 | -- | 36 / -- |
+| Engram, other | 6 | 2 | 6 | 9 | 6 / 7 |
+| **total** | **955** | **104** | **998** | **134** | 1,572 / 182 |
+
+### Z2.5 Wall-clock split and the tok/s arithmetic
+
+Unprofiled timing windows (3 s, mid-decode; `<tag>/s<N>.json`, window "timing"). drafts = verify steps x streams.
+
+| launch | streams | tokens a stream | drafts | accepted | MAL | steps | step wall | (drafts + accepted) / streams / 3 s | observed tok/s a stream (aggregate) | v0.4.0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| G4 defaults | 1 | 316 | 157 | 159 | 2.01 | 157 | 3000 / 157 = **19.11 ms** | 105.3 | **105.3** | 74.3 |
+| G1 defaults | 1 | 306 | 157 | 149 | 1.95 | 157 | 19.11 ms | 102.0 | 102.0 | 71.0 |
+| G3 ADAPTIVE=false | 1 | 291 | 138 | 153 | 2.11 | 138 | 21.74 ms | 97.0 | 97.0 | 80.7 |
+| G4 defaults | 4 | 175 / 194 / 193 / 181 | 372 | 371 | 2.00 | 93 | **32.26 ms** | 61.9 | 61.9 (**247.7**) | 50.6 (202.3) |
+| G1 defaults | 4 | 179 / 175 / 172 / 190 | 376 | 340 | 1.90 | 94 | 31.92 ms | 59.7 | 59.7 (238.7) | 46.4 (185.3) |
+| G3 ADAPTIVE=false | 4 | 149 / 152 / 130 / 128 | 276 | 283 | 2.03 | 69 | 43.48 ms | 46.6 | 46.6 (186.3) | 38.7 (154.7) |
+| E1 eager, ADAPTIVE=false | 1 | 137 | 60 | 77 | 2.28 | 60 | 100.0 ms | 22.8 | 22.8 | 17.8 |
+
+So tok/s = MAL / step wall: 2.01 / 19.11 ms = 105.3 single stream; 4 x 2.00 / 32.26 ms = 247.7 aggregate. (spectune's release
+numbers, 87-97 prose single / 179-212 at four, run a different prompt set and include prefill and the request tail; this
+workload measures mid-decode only.)
+
+**Split of the unprofiled step** (G4: GPU-only trace by graph replay; G3: by the CPU annotation phases):
+
+| | T = 6 default (G4) | T = 24 default (G4) | T = 6 ADAPTIVE=false (G3) | T = 24 ADAPTIVE=false (G3) |
+|---|---:|---:|---:|---:|
+| step wall, unprofiled | 19.11 ms (25.42) | 32.26 (40.00) | 21.74 (27.27) | 43.48 (52.63) |
+| target forward graph replay, kernel time | 13.95 (16.37) | 25.52 (30.84) | 17.51 incl. eager input prep | 37.01 |
+| drafter graph replay | 2.99 (3.17) | 4.51 (5.55) | 2.08 (draft phase) | 3.57 |
+| eager kernels (input prep, lm_head, logits gather, sampler / rejection) | 0.81 (3.92) | 1.09 (1.06) | 0.60 (sample phase) | 1.02 |
+| **all kernels** | **17.75** (23.46) | **31.12** (37.45) | **20.19** (24.87) | **41.61** (50.18) |
+| **launch gaps + CPU** | **<= 1.36 (7.1 %)** | **<= 1.14 (3.5 %)** | **<= 1.55 (7.1 %)** | **<= 1.87 (4.3 %)** |
+
+Traced, the same steps run 24.65 / 38.99 ms (G4) with 5.2 / 6.1 ms of idle inside the forward replay (~6 us a node), as on
+v0.4.0: periods come from the unprofiled windows.
+
+**Adaptive verification, true vs false (one stream)**: GPU time 17.75 vs 20.19 ms (-2.4: expert tier -1.4, GEMVs -0.4, FFN
+front -0.3, logits gather 101 vs 185 us), drafter +0.9 ms (stock markov + f32 GEMM), MAL 2.01 vs 2.11, **105.3 vs 97.0 tok/s
+(+9 %)**; v0.4.0 had it the other way (-8 to -12 %) because of the flat all-gather. Four streams: 247.7 vs 186.3 aggregate (+33 %).
