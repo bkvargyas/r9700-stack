@@ -8,7 +8,8 @@
 # 120 V feed: run `bash ~/gpu-offset.sh -500` before any eight-card launch (2x2200 W PSUs, 8-card prefill trips the SCMP).
 # Defaults (notes/exl3-serving.md): HIP graphs, DSpark drafter k=5 with adaptive verification, MAXLEN 32768, NSEQ 4,
 # NBT 2048, KVMEM 2.0 GiB (= 387,069 KV tokens), PYTORCH_ALLOC_CONF=expandable_segments:True, capture sizes 1,2,4 + 6 x 1..4.
-# Long context: MAXLEN=131072 KVMEM=0.8 (313,831 KV tokens, needles retrieved at 126.7k; notes/exl3-serving.md section 3).
+# Long context: MAXLEN=131072 KVMEM=1.0 (392,289 KV tokens = three full-length requests; needles retrieved at 120k and
+# 128.5k, 0.49-0.52 GiB free on the worst card; KVMEM=0.8 = 313,831 tokens for margin; notes/exl3-serving.md section 3b).
 # DSPARK=1 (default) adds the checkpoint's DSpark drafter (mtp.{0,1,2}, block 5); DSPARK=0 for a plain run.
 # NSEQ above 4 is NOT supported on this release: a 48-token step goes through exllamav3's fused MoE tier, which faults in
 # the engine warm-up (HSA memory aperture violation; notes/exl3-plan.md Phase 4 A). The 48-token r9k tier that launches it
@@ -74,7 +75,8 @@ env \
                                         # during it) and keeps 0.75 GiB free through the 4-stream burst and the 15-minute
                                         # soak (v0.4.1's 1.7 left 0.86); 2.2 leaves 0.56 after the burst (section 3b);
                                         # ~193k KV tokens a GiB (fp8 SWA + compressed + indexer caches, replicated). For
-                                        # MAXLEN=131072 use KVMEM=0.8 (313,831 tokens; 1.0 leaves 0.2 GiB at 128k prompts, 1.5 fails capture).` \
+                                        # MAXLEN=131072 use KVMEM=1.0 (392,289 tokens; 0.49-0.52 GiB free at 128k prompts and the 100-125k soak;
+                                        # 0.8 = 313,831 tokens for margin; 1.2 leaves 0.32 GiB; 1.5 fails capture).` \
   KVDTYPE=${KVDTYPE-fp8} `                # fp8_ds_mla records (the ROCm V4.1 attention's layout; the probe ran it)` \
   EAGER=${EAGER-0} `                      # HIP graphs (EAGER=1 for debugging; graph capture 70 s with adaptive verification)` \
   PREFIX_CACHE=${PREFIX_CACHE-0} `        # off (ROCm keeps SWA replay off anyway; divergence.py needs it off)` \
