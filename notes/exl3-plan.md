@@ -616,3 +616,22 @@ single-stream step ~15-16 ms (~115-125 tok/s prose), four streams ~26-28 ms (~29
   52.9-60.4 per stream at four (v0.4.0: 31.5), prose = code as expected without speculation; divergence 22 / 24 / 22, GSM8K
   99 / 100. wo_a on EXL3 vs bf16 at these widths: 83.3 vs 80.5 single, 59.8-60.4 vs 58.0-58.3 at four -> EXL3 stays the default.
   The launcher is restored (commit after a9ec6a9) and the drafter runs are repeated as REL2.
+
+### Where the time goes on v0.4.1 (2026-11-04 00:03-00:37 UTC; notes/exl3-ledger.md section Z2; rank 0, GPU time a step)
+Single-stream default step **19.11 ms** (v0.4.0 25.42) = 105.3 tok/s on the ledger workload at 2.01 accepted tokens; four streams
+**32.26 ms** (40.0) = 247.7 aggregate; true 6-row verify 21.74 ms (97 tok/s), true 24-row 43.48 (186 aggregate). Still GPU-bound:
+kernels 17.75 / 31.12 ms, gaps <= 1.4 / 1.1 ms; launches 1,865 -> 1,132 (T = 6), 2,082 -> 1,318 (T = 24). What moved: the all-gather
+4.05 -> 0.19 ms (C), which is also why adaptive verification now wins at one stream (105 vs 97; v0.4.0 74 vs 81); GEMVs + wo_a + casts
+3.3 -> 2.27 ms at T = 6 and 8.8 -> 4.63 at 24 rows (D: the launches removed; the kernels run at 248-267 GB/s, wo_a 166); B's FFN front
+48 launches / 1.43 ms, a plain layer 32 -> 18 launches. What did not: **the 81 all-reduces cost the same at rank 0 (5.24 ms at T = 6,
+64.6 us a call) -- the one-kernel all-reduce is 23.2 us (minimum over ranks) and ~3.4 ms a step is rank 0 waiting for slower ranks,
+mostly on the post-MoE call (68 us vs 25 after attention): uneven expert load across the expert-parallel ranks. At 24 rows 152.8 us
+a call vs a 73 us minimum = 6.5 ms a step: the largest row, unowned (rank-skew upper bound: ~15.7 ms step, ~128 tok/s).** Two
+things that should have run and did not: C's fused MoE combine ("fusion skipped ... runner shape changed" on all 43 runners: the
+`cfg.tp_size == 8` check -- under --enable-expert-parallel the MoE config has tp_size 1, ep_size 8; ~0.9 ms at 1-4 rows) and B's
+markov head under the default adaptive verification (stock's five GEMVs + argmax 0.67 ms + adaptive's f32 GEMM 0.62 ms run instead;
+B's kernel runs only with ADAPTIVE=false; the decline is in dsv4_glue._markov_why_not). Expert tier unchanged (2.38 / 3.80 / 7.18 /
+12.52 ms at 2-4 / 6 / 9-16 / 24 rows). v0.4.2 package ceilings: A2 ~-2.3 ms at 24 rows (+ the 8-stream shape); F ~-1.2 ms at T = 6,
+-3.2 at 24 (14.9 MB of attention GEMVs a layer at 450 GB/s = 33 us vs 63); G -1.1 to -1.9 ms at 24 rows (kernel part only);
+C2 (combine gate) ~-0.9; B2 (markov under adaptive + the f32 GEMM) ~-0.5; **new H3: expert-parallel load skew** (replicas of hot
+experts / a routing-histogram placement; vLLM's EPLB as the reference) is the biggest remaining item.
