@@ -22,7 +22,7 @@ underneath it.
 > switches, on a 120 V feed that holds eight-card runs to a -500 MHz clock offset. Your rig will differ; the serve
 > scripts carry every knob with the reason next to it.
 
-![r9700-stack v0.4.1: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.4.1.png)
+![r9700-stack v0.4.2: what runs on it, the weight formats, the speed](docs/r9700-stack-v0.4.2.png)
 
 ## What it does
 
@@ -45,7 +45,7 @@ You run the stock vLLM ROCm image with this plugin installed. From there:
    `max_num_seqs`, mixed-length soaks and long-context needles on every configuration before a tag; paired GSM8K
    (McNemar) and HumanEval on the numerics.
 
-Current release: **v0.4.1** (2026-11-03), [release notes](notes/release-v0.4.1.md), [CHANGELOG.md](CHANGELOG.md).
+Current release: **v0.4.2** (2026-11-04), [release notes](notes/release-v0.4.2.md), [CHANGELOG.md](CHANGELOG.md).
 
 ## Features
 
@@ -57,7 +57,7 @@ Current release: **v0.4.1** (2026-11-03), [release notes](notes/release-v0.4.1.m
 | 🔗 **Collectives over PCIe** | One-shot / two-shot P2P for 2 and 4 cards; an eight-rank all-reduce and all-gather that never cross a root complex (pairs over P2P, the cross stage through pinned host pools); compressed 4/6-bit all-reduce for prefill; RCCL above. |
 | 🎯 **Speculative decoding on every family** | MTP-3 (Flash-Next, GLM), DFlash2 (27B), DSpark with adaptive verification (DeepSeek), draft metadata and all-reduces inside the HIP graphs. |
 | 📏 **Measured, not guessed** | A per-kernel ledger of the DeepSeek step ([notes/exl3-ledger.md](notes/exl3-ledger.md)) decides what gets built; every serve script's default has its measurement next to it. |
-| 🧪 **Gated releases** | Strict sanity above `max_num_seqs`, 15-minute mixed-length soaks, long-context needles, paired GSM8K and HumanEval on every tagged tree ([notes/release-v0.4.1.md](notes/release-v0.4.1.md)). |
+| 🧪 **Gated releases** | Strict sanity above `max_num_seqs`, 15-minute mixed-length soaks, long-context needles, paired GSM8K and HumanEval on every tagged tree, a drafter self-test after every DeepSeek launch ([notes/release-v0.4.2.md](notes/release-v0.4.2.md)). |
 | 🧰 **Launchers and benches** | One serve script per configuration (`serve/`), warm-up, sanity, soak, eval and needle tools (`bench/`), kernel unit tests (`tests/`), `R9K_*=stock` to switch any kernel back to vLLM's. |
 
 ## Speed
@@ -69,8 +69,8 @@ Current release: **v0.4.1** (2026-11-03), [release notes](notes/release-v0.4.1.m
 | **Qwen3.8-27B-NVFP4**, 2 cards, DFlash2 | **216-222 tok/s** (4.5 tokens a step) | 527 / 640 at 8 / 16 streams | 3.9k tok/s (8k prompt) | 367k tokens |
 | **Qwen3.8-Flash-Next**, 4 cards, MTP-3 | **210-225 tok/s** | 913-944 at 16 streams | 6.8-7.5k tok/s (8k) | ~480k |
 | **Qwen3.8-Flash-Next**, 2 cards, experts in host RAM | 122 (Gen3 host) / 143 (Gen5) | 177 / 257 at 8 streams | 2.6k / 3.7k | 221k |
-| **GLM-5.3-Flash**, 8 cards, MTP-3 | **93-100 tok/s** | 234 at 4 streams | 2.5-3.4k tok/s | 176-210k |
-| **DeepSeek-V4.1-Flash** EXL3 2.9 bpw, 8 cards, DSpark k=5 | **87-97 prose / 202 code** (v0.4.0: 73 / 152) | 179-212 prose / 368 code at 4 streams | 3.4k tok/s | 329k (32k) / 314k (128k recipe) |
+| **GLM-5.3-Flash**, 8 cards, MTP-3 | **93-100 tok/s** | 221-234 at 4 streams | 2.5-3.4k tok/s | 176-210k |
+| **DeepSeek-V4.1-Flash** EXL3 2.9 bpw, 8 cards, DSpark k=5 | **104 prose / 215 code** (v0.4.1: 87-97 / 202) | 199-221 prose / 422 code at 4 streams, 317 / 555 at 8 | 3.6k tok/s | 387k (32k) / 392k (128k recipe) |
 
 Two DGX Sparks on TensorFold serve the same DeepSeek pack at 81 prose / 118 code single stream and 154-166 at four
 streams. DeepSeek accuracy on this stack: GSM8K 193-196 / 200, needles 9 / 9 to 28k and retrieval at 126.7k-token

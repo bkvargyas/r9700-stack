@@ -1,4 +1,4 @@
-# v0.4.2 -- the DeepSeek-V4.1-Flash step, second pass: eight streams, the expert tier and the KV budget (2026-11-0X)
+# v0.4.2 -- the DeepSeek-V4.1-Flash step, second pass: eight streams, the expert tier and the KV budget (2026-11-04)
 
 Same pin as v0.4.0 and v0.4.1 (`nightly-rocm100-e4a5b553`, vLLM 0.32 line, torch 2.13, ROCm 10.0), same image. The second pass
 of the "2x the Sparks" program (notes/exl3-plan.md "Phase 4"; the two DGX Sparks on TensorFold serve this pack at 80.7 tok/s
@@ -63,15 +63,51 @@ eight-card runs at the -500 MHz offset).
 
 ## Speed (DeepSeek-V4.1-Flash, eight cards, launcher defaults; v0.4.1 in parentheses, two DGX Sparks in brackets)
 
-__REL_SPEED__
+Clean tree = git archive of the tag, VM100, the launcher defaults (MAXLEN 32768, KVMEM 2.0, DSpark k = 5 with adaptive
+verification, the placement map on); `~/ds41/exl3/S/validate-42.log` (NSEQ 4, 2026-11-04 17:07-17:35 UTC) and
+`validate-42-n8.log` (NSEQ 8, 17:47-18:01); spectune, greedy, best of 2 reps.
+
+| | single stream | per stream x 4 (aggregate) | per stream x 8 (aggregate; NSEQ 8) |
+|---|---:|---:|---:|
+| prose | **103.5 tok/s** (86.8-96.7) [81] | 56.7-64.5 (**199-221**) (48-57; 179-212) [154] | 45.2 (**317**) |
+| code | **214.5** (201.7-202.6) [118] | 113.8 (**422-423**) (99.7-99.9; 368-369) [166] | 75.9 (**555**) |
+| GSM8K-style | 153.5 (144.7) | 81.7 (213) (71.7-83.8) | 64.0 (217) |
+
+Acceptance lengths unchanged (prose 1.69-1.77, code 4.24-4.32). Against the two Sparks: single stream 1.3x prose / 1.8x code, four
+streams 1.3-1.4x prose / 2.5x code, and at eight streams 2.1x / 3.3x their four-stream aggregates. **Power:** the eight cards draw
+1.5-1.6 kW during decode at every stream count (sysfs `power1_average` sampled every 2 s through the NSEQ 8 pass; the cap is 210 W
+a card) and ~105 W idle with the model loaded; the host is not metered. Tokens a kWh of card power: ~230k prose / ~480k code at
+one stream, ~500k / ~950k at four, ~710k / ~1.25M at eight.
 
 ## Validation
 
-__REL_VALIDATION__
+**DeepSeek-V4.1-Flash TP8, NSEQ 4, the launcher defaults on the tagged tree** (`validate-42.log`): model load 26.34 GiB a rank in
+531 s, RoPE caches trimmed (494 MiB freed a rank), KV cache **387,069 tokens** (11.8 x 32k; v0.4.1 329,008). Launch self-test
+prose 1.65 / code 3.85. TTFT 1.28 s on a 1.5k prompt (1,210 tok/s) and 3.42 s on 12.3k (3,599 tok/s); a 4 x 12k prefill burst
+leaves 0.52 GiB free on the worst card. spectune: the table above. divergence.py **23 / 24, 24 / 24, 24 / 24** (v0.4.1 22 / 24 / 22).
+Needles 3 / 3 at 8k, 16k and 28k. Strict sanity 0 bad of 25 at 5 streams and 0 of 80 at 8, twice. Soak (8 clients, 200-28k-token
+prompts, 925 s): 187 requests, 0 errors, median prompt 14.2k tokens, 2,945 prompt tok/s, worst card 0.52 GiB free throughout.
+GSM8K 200: **194 / 200 = 97.0 %** (1 truncated; v0.4.1 193). 0 server errors.
 
-__N8__
+**NSEQ 8 on the same tree** (`validate-42-n8.log`, the first eight-stream validation of this configuration): launch self-test
+prose 1.66 / code 3.55; spectune 1 / 4 / 8 streams prose 101.7 / 51.8 x 4 (184) / 45.2 x 8 (**317**), code 214.7 / 113.0 x 4
+(417) / 75.9 x 8 (**555**), GSM8K-style 158.7 / 83.9 x 4 (204) / 64.0 x 8 (217). Strict sanity 0 bad of 45 at 9 streams and 0 of
+80 at 16. Soak (8 clients, 200-28k, 606 s): 125 requests, 0 errors, median prompt 16.0k tokens, 3,179 prompt tok/s. Self-test
+after the soak unchanged (1.66 / 3.55). 0 server errors.
 
-__GATE42__
+**The other three configurations on the same tree and image** (`~/gate-042.sh` -> `~/gate042.log`, 14:47-16:49 UTC; v0.4.1's gate
+in parentheses):
+
+- **Qwen3.8-27B-NVFP4 TP2:** probe 220.4 tok/s mean (code 236 / prose 111 / json 281 / math 254), 4.64 tokens a step, 512 / 607
+  tok/s at 8 / 16 streams, prefill 3,874 tok/s on 8k. BetterBench combined **195.5** (196.4), update p99 24.7 ms; strict sanity
+  0 bad of 2,460; soak 199 requests in 961 s, 0 errors, 3,050 prompt tok/s. 0 server errors.
+- **Qwen3.8-Flash-Next TP4:** KV cache 479,076 tokens; probe 222.0 (218 / 160 / 262 / 249), 3.11 tokens a step, 466 / 909 at
+  8 / 16 streams, prefill 6,556; BetterBench combined **184.8** (185.3), update p99 15.2 ms; strict sanity 0 bad of 2,460; soak 424
+  requests in 906 s, 0 errors, 6,483 prompt tok/s. 0 server errors.
+- **GLM-5.3-Flash TP8 (32k production recipe; its small collectives take the v0.4.1 one-kernel paths, the hub path is off):**
+  KV cache 203,329 tokens (176,443); decode-only **95.1 tok/s** median (93.2), four streams 176 then **221** tok/s aggregate (172 /
+  234), 12.7k needle correct at 118.7 tok/s at depth (123.5) and 83 % acceptance; strict sanity (thinking on) 0 bad of 780; soak
+  168 requests in 978 s, 0 errors (170). 0 server errors.
 
 ## Known limits
 

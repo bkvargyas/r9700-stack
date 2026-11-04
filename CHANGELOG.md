@@ -9,7 +9,7 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
-## [0.4.2] - 2026-11-0X
+## [0.4.2] - 2026-11-04
 
 Release notes with the validation record: [notes/release-v0.4.2.md](notes/release-v0.4.2.md).
 
@@ -29,7 +29,7 @@ Release notes with the validation record: [notes/release-v0.4.2.md](notes/releas
 - The fused MoE combine runs under expert parallel (v0.4.1's `tp_size == 8` guard skipped it on every runner) and the drafter's
   markov head serves the adaptive-verification path with a one-launch confidence tail (300 -> 7.8 us): ledger step 19.11 -> 18.07 ms
   at one stream. `KVMEM` default 2.0 GiB a rank at 32k (387,069 KV tokens; was 1.7 = 329,008) and 1.0 at 128k (392,289; was 0.8),
-  after the load-time dequant path moved to 4,096-row pieces. The EXL3 decode GEMV traced and trimmed (fused wqa / wkv 18.9 -> 15.1 us at one row, wo_a 12.1 -> 10.1; `R9K_EXL3_GEMV_SHARED_KS`); the NB2=4 crash on main_proj fixed (static LDS not budgeted) and NB2=4 the default there (404 -> 299 us at 48 rows). __CL_SPEED__
+  after the load-time dequant path moved to 4,096-row pieces. The EXL3 decode GEMV traced and trimmed (fused wqa / wkv 18.9 -> 15.1 us at one row, wo_a 12.1 -> 10.1; `R9K_EXL3_GEMV_SHARED_KS`); the NB2=4 crash on main_proj fixed (static LDS not budgeted) and NB2=4 the default there (404 -> 299 us at 48 rows). DeepSeek-V4.1-Flash on eight cards: prose **103.5 tok/s** single stream (v0.4.1 87-97), code **214.5** (202); 199-221 / 422 aggregate at four streams (179-212 / 368), 317 / 555 at eight; the cards draw 1.5-1.6 kW while decoding.
 - `bench/ds41/spectune.py` takes more streams than prompts; `notes/exl3-ledger.md` carries the v0.4.1 ledger; `notes/lsa-study.md`
   (latent sparse attention: parked).
 
