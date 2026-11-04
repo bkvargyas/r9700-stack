@@ -21,6 +21,9 @@ import os
 from dataclasses import dataclass
 
 import torch
+from vllm.logger import init_logger
+
+logger = init_logger("vllm." + __name__)
 
 _L = None
 _SCR: dict = {}
@@ -53,6 +56,10 @@ def lib():
         L.r9k_dsv4_markov_last.restype = ctypes.c_int
         L.r9k_dsv4_markov_last.argtypes = [ctypes.c_long] * 4 + [ctypes.c_int] * 3 + [ctypes.c_long]
         L.r9k_dsv4_markov_blocks.restype = ctypes.c_int
+        if hasattr(L, "r9k_dsv4_markov_conf"):
+            L.r9k_dsv4_markov_conf.restype = ctypes.c_int
+            L.r9k_dsv4_markov_conf.argtypes = ([ctypes.c_long, ctypes.c_long, ctypes.c_int, ctypes.c_long, ctypes.c_int]
+                                               + [ctypes.c_long] * 8 + [ctypes.c_int] * 2 + [ctypes.c_long])
         L.r9k_dsv4_markov_blocks.argtypes = [ctypes.c_int]
         L.r9k_dsv4_sk.restype = ctypes.c_int
         L.r9k_dsv4_sk.argtypes = ([ctypes.c_long, ctypes.c_long, ctypes.c_long, ctypes.c_float, ctypes.c_int,
@@ -585,6 +592,10 @@ def _add_layer_binder(name, fn) -> None:
 
 # ================================================================================================ DSpark Markov head
 MARKOV_FP8 = os.environ.get("R9K_DSV41_MARKOV_FP8", "0") == "1"
+# Adaptive verification with the checkpoint's confidence head (the DeepSeek-V4.1 default): r9k = one launch
+# (r9k_dsv4_markov_conf: f64-summed dot, f32 sigmoid); stock = the model's own compute_confidence (gather + cat + f32 GEMM
+# + sigmoid), bit-exact with stock's loop.
+MARKOV_CONF = os.environ.get("R9K_DSV41_MARKOV_CONF", "r9k")
 _MK: dict = {}
 
 
@@ -636,6 +647,45 @@ def markov_greedy(w1, w2, base, input_ids, anchor, tokens, rows, n_spec, w2_fp8=
         raise RuntimeError(f"r9k_dsv4_markov_last failed ({rc})")
 
 
+def markov_confidence(hidden, w1, proj_w, proj_b, input_ids, anchor, tokens, rows, n_spec, out):
+    """DSpark confidence head over the drafts in one launch: out[r, i] (f32, unit step stride) =
+    sigmoid([hidden[r * n_spec + i], w1[prev(r, i)]] . proj_w + proj_b), prev(r, 0) = input_ids[anchor[r]],
+    prev(r, i) = tokens[r, i - 1]. hidden bf16 [rows * n_spec, H] (unit column stride); w1 bf16 [V, R] or None
+    (a head without the Markov input); proj_w f32 [1, H + R]; proj_b f32 [1] or None; tokens int64 (row stride)."""
+    H = hidden.shape[-1]
+    R = 0 if w1 is None else w1.shape[1]
+    st = torch.cuda.current_stream(hidden.device).cuda_stream
+    rc = lib().r9k_dsv4_markov_conf(hidden.data_ptr(), hidden.stride(0), H, _p(w1), R, proj_w.data_ptr(), _p(proj_b),
+                                    input_ids.data_ptr(), anchor.data_ptr(), tokens.data_ptr(), tokens.stride(0),
+                                    out.data_ptr(), out.stride(0), rows, n_spec, st)
+    if rc:
+        raise RuntimeError(f"r9k_dsv4_markov_conf failed ({rc}) H={H} R={R} rows={rows}")
+
+
+def _conf_why_not(model, spec, head_hidden):
+    """None when the confidence head can run on r9k_dsv4_markov_conf (else the reason)."""
+    if not hasattr(lib(), "r9k_dsv4_markov_conf"):
+        return "libr9k without r9k_dsv4_markov_conf"
+    ch = getattr(model.model, "confidence_head", None)
+    if ch is None or not hasattr(ch, "proj"):
+        return "no confidence head module"
+    p = ch.proj
+    w = getattr(p, "weight", None)
+    b = getattr(p, "bias", None)
+    if p.quant_method.__class__.__name__ != "UnquantizedLinearMethod" or w is None or w.dtype != torch.float32 \
+            or w.dim() != 2 or w.shape[0] != 1 or not w.is_contiguous():
+        return "confidence head not an unquantized f32 [1, K] linear"
+    if b is not None and (b.dtype != torch.float32 or b.numel() != 1):
+        return "confidence head bias"
+    R = model.model.markov_head.markov_w1.weight.shape[1] if getattr(ch, "with_markov", True) else 0
+    if head_hidden.dtype != torch.bfloat16 or head_hidden.dim() != 2 or w.shape[1] != head_hidden.shape[1] + R \
+            or head_hidden.stride(1) != 1:
+        return "confidence head input shape"
+    if not hasattr(spec, "draft_token_confidence_probs"):
+        return "no draft_token_confidence_probs"
+    return None
+
+
 def _markov_why_not(model, spec, num_reqs):
     head = getattr(getattr(model, "model", None), "markov_head", None)
     if head is None:
@@ -644,8 +694,10 @@ def _markov_why_not(model, spec, num_reqs):
         return "probabilistic drafts"
     if getattr(spec, "draft_watermarker", None) is not None or getattr(spec, "_d2t_scatter_index", None) is not None:
         return "watermarker / reduced vocabulary"
-    if getattr(spec, "use_confidence_head", False) or getattr(spec, "_draft_topk", None) is not None:
-        return "confidence head / draft top-k"
+    if getattr(spec, "_draft_topk", None) is not None:
+        return "draft top-k"
+    if getattr(spec, "use_confidence_head", False) and getattr(model.model, "confidence_head", None) is None:
+        return "confidence head expected but missing"
     if hasattr(model, "apply_output_logit_transform"):
         return "an output logit transform"
     if not 1 <= num_reqs <= 8:
@@ -663,10 +715,29 @@ def _markov_why_not(model, spec, num_reqs):
     return None
 
 
+_MK_SEEN: set = set()
+
+
+def _mk_note(key, msg, *args, warn=False):
+    if key not in _MK_SEEN:
+        _MK_SEEN.add(key)
+        (logger.warning if warn else logger.info)(msg, *args)
+
+
 def markov_sample_sequential(model, spec, num_reqs: int, head_hidden: torch.Tensor) -> bool:
     """DSparkSpeculator._sample_sequential (greedy drafts) on r9k_dsv4_markov_step: n_spec + 1 launches instead of
-    ~5 a step (embedding, bias GEMV, add, argmax, copy). Returns False, having done nothing, otherwise."""
-    if _markov_why_not(model, spec, num_reqs) is not None:
+    ~5 a step (embedding, bias GEMV, add, argmax, copy). Adaptive verification: with the confidence head (DeepSeek-V4.1's
+    checkpoint has one; the speculator then has no acceptance estimator) one more launch writes
+    draft_token_confidence_probs from the drafts (r9k_dsv4_markov_conf, or stock's compute_confidence with
+    R9K_DSV41_MARKOV_CONF=stock); with the acceptance estimator it gets each step's logits. Returns False, having done
+    nothing, otherwise."""
+    why = _markov_why_not(model, spec, num_reqs)
+    conf = bool(getattr(spec, "use_confidence_head", False))
+    cwhy = None
+    if why is None and conf and MARKOV_CONF == "r9k":
+        cwhy = _conf_why_not(model, spec, head_hidden)
+    if why is not None:
+        _mk_note(("no", why), "r9700: DSpark Markov head on stock's loop (%s)", why, warn=True)
         return False
     n_spec = spec.num_speculative_steps
     num_sample = num_reqs * n_spec
@@ -676,7 +747,9 @@ def markov_sample_sequential(model, spec, num_reqs: int, head_hidden: torch.Tens
     if base.dtype != torch.bfloat16 or base.shape[-1] != V or base.stride(-1) != 1 or not base.is_contiguous():
         base = base.to(torch.bfloat16).contiguous()
         if base.shape[-1] != V:
-            return _markov_rest(model, spec, num_reqs, base)
+            _mk_note(("rest",), "r9700: DSpark Markov head: draft logits width %d != %d, stock bias loop", base.shape[-1],
+                     V, warn=True)
+            return _markov_rest(model, spec, num_reqs, base, sample_hidden)
     base = base.view(num_reqs, n_spec, V)
     head = model.model.markov_head
     w2 = head.markov_w2.weight
@@ -693,10 +766,33 @@ def markov_sample_sequential(model, spec, num_reqs: int, head_hidden: torch.Tens
             spec._maybe_predict_acceptance(lg, idx_map[:, step], spec._step_cols[step])
     markov_greedy(head.markov_w1.weight, w2, base, spec.input_buffers.input_ids, spec._anchor_idx, spec.draft_tokens,
                   num_reqs, n_spec, fp8, on)
+    mode = "estimator gets each step's logits" if on is not None else "no adaptive input"
+    if conf:
+        if MARKOV_CONF == "r9k" and cwhy is None:
+            ch = model.model.confidence_head
+            markov_confidence(sample_hidden, head.markov_w1.weight if getattr(ch, "with_markov", True) else None,
+                              ch.proj.weight, ch.proj.bias, spec.input_buffers.input_ids, spec._anchor_idx,
+                              spec.draft_tokens, num_reqs, n_spec, spec.draft_token_confidence_probs)
+            mode = "confidence head on r9k_dsv4_markov_conf"
+        else:
+            _stock_confidence(model, spec, num_reqs, sample_hidden)
+            mode = "confidence head on stock's compute_confidence" + (f" ({cwhy})" if cwhy else "")
+    _mk_note(("on", mode), "r9700: DSpark Markov head on r9k_dsv4_markov (adaptive verification: %s)", mode)
     return True
 
 
-def _markov_rest(model, spec, num_reqs, base_logits) -> bool:
+def _stock_confidence(model, spec, num_reqs, sample_hidden):
+    """Stock's confidence tail from the drafts: markov_embed(prev) per step (prev = anchor, then the drafts), stacked
+    (req, step), compute_confidence -> draft_token_confidence_probs. Same ops on the same tokens as stock's loop."""
+    n_spec = spec.num_speculative_steps
+    prev0 = spec.input_buffers.input_ids[spec._anchor_idx[:num_reqs]]
+    embeds = [model.markov_embed(prev0)] + [model.markov_embed(spec.draft_tokens[:num_reqs, i])
+                                             for i in range(n_spec - 1)]
+    confidence = model.compute_confidence(sample_hidden, torch.stack(embeds, dim=1).flatten(0, 1))
+    spec.draft_token_confidence_probs[:num_reqs] = confidence.view(num_reqs, n_spec)
+
+
+def _markov_rest(model, spec, num_reqs, base_logits, sample_hidden) -> bool:
     n_spec = spec.num_speculative_steps
     num_sample = num_reqs * n_spec
     base_logits = base_logits.view(num_reqs, n_spec, -1)
@@ -708,6 +804,8 @@ def _markov_rest(model, spec, num_reqs, base_logits) -> bool:
         draft = spec._sample_logits(base_logits[:, i] + bias, idx_map[:, i], sample_pos[:, i], i)
         spec.draft_tokens[:num_reqs, i] = draft
         prev = draft
+    if getattr(spec, "use_confidence_head", False):
+        _stock_confidence(model, spec, num_reqs, sample_hidden)
     return True
 
 

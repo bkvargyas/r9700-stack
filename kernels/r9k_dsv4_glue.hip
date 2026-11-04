@@ -634,6 +634,38 @@ __global__ void r9k_dsv4_markov_last_kernel(const float* __restrict__ prev_max, 
   if (lane == 0) tokens[(long)r * tok_stride + step] = prev_arg[r * nb + bi];
 }
 
+// DSpark confidence head on the drafts (adaptive verification with the checkpoint's trained confidence head; stock:
+// gather + cat + .float() + an f32 [K -> 1] GEMM + sigmoid + copy). One block per (request r, draft step i), b = r * n + i:
+// x = [hidden[b] (bf16 [H]), w1[prev(r, i)] (bf16 [R])], conf[r, i] = sigmoid(f32(x) . proj (f32 [H + R]) + bias),
+// prev(r, 0) = input_ids[anchor[r]], prev(r, i) = tokens[r, i - 1] (the drafts the Markov launches wrote). The dot is
+// summed in f64 and rounded once to f32 (within half an f32 ulp of the exact dot; stock's f32 GEMM sits within its own
+// summation order's error of the same value), the sigmoid in f32 as torch's: 1 / (1 + exp(-z)).
+__global__ void __launch_bounds__(NT) r9k_dsv4_markov_conf_kernel(
+    const uint16_t* __restrict__ hidden, long h_stride, int H, const uint16_t* __restrict__ w1, int R,
+    const float* __restrict__ proj, const float* __restrict__ pbias, const int* __restrict__ input_ids,
+    const long* __restrict__ anchor, const long* __restrict__ tokens, long tok_stride, float* __restrict__ conf,
+    long conf_stride, int n_spec) {
+  __shared__ double s_p[NT / 32];
+  const int b = blockIdx.x, r = b / n_spec, i = b % n_spec, t = threadIdx.x, lane = t & 31, wave = t >> 5;
+  const long prev = i == 0 ? (long)input_ids[anchor[r]] : tokens[(long)r * tok_stride + i - 1];
+  const uint16_t* hx = hidden + (long)b * h_stride;
+  const uint16_t* ex = w1 + prev * R;
+  double acc = 0.0;
+  for (int k = t; k < H; k += NT) acc = fma((double)bf2f(hx[k]), (double)proj[k], acc);
+  for (int k = t; k < R; k += NT) acc = fma((double)bf2f(ex[k]), (double)proj[H + k], acc);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor(acc, o, 32);
+  if (lane == 0) s_p[wave] = acc;
+  __syncthreads();
+  if (t == 0) {
+    double z = 0.0;
+    for (int w = 0; w < NT / 32; w++) z += s_p[w];
+    float zf = (float)z;
+    if (pbias) zf += pbias[0];
+    conf[(long)r * conf_stride + i] = 1.f / (1.f + expf(-zf));
+  }
+}
+
 }  // namespace
 
 extern "C" int r9k_dsv4_glue_max_m() { return MAXM; }
@@ -687,6 +719,20 @@ extern "C" int r9k_dsv4_markov_last(long prev_max, long prev_arg, long tokens, l
   const int nb = (V + MK_BLOCK - 1) / MK_BLOCK;
   hipLaunchKernelGGL(r9k_dsv4_markov_last_kernel, dim3(rows), dim3(32), 0, (hipStream_t)stream, (const float*)prev_max,
                      (const int*)prev_arg, (long*)tokens, tok_stride, nb, step);
+  return hipGetLastError() == hipSuccess ? 0 : -6;
+}
+
+// The confidence head over rows x n_spec drafts (r9k_dsv4_markov_conf_kernel); run after r9k_dsv4_markov_last.
+// hidden bf16 [rows * n_spec, H] (row stride h_stride), w1 bf16 [V, R] (R = 0: no Markov input), proj f32 [H + R],
+// pbias f32 [1] or 0, tokens int64 (tok_stride), conf f32 (conf_stride; unit step stride).
+extern "C" int r9k_dsv4_markov_conf(long hidden, long h_stride, int H, long w1, int R, long proj, long pbias,
+                                    long input_ids, long anchor, long tokens, long tok_stride, long conf,
+                                    long conf_stride, int rows, int n_spec, long stream) {
+  if (rows < 1 || n_spec < 1 || H < 1 || R < 0 || (R && !w1)) return -1;
+  hipLaunchKernelGGL(r9k_dsv4_markov_conf_kernel, dim3(rows * n_spec), dim3(NT), 0, (hipStream_t)stream,
+                     (const uint16_t*)hidden, h_stride, H, (const uint16_t*)w1, R, (const float*)proj,
+                     (const float*)pbias, (const int*)input_ids, (const long*)anchor, (const long*)tokens, tok_stride,
+                     (float*)conf, conf_stride, n_spec);
   return hipGetLastError() == hipSuccess ? 0 : -6;
 }
 

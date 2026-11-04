@@ -598,5 +598,186 @@ if os.environ.get("TIMING", "1") != "0":
         print(f"  rows={rows_}: stock loop {r_st:.1f}, r9k {r_ours:.1f} (+ logits stored {r_lg:.1f}), r9k fp8 head {r_f8:.1f}",
               flush=True)
 
+
+# ------------------------------------------------------------------------------------- confidence head + the hook
+print("== DSpark confidence head (adaptive verification): r9k_dsv4_markov_conf vs stock's cat + f32 GEMM + sigmoid")
+CK = H + RK
+
+
+def load_conf():
+    idx = os.path.join(PACK, "model.safetensors.index.json")
+    if os.path.exists(idx):
+        from safetensors import safe_open
+        wm = json.load(open(idx))["weight_map"]
+        n = "mtp.2.confidence_head.proj.weight"
+        with safe_open(os.path.join(PACK, wm[n]), "pt") as f:
+            print("  confidence weights: pack mtp.2")
+            return f.get_tensor(n).to(torch.float32).contiguous().to(dev)       # params_dtype f32 (stock loader)
+    print("  confidence weights: random")
+    return (torch.randn(1, CK, generator=gen) * CK ** -0.5).to(dev)
+
+
+CW = load_conf()
+
+
+def conf_stock(hid, prevs, w=CW, b=None):
+    """stock DSparkConfidenceHead + compute_confidence: cat([hidden, w1[prev]]).float() -> ReplicatedLinear f32
+    (vLLM's unquantized GEMM dispatch) -> sigmoid. hid [N, H] bf16, prevs [N] token ids."""
+    e = torch.nn.functional.embedding(prevs, MW1)
+    x = torch.cat([hid, e], dim=-1).float()
+    return torch.sigmoid(_gemm(None, x, w, b).squeeze(-1)), x
+
+
+for rows_ in (1, 2, 4, 8):
+    N = rows_ * NSPEC
+    hid = rows(N, H, 1.0, 900 + rows_)
+    input_ids = torch.randint(0, VOC, (64,), generator=gen, dtype=torch.int32).to(dev)
+    anchor = (torch.arange(rows_, dtype=torch.int64) * 6).to(dev)
+    tok = torch.randint(0, VOC, (8, NSPEC), generator=gen, dtype=torch.int64).to(dev)
+    prevs = torch.cat([input_ids[anchor].long()[:, None], tok[:rows_, :NSPEC - 1]], 1).reshape(-1)
+    cs, x = conf_stock(hid, prevs)
+    out = torch.full((8, NSPEC), -1.0, device=dev)
+    G.markov_confidence(hid, MW1, CW, None, input_ids, anchor, tok, rows_, NSPEC, out)
+    zref = (x.double() @ CW.double().t()).squeeze(-1)                     # exact-ish dot
+    zst = _gemm(None, x, CW, None).squeeze(-1).double()
+    zst1 = torch.cat([_gemm(None, x[i:i + 1], CW, None).squeeze(-1) for i in range(N)]).double()   # stock at M = 1
+    ours = out[:rows_].reshape(-1)
+    zo = torch.logit(ours.double().clamp(1e-12, 1 - 1e-12))
+    e_st = (zst - zref).abs().max().item()
+    e_st1 = (zst1 - zref).abs().max().item()
+    e_o = (zo - zref).abs().max().item()
+    dc = (ours - cs).abs().max().item()
+    neq = int((ours != cs).sum())
+    check(f"confidence rows={rows_}", dc < 2e-6 and bool((out[rows_:] == -1).all()),
+          f"(prob max |ours - stock| {dc:.1e}, {neq}/{N} not bit-equal; logit |err| vs f64: stock M={N} {e_st:.1e}, "
+          f"stock M=1 {e_st1:.1e} (its own batch-size spread {(zst - zst1).abs().max().item():.1e}), ours {e_o:.1e})")
+
+print("== Markov hook on a stock-shaped speculator (greedy drafts + confidence head), eager and graph replay")
+import types
+
+
+class UnquantizedEmbeddingMethod:  # noqa: N801 -- the class name the hook checks
+    pass
+
+
+class UnquantizedLinearMethod:  # noqa: N801
+    pass
+
+
+def mk_model(base_all):
+    w2m = types.SimpleNamespace(weight=MW2, quant_method=UnquantizedEmbeddingMethod())
+    w1m = torch.nn.Embedding(VOC, RK, _weight=MW1.clone(), device=dev, dtype=torch.bfloat16)
+    proj = types.SimpleNamespace(weight=CW, bias=None, quant_method=UnquantizedLinearMethod())
+    ch = types.SimpleNamespace(proj=proj, with_markov=True)
+    mh = types.SimpleNamespace(markov_w1=w1m, markov_w2=w2m)
+    m = types.SimpleNamespace(model=types.SimpleNamespace(markov_head=mh, confidence_head=ch),
+                              logits_processor=types.SimpleNamespace(scale=1.0, soft_cap=None))
+    m.compute_draft_logits = lambda h: base_all[: h.shape[0]]
+    m.markov_embed = lambda t: w1m(t)
+    m.markov_bias = lambda e: _gemm(None, e, MW2, None)
+    m.compute_confidence = lambda hh, me: conf_stock_x(hh, me)
+    return m
+
+
+def conf_stock_x(hh, me):
+    x = torch.cat([hh, me], dim=-1).float()
+    return torch.sigmoid(_gemm(None, x, CW, None).squeeze(-1))
+
+
+def mk_spec(rows_, seed):
+    g2 = torch.Generator(device="cpu").manual_seed(seed)
+    sp = types.SimpleNamespace(draft_logits=None, draft_watermarker=None, _d2t_scatter_index=None, _draft_topk=None,
+                               use_confidence_head=True, acceptance_estimator=None, num_speculative_steps=NSPEC)
+    sp.input_buffers = types.SimpleNamespace(input_ids=torch.randint(0, VOC, (64,), generator=g2,
+                                                                       dtype=torch.int32).to(dev))
+    sp._anchor_idx = (torch.arange(8, dtype=torch.int64) * NSPEC).to(dev)
+    sp.sample_indices = torch.randperm(64, generator=g2)[:8 * NSPEC].to(dev)
+    sp.draft_tokens = torch.zeros(8, NSPEC, dtype=torch.int64, device=dev)
+    sp.draft_token_confidence_probs = torch.zeros(8, NSPEC, dtype=torch.float32, device=dev)
+    return sp
+
+
+def stock_loop(model, sp, rows_, head_hidden):
+    """DSparkSpeculator._sample_sequential, greedy drafts, use_confidence_head (this pin), no estimator."""
+    num_sample = rows_ * NSPEC
+    sh = head_hidden[sp.sample_indices[:num_sample]]
+    bl = model.compute_draft_logits(sh).view(rows_, NSPEC, -1)
+    prev = sp.input_buffers.input_ids[sp._anchor_idx[:rows_]]
+    embs = []
+    for i in range(NSPEC):
+        me = model.markov_embed(prev)
+        embs.append(me)
+        d = (bl[:, i] + model.markov_bias(me)).argmax(dim=-1)
+        sp.draft_tokens[:rows_, i] = d
+        prev = d
+    c = model.compute_confidence(sh, torch.stack(embs, dim=1).flatten(0, 1))
+    sp.draft_token_confidence_probs[:rows_] = c.view(rows_, NSPEC)
+
+
+for rows_ in (1, 4, 8):
+    base_all = (torch.randn(rows_ * NSPEC, VOC, generator=gen) * 2).bfloat16().to(dev)
+    hh = rows(64, H, 1.0, 950 + rows_)
+    m = mk_model(base_all)
+    sp_ref, sp_hk = mk_spec(rows_, 7 + rows_), mk_spec(rows_, 7 + rows_)
+    stock_loop(m, sp_ref, rows_, hh)
+    why = G._markov_why_not(m, sp_hk, rows_)
+    cwhy = G._conf_why_not(m, sp_hk, hh)
+    took = G.markov_sample_sequential(m, sp_hk, rows_, hh)
+    tsame = int((sp_hk.draft_tokens[:rows_] == sp_ref.draft_tokens[:rows_]).all(1).sum())
+    dc = (sp_hk.draft_token_confidence_probs[:rows_] - sp_ref.draft_token_confidence_probs[:rows_]).abs().max().item()
+    # graph capture + replay of the hook == its eager result
+    sp_g = mk_spec(rows_, 7 + rows_)
+    st_ = torch.cuda.Stream()
+    st_.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st_):
+        G.markov_sample_sequential(m, sp_g, rows_, hh)
+    torch.cuda.current_stream().wait_stream(st_)
+    sp_g.draft_tokens.zero_()
+    sp_g.draft_token_confidence_probs.zero_()
+    gg = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(gg):
+        G.markov_sample_sequential(m, sp_g, rows_, hh)
+    sp_g.draft_tokens.zero_()
+    sp_g.draft_token_confidence_probs.zero_()
+    gg.replay()
+    torch.cuda.synchronize()
+    geq = torch.equal(sp_g.draft_tokens, sp_hk.draft_tokens) and \
+        torch.equal(sp_g.draft_token_confidence_probs, sp_hk.draft_token_confidence_probs)
+    check(f"hook rows={rows_} (adaptive, confidence head)", why is None and cwhy is None and took and tsame == rows_
+          and dc < 2e-6 and geq,
+          f"(declines: {why} / {cwhy}; drafts identical {tsame}/{rows_}; conf max |d| {dc:.1e}; graph == eager {geq})")
+    if rows_ == 4:                                     # R9K_DSV41_MARKOV_CONF=stock: bit-exact with stock's loop
+        G.MARKOV_CONF = "stock"
+        sp_s = mk_spec(rows_, 7 + rows_)
+        G.markov_sample_sequential(m, sp_s, rows_, hh)
+        G.MARKOV_CONF = "r9k"
+        check("hook rows=4 MARKOV_CONF=stock bit-exact", torch.equal(sp_s.draft_tokens, sp_ref.draft_tokens)
+              and torch.equal(sp_s.draft_token_confidence_probs, sp_ref.draft_token_confidence_probs))
+
+if os.environ.get("TIMING", "1") != "0":
+    print("== timing: confidence head (graph replay, us)")
+    for rows_ in (1, 4):
+        N = rows_ * NSPEC
+        hid = rows(N, H, 1.0, 990)
+        input_ids = torch.randint(0, VOC, (64,), generator=gen, dtype=torch.int32).to(dev)
+        anchor = (torch.arange(rows_, dtype=torch.int64) * 6).to(dev)
+        tok = torch.randint(0, VOC, (8, NSPEC), generator=gen, dtype=torch.int64).to(dev)
+        out = torch.zeros(8, NSPEC, device=dev)
+        w1m = torch.nn.Embedding(VOC, RK, _weight=MW1.clone(), device=dev, dtype=torch.bfloat16)
+
+        def st_conf():
+            prev0 = input_ids[anchor[:rows_]]
+            es = [w1m(prev0)] + [w1m(tok[:rows_, i]) for i in range(NSPEC - 1)]
+            out[:rows_] = conf_stock_x(hid, torch.stack(es, dim=1).flatten(0, 1)).view(rows_, NSPEC)
+
+        t_st = gtime(st_conf, reps=40)
+        t_o = gtime(lambda: G.markov_confidence(hid, MW1, CW, None, input_ids, anchor, tok, rows_, NSPEC, out), reps=40)
+        print(f"  rows={rows_}: stock (5 embeddings + stack + cat + f32 GEMM + sigmoid + copy) {t_st:.1f}, "
+              f"r9k {t_o:.1f}", flush=True)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            st_conf()
+            torch.cuda.synchronize()
+        print("   stock kernels:", sorted({e.name[:60] for e in prof.events() if e.device_type.name == "CUDA"}))
+
 print("ALL OK" if ok_all else "SOME FAILED")
 sys.exit(0 if ok_all else 1)

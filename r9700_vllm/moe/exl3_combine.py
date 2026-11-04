@@ -21,7 +21,8 @@ Mechanics: install(model) rebinds MoERunner.forward of every EXL3 MoE layer (as 
 call has a shared output and no padding, `shared + fused` + the final all-reduce become torch.ops.r9700.exl3_moe_ar
 (opaque to torch.compile, captured into the HIP graphs); and wraps the layer's Exl3MoEMethod._apply_r9k to record the
 routing it ran with (ids int32, weights f32) next to its output. The op takes the record only if its output IS the
-tensor it was handed. R9K_EXL3_MOE_AR=0 (or no one-kernel ar8, or TP != 8) installs nothing.
+tensor it was handed. R9K_EXL3_MOE_AR=0 (or no one-kernel ar8, or a runner whose final reduce is not the eight-rank TP-group sum: TP8, or
+EP8 under --enable-expert-parallel, where the pin's MoE config reads tp_size 1, ep_size 8) installs nothing.
 """
 from __future__ import annotations
 
@@ -135,6 +136,39 @@ def _forward(self, hidden_states, router_logits, input_ids=None, shared_experts_
     return self._maybe_add_zero_expert_output(result)
 
 
+def _eight_rank_reduce(cfg) -> bool:
+    """The runner's final all-reduce is the eight-rank TP-group sum: TP8 (tp 8, ep 1) or, under
+    --enable-expert-parallel, the pin's flattened EP8 (tp 1, ep 8: _maybe_reduce_final_output reduces when tp > 1 or
+    ep > 1, over the same TP group). No DP / PCP / all2all kernels (those combine elsewhere)."""
+    tp, ep = getattr(cfg, "tp_size", 1), getattr(cfg, "ep_size", 1)
+    if getattr(cfg, "dp_size", 1) != 1 or getattr(cfg, "pcp_size", 1) != 1:
+        return False
+    pc = getattr(cfg, "moe_parallel_config", None)
+    if pc is not None and getattr(pc, "use_all2all_kernels", False):
+        return False
+    return (tp, ep) in ((8, 1), (1, 8))
+
+
+def _why_not(mod, qm, cfg, need) -> list:
+    """The checks install() makes on a runner, by name: [] = take it."""
+    checks = (
+        ("Exl3MoEMethod with _apply_r9k", type(qm).__name__ == "Exl3MoEMethod" and hasattr(qm, "_apply_r9k")),
+        ("shared experts", getattr(mod, "_shared_experts", None) is not None),
+        ("MoERunner.forward helpers", all(hasattr(mod, a) for a in need)),
+        ("routed output transform", getattr(mod, "routed_output_transform", None) is None),
+        ("routed_scaling_factor != 1", getattr(mod, "routed_scaling_factor", 1.0) == 1.0),
+        ("zero-expert router", type(getattr(mod, "router", None)).__name__ != "ZeroExpertRouter"),
+        ("no moe_config", cfg is not None),
+        ("sequence parallel", cfg is not None and not getattr(cfg, "is_sequence_parallel", True)),
+        ("skip_final_all_reduce", cfg is not None and not getattr(cfg, "skip_final_all_reduce", True)),
+        (f"not an eight-rank reduce (tp {getattr(cfg, 'tp_size', '?')}, ep {getattr(cfg, 'ep_size', '?')})",
+         cfg is not None and _eight_rank_reduce(cfg)),
+        ("fused output pre-reduced", hasattr(mod, "_fused_output_is_reduced") and not mod._fused_output_is_reduced),
+        ("moe/fold.py took it", not getattr(mod, "_r9k_fold", False)),
+    )
+    return [n for n, ok in checks if not ok]
+
+
 def install(model: torch.nn.Module) -> int:
     """Rebind every EXL3 MoE runner under `model` whose tail is exactly `shared + fused` -> all-reduce. Call once after
     the model is built (before torch.compile traces it). Returns the number of runners taken."""
@@ -151,17 +185,11 @@ def install(model: torch.nn.Module) -> int:
             continue
         qm = getattr(mod, "_quant_method", None)
         cfg = getattr(mod, "moe_config", None)
-        ok = (type(qm).__name__ == "Exl3MoEMethod" and hasattr(qm, "_apply_r9k")
-              and getattr(mod, "_shared_experts", None) is not None and all(hasattr(mod, a) for a in need)
-              and getattr(mod, "routed_output_transform", None) is None
-              and getattr(mod, "routed_scaling_factor", 1.0) == 1.0
-              and type(getattr(mod, "router", None)).__name__ != "ZeroExpertRouter"
-              and cfg is not None and not getattr(cfg, "is_sequence_parallel", True)
-              and not getattr(cfg, "skip_final_all_reduce", True) and getattr(cfg, "tp_size", 1) == 8
-              and not mod._fused_output_is_reduced and not getattr(mod, "_r9k_fold", False))
-        if not ok:
+        why = _why_not(mod, qm, cfg, need)
+        if why:
             if type(qm).__name__ == "Exl3MoEMethod":
-                logger.warning_once("r9700: exl3 MoE combine fusion skipped for %s (runner shape changed)", name)
+                logger.warning_once("r9700: exl3 MoE combine fusion skipped for %s (runner shape changed: %s)", name,
+                                    ", ".join(why))
             continue
         if n == 0:
             gate.check("moe_shared_fold")                       # the same MoERunner.forward copy as moe/fold.py
