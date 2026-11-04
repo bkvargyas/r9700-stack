@@ -635,3 +635,18 @@ B's kernel runs only with ADAPTIVE=false; the decline is in dsv4_glue._markov_wh
 -3.2 at 24 (14.9 MB of attention GEMVs a layer at 450 GB/s = 33 us vs 63); G -1.1 to -1.9 ms at 24 rows (kernel part only);
 C2 (combine gate) ~-0.9; B2 (markov under adaptive + the f32 GEMM) ~-0.5; **new H3: expert-parallel load skew** (replicas of hot
 experts / a routing-histogram placement; vLLM's EPLB as the reference) is the biggest remaining item.
+
+### v0.4.2 results, package CB2 (2026-11-04 04:04-04:16 UTC; clean tree v0.4.1 + CB2; `~/ds41/exl3/CB2/a1/run.log`)
+- **Root causes.** The fused MoE combine was skipped on all 43 runners because `exl3_combine.install` required `tp_size == 8`; under
+  `--enable-expert-parallel` the pinned vLLM's MoE parallel config is tp 1 / ep 8 and still all-reduces over the eight-rank group, so
+  the tail C's kernel replaces is the same. B's markov kernel declined under adaptive verification because this pack carries
+  `mtp.2.confidence_head.proj.weight`: with adaptive on, stock enables the confidence head and disables the acceptance estimator;
+  the "adaptive f32 GEMM" of the ledger (0.62 ms) is stock's confidence projection (cat([hidden, w1[prev]]) -> f32 [5376 -> 1] ->
+  sigmoid), not the estimator.
+- **Fixes.** `_eight_rank_reduce` accepts (tp 8, ep 1) or (tp 1, ep 8); skips now log the failing check. The markov hook serves the
+  adaptive path with a one-launch confidence tail (`r9k_dsv4_markov_conf`: f64 dot, one f32 rounding, f32 sigmoid; 300 -> 7.8 us;
+  probabilities within 1e-6 of stock's, i.e. inside stock's own summation error; `R9K_DSV41_MARKOV_CONF=stock` is bit-exact).
+- **Server (defaults, adaptive on):** both hooks engaged on 40 + 3 runners, "fused into the ar8 one-kernel all-reduce (first call
+  T=2)", 0 skips. Ledger workload step **18.07 ms** (v0.4.1 19.11) at one stream, **31.25** (32.26) at four. spectune prose x1
+  **98.1** tok/s (MAL 1.74), x4 54-59 per stream (188-219 aggregate); code x1 **208** (4.45), x4 106-107 (393-395 aggregate).
+  divergence 23 / 24 / 24, GSM8K 98 / 100. Committed on v042.
