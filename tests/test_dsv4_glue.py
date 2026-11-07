@@ -186,8 +186,9 @@ if have_x:
             X.exl3_gemm(a16, tr, cc, suh, ah, svh, -1, False, True, 0)
             ours = G.prepass(x, None, suh)
             d = (ours.view(torch.int16).int() - ah.view(torch.int16).int()).abs()
-            # M = 1: exllamav3's single-row rotation, bit-exact; M > 1: its multi-row rotation differs by <= 2 f16 ulp
-            check(f"rotated input K={K} M={M} vs exl3_gemm A_had", torch.equal(ours, ah) if M == 1 else int(d.max()) <= 2,
+            # bit-exact with exllamav3's single-row (M = 1) and multi-row rotations: both round h * 1/sqrt(128) to f16 once
+            # (exllamav3's -ffp-contract=fast build; our f2h_mul), the earlier f32-then-f16 path missed near-ties by 1 ulp
+            check(f"rotated input K={K} M={M} vs exl3_gemm A_had", torch.equal(ours, ah),
                   f"({int((d > 0).sum())}/{d.numel()} differ, max {int(d.max())} f16 ulp)")
         x = rows(4, K, 2.0, 99)
         w = W["attn_norm"] if K == H else W["q_norm"]

@@ -54,6 +54,14 @@ __device__ __forceinline__ uint16_t f2bf(float f) {    // round to nearest even 
 __device__ __forceinline__ float rbf(float f) { return bf2f(f2bf(f)); }
 __device__ __forceinline__ uint16_t f2h(float f) { return __half_as_ushort(__float2half_rn(f)); }
 __device__ __forceinline__ float h2f(uint16_t u) { return __half2float(__ushort_as_half(u)); }
+// a * b rounded once to f16 (the f32 x f32 product is exact in f64). exllamav3 is built with HIP's default
+// -ffp-contract=fast, so its `__floats2half2_rn(h * r_scale)` compiles to a mixed-precision multiply with an f16 result:
+// one rounding. libr9k builds with -ffp-contract=off, where the same source rounds twice (f32, then f16) and lands one
+// f16 ulp away on near-ties (~1 output in 15k; tests/test_dsv4_glue.py "rotated input ... M=1").
+__device__ __forceinline__ uint16_t f2h_mul(float a, float b) {
+  const _Float16 r = (_Float16)((double)a * (double)b);
+  return __builtin_bit_cast(uint16_t, r);
+}
 
 __device__ __forceinline__ float wave_sum(float v) {
 #pragma unroll
@@ -185,12 +193,10 @@ __global__ void __launch_bounds__(NT) r9k_dsv4_norm_kernel(NormArgs a) {
 #pragma unroll
         for (int i = 0; i < 4; i++) h[i] = h2f(f2h(h[i] * h2f(su[i])));   // __hmul2 (exact product, one rounding)
         had128(h, lane);
-#pragma unroll
-        for (int i = 0; i < 4; i++) h[i] *= RS128;
       }
       v4u16 o;
 #pragma unroll
-      for (int i = 0; i < 4; i++) o[i] = f2h(h[i]);
+      for (int i = 0; i < 4; i++) o[i] = sg.suh ? f2h_mul(h[i], RS128) : f2h(h[i]);   // * 1/sqrt(128), one rounding
       *reinterpret_cast<v4u16*>(sg.out_h + (long)m * sg.out_h_stride + k) = o;
     }
   }
