@@ -97,7 +97,7 @@ def mtp_weights(weights, mtp_mxfp4: bool):
         if mtp_mxfp4 and (_MTP_EXPERTS_FUSED.search(name) or (_MTP_MLP_FP8.search(name) and name.endswith(".weight"))) \
                 and w.dtype == torch.bfloat16:
             # MSE-searched block exponents (quant/nvfp4.py): 3-5% lower error than round-to-nearest on bf16 MLP weights
-            q = [quantize_mxfp4_search(x.cuda().float()) for x in w.reshape(-1, w.shape[-1]).split(1 << 18)]
+            q = [quantize_mxfp4_search(x.cuda().float()) for x in w.reshape(-1, w.shape[-1]).split(1 << 15)]
             yield f"{name}_packed", torch.cat([p for p, _ in q]).cpu().reshape(*w.shape[:-1], -1)
             yield f"{name}_scale", torch.cat([s for _, s in q]).cpu().reshape(*w.shape[:-1], -1)
             continue
