@@ -87,8 +87,19 @@ env \
                                         # qwen3 parsers; JSON without spaces: serve.sh word-splits EXTRA)` \
   "${@}" \
   bash "$(dirname "$(realpath "$0")")/serve.sh" || exit $?
+# wait_ready: until the server answers, for as long as its container is alive (READY_WAIT seconds, default 3600). A
+# cold-page-cache launch (the 385 GiB pack + the Engram tables read from disk, e.g. right after another model ran) takes
+# 35-45 minutes to load; the old fixed 20-minute wait reported a still-loading server as a failed self-test (2026-11-07).
+wait_ready() {
+  local t=0
+  until curl -s "localhost:${PORT:-8080}/v1/models" >/dev/null 2>&1; do
+    docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "${NAME:-vllmstock}" || sudo docker ps --format "{{.Names}}" 2>/dev/null | grep -qx "${NAME:-vllmstock}" || { echo "ds41-exl3.sh: container ${NAME:-vllmstock} exited before the server came up" >&2; return 1; }
+    t=$((t + 10)); [ $t -ge "${READY_WAIT:-3600}" ] && { echo "ds41-exl3.sh: server not up after ${READY_WAIT:-3600} s" >&2; return 1; }
+    sleep 10
+  done
+}
 if [ "${WARM:-0}" = 1 ]; then
-  for i in $(seq 1 120); do curl -s "localhost:${PORT:-8080}/v1/models" >/dev/null 2>&1 && break; sleep 10; done
+  wait_ready || exit 2
   python3 - "${PORT:-8080}" "${SERVED_NAME-DeepSeek-V4.1}" <<'PY'
 import json, sys, urllib.request
 port, model = sys.argv[1], sys.argv[2]
@@ -106,7 +117,7 @@ fi
 # i.e. the DSpark drafter accepting nothing while the target text stays sane (notes/exl3-drafter-heisenbug.md); exit 2 when
 # the server cannot be queried. SELFTEST=0 skips it; it is skipped with DSPARK=0 and DRYRUN=1.
 if [ "${SELFTEST:-1}" = 1 ] && [ "${DRYRUN:-0}" != 1 ] && [ "${DSPARK:-1}" = 1 ]; then
-  for i in $(seq 1 120); do curl -s "localhost:${PORT:-8080}/v1/models" >/dev/null 2>&1 && break; sleep 10; done
+  wait_ready || exit 2
   python3 "$ROOT/bench/ds41/drafter_selftest.py" "http://localhost:${PORT:-8080}" "${SERVED_NAME-DeepSeek-V4.1}" || {
     echo "ds41-exl3.sh: drafter self-test FAILED (the server is still running; SELFTEST=0 skips the check)" >&2; exit 1; }
 fi
