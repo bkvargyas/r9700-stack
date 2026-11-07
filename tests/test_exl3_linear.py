@@ -340,8 +340,14 @@ def t_graph(E, cfg, fused):
 
 
 def t_graph_unwarmed(E):
-    """Negative control (informational): why apply never sends 9+ rows to one exl3_gemm -- a single 32-row call on a
-    never-tuned shape takes the autotuned WMMA GEMM, whose first call host-syncs inside the capture."""
+    """Negative control (informational): why apply never sends 9+ rows to one exl3_gemm. exllamav3 v1.6.6 routes 1..8
+    rows to its multi-row GEMV (tag 92; _warm allocates its parameter block eagerly). A 9+ row call goes through
+    exl3_gemv_try_launch, whose first line pre-warms the graph-GEMV parameter block with a raw hipMalloc (4,128 bytes)
+    on the assumption that "no exllamav3 Graph" means "not capturing" -- false under a torch stream capture: that
+    hipMalloc returns hipErrorStreamCaptureUnsupported, the first error (traced 2026-11-07 with rocgdb + AMD_LOG_LEVEL=3,
+    notes/vllm-0.33.md); the kernel launch after it and EndCapture then report hipErrorStreamCaptureInvalidated. With
+    the block pre-warmed by an eager 9+ row call, the next blocker is the cooperative GEMM's autotuner, which times
+    candidates with hipStreamSynchronize on the capture stream on the first call of a shape (coop_autotune.cu)."""
     t = make_exl3(3072, 1536, 4, seed=6)
     p = E.Exl3Part(t["trellis"].cuda(), t["suh"].cuda(), t["svh"].cuda(), 4, False, True, 0, 1536)
     a = X(32, 3072, 1).half()
@@ -356,7 +362,10 @@ def t_graph_unwarmed(E):
         e = rel(y, a.float() @ ref_weight(E, t))
         print(f"    cold capture at M=32 went through; replay rel {e:.1e}", flush=True)
     except Exception as ex:  # noqa: BLE001
-        print(f"    cold capture at M=32 failed: {type(ex).__name__}: {str(ex)[:200]}", flush=True)
+        # the expected outcome (see the docstring): exllamav3's lazy parameter-block hipMalloc, then its autotuner's
+        # stream sync, are not capturable; apply() chunks to <= 8 rows and _warm runs them eagerly before any capture
+        print(f"    expected (negative control, not a failure): cold capture at M=32 failed: {type(ex).__name__}: "
+              f"{str(ex)[:160]}", flush=True)
 
 
 def bench(fn, it=50):
