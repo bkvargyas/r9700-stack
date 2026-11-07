@@ -7,7 +7,18 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+- **Startup calibration of the TP4 collective cutoffs** (`comm/calibrate.py`): one-shot / two-shot / RCCL all-reduce
+  and r9k / RCCL all-gather, graph-timed on every rank at launch, slowest rank decides. The fixed cutoffs were PLX-switch
+  numbers; on a box with every card on its own CPU root port they put 8-16-stream decode on a two-shot path 4-9x slower
+  than RCCL (notes/root-ports.md). `R9K_ARN_CALIBRATE=0` keeps the fixed cutoffs; explicit `R9K_ARN_1S_KB` /
+  `R9K_ARN_MAX_KB` / `R9K_AG` / `R9K_AG_MAX_KB` are respected.
+- notes/root-ports.md: bring-up and measurements of a switchless 4x R9700 box (passthrough, P2P kernel config, collectives,
+  step ledger against the PLX box, prefix caching for agent workloads).
+
+### Changed
+- The compressed all-reduce (`ar4`) only takes messages above the exact path's original ceiling (`ar4_min`, 512 KiB), so
+  a calibrated, smaller exact range sends the sizes in between to RCCL instead of compressing decode-sized messages.
 
 ## [0.4.2] - 2026-11-04
 

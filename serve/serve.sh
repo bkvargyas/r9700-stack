@@ -3,7 +3,7 @@
 # Experts in pinned host memory (stock --cpu-offload-params) + the plugin's device LRU expert cache, PLE int6
 # table in pinned host, bf16 KV (stock QSA), MTP via the plugin's allowlist patch.
 # Knobs: MODEL (path inside the container, /models/...), OFFLOAD_GB (per rank, 0 = none), MAXLEN, EAGER=1, KVDTYPE=fp8, MTP=n, DRAFT=/models/x SPEC=n, ATTN=, DRAFT_ATTN=, KVMEM=GiB, CHAT_TEMPLATE=, SPEC_EXTRA=, UTIL, NBT, NSEQ, P2P=1, HWQ=, MWAITX=, CGMODE=, OVERLAYS=..., EXTRA="...",
-#   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce <= 512 KB, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
+#   GPUS=0,1 (HIP ordinals), TP=2 (4 = our N-rank P2P all-reduce with cutoffs calibrated at launch, comm/calibrate.py, RCCL above; R9K_ARN=0 for RCCL only), PORT=8080, NAME=vllmstock (two servers
 #   side by side need distinct GPUS/PORT/NAME), SERVED_NAME=Qwen3.8 (the model name the API serves), DOCKER_ARGS="-e NCCL_DEBUG=INFO ..." (extra docker run args),
 # plus every R9K_* plugin knob (forwarded). WRAP=rocprof / PROF=1 for profiling.
 IMG=${IMG:-r9700/vllm:dev}
