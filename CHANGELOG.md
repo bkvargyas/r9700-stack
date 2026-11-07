@@ -17,8 +17,15 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
   step ledger against the PLX box, prefix caching for agent workloads).
 
 ### Changed
+- **vLLM pin: the 0.33.0 release image** (`vllm/vllm-openai-rocm:v0.33.0-rocm100`, by digest), from the 0.32-era nightly
+  e4a5b553; same torch 2.13 / ROCm 10.0. Integration gate, kernel gates and Flash-Next TP4 serving at parity with 0.32
+  (probe 207.3 vs 207.0, prefill unchanged, KV -7%), notes/vllm-0.33.md. Not yet validated on the PLX box's overlay.
 - The compressed all-reduce (`ar4`) only takes messages above the exact path's original ceiling (`ar4_min`, 512 KiB), so
   a calibrated, smaller exact range sends the sizes in between to RCCL instead of compressing decode-sized messages.
+
+### Fixed
+- Flash-Next MTP head conversion OOM at load (bf16 -> MXFP4 search chunk 2^18 -> 2^15 rows, same bits): TP2 with
+  offloaded experts on 0.32, and TP4 too on 0.33.
 
 ## [0.4.2] - 2026-11-04
 
