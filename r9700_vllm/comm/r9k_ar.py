@@ -273,7 +273,10 @@ class R9kAllReduceN:
       16 tok   80 KB    71.2 /  37.2 /  24.2
       64 tok  320 KB   102.0 / 130.4 /  73.2
      128 tok  640 KB   142.1 / 252.0 / 139.9
-    1024 tok    5 MB   770.1 /1965.3 /1140.7   (the switch uplinks are the limit; RCCL's ring spreads it better)"""
+    1024 tok    5 MB   770.1 /1965.3 /1140.7   (the switch uplinks are the limit; RCCL's ring spreads it better)
+    Those are PLX-switch numbers. On a box with every card on its own CPU root port two-shot is the slowest path at
+    every size and RCCL wins from ~40 KB (notes/root-ports.md), so at TP4 the cutoffs are measured at launch
+    (comm/calibrate.py, R9K_ARN_CALIBRATE=0 for the fixed ones above)."""
 
     def __init__(self, group, device, host: bool = False, one_shot_kb: float | None = None, max_kb: float | None = None,
                  sub: bool = False, extra2: int = 0):
@@ -326,8 +329,20 @@ class R9kAllReduceN:
         self.max_nb2 = min(int(os.environ.get("R9K_ARN2_MAX_BLOCKS", "64")), L.r9k_ar_max_blocks())
         self.words_per_block2 = int(os.environ.get("R9K_ARN2_WPB", "1024"))
         N = self.world_size
-        self.slot1 = self.max1 // 16
+        # Startup calibration (comm/calibrate.py, run by R9kCommunicator after this constructor) may move the
+        # one-shot cutoff up, so its pool is sized for the calibration ceiling (R9K_ARN_CAL_1S_KB, 128 KiB: 1 MiB a
+        # rank at TP4); the routing cutoff stays max1. Only the top-level TP4 instance calibrates: r9k_ar8's sub-
+        # group stages and the host pools keep their callers' caps.
+        from . import calibrate as _cal
+        self.calibrating = _cal.enabled() and not _cal.ar_pinned() and one_shot_kb is None and max_kb is None \
+            and not sub and not self._host and N == 4
+        pool1 = max(self.max1, kb("R9K_ARN_CAL_1S_KB", "128")) if self.calibrating else self.max1
+        self.slot1 = pool1 // 16
         self.slot2 = self.max_bytes // 16
+        # Messages above the exact range go to the compressed path (ar4) only from here: the size it was validated
+        # from with the fixed cutoffs (R9K_ARN_MAX_KB, 512 KiB). When calibration shrinks the exact range, the
+        # sizes in between go to RCCL, so decode-sized messages are never compressed.
+        self.ar4_min = self.max_bytes
         # Host pools take the host-memory two-shot (kernels/r9k_ar.hip r9k_ar_twoshot_host_nrank): each rank writes
         # only its own pool and the readers pull, 1 S up + 1.5 S down a rank instead of the generic kernel's 1.5 + 1.5,
         # and a pool of 2 x 2 slots instead of 2 x (N + 1). R9K_ARN_HOST_2S=0 keeps the generic kernel (A/B).
@@ -340,7 +355,7 @@ class R9kAllReduceN:
             self._two_host = all(th)
         if self._two_host:
             self.words_per_block2 = int(os.environ.get("R9K_ARNH_WPB", "512"))
-        one = self._share(group, 2 * N * self.max1, N * L.r9k_ar_max_blocks() * 4)
+        one = self._share(group, 2 * N * pool1, N * L.r9k_ar_max_blocks() * 4)
         # extra2: slots of max_bytes appended to the two-shot pool for a caller's own kernel (r9k_ar8_fused)
         two = self._share(group, ((4 if self._two_host else 2 * (N + 1)) + extra2) * self.max_bytes,
                           N * L.r9k_ar_max_blocks() * 4) if self.max_bytes > self.max1 else None
@@ -485,7 +500,7 @@ class R9kAllReduceN:
             return False
         n = x.numel() * x.element_size()
         if n > self.max_bytes:
-            return self.ar4 is not None and self.ar4.should(x)
+            return self.ar4 is not None and n > self.ar4_min and self.ar4.should(x)
         return 0 < n <= self.max_bytes and n % 16 == 0
 
     def nblocks(self, nbytes: int, two: bool = False) -> int:
@@ -565,7 +580,7 @@ class R9kAllReduceN:
         every kernel reads an element of `in` before the same lane writes it, and blocks own disjoint ranges)."""
         nbytes = x.numel() * x.element_size()
         if mode is None and nbytes > self.max_bytes:
-            if self.ar4 is None:                   # callers check should() first; a stray oversize call goes to RCCL
+            if self.ar4 is None or nbytes <= self.ar4_min:   # callers check should() first; strays go to RCCL
                 dist.all_reduce(x, group=self.group)
                 return x
             return self.ar4.all_reduce(x)

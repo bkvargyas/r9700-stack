@@ -147,6 +147,12 @@ class R9kCommunicator(CudaCommunicator):
                 ar = R9kAllReduceN(self.cpu_group, self.device)
                 if not ar.disabled:
                     self._r9k_ar = ar
+                    # Measure the one-shot / two-shot / RCCL and r9k / RCCL all-gather cutoffs on this box
+                    # (comm/calibrate.py): the fixed ones are PLX-switch numbers and lose 2x on root-port boxes.
+                    if ar.calibrating:
+                        from .calibrate import calibrate_nrank
+                        calibrate_nrank(ar, lambda x: CudaCommunicator.all_reduce(self, x),
+                                        lambda x, d: CudaCommunicator.all_gather(self, x, d), self.cpu_group)
                     # TP=8 on four switches: the flat one-shot collapses (126-288 us); the hierarchical
                     # pair / cross / pair composition stays ~20 us (comm/r9k_ar8.py). R9K_AR8=0 keeps flat.
                     if ws == 8 and os.environ.get("R9K_AR8", "1") == "1":
