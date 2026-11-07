@@ -9,7 +9,7 @@ no re-quantised weights: everything loads at runtime through vLLM's own extensio
 underneath it.
 
 [![Release](https://img.shields.io/github/v/release/bkvargyas/r9700-stack?label=release&color=2ea043)](https://github.com/bkvargyas/r9700-stack/releases/latest)
-![vLLM 0.32 line](https://img.shields.io/badge/vLLM-0.32%20line%2C%20stock%20nightly-blue)
+![vLLM 0.33](https://img.shields.io/badge/vLLM-0.33.0%2C%20stock%20release-blue)
 ![ROCm 10](https://img.shields.io/badge/ROCm-10.0%2C%20stock-red)
 ![Cards](https://img.shields.io/badge/Radeon%20AI%20PRO%20R9700-2%20%7C%204%20%7C%208%20cards-orange)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-lightgrey)](LICENSE)
@@ -80,7 +80,7 @@ prompts, decode flat to 28k of context. How each number was produced, and what w
 ## How it fits together
 
 ```
-OpenAI-compatible clients ──▶ stock vLLM (ROCm 10 nightly image) ──▶ model classes, attention backends, quant methods
+OpenAI-compatible clients ──▶ stock vLLM (ROCm 10 release image) ──▶ model classes, attention backends, quant methods
                                        │                                   registered by r9700_vllm at import
                                        ├──▶ libr9k.so (HIP) + Triton kernels      the decode / prefill / MoE / collective kernels
                                        ├──▶ exllamav3's gfx1201 extension         EXL3 trellis GEMV / GEMM (built into the image)
@@ -88,7 +88,7 @@ OpenAI-compatible clients ──▶ stock vLLM (ROCm 10 nightly image) ──▶
                                        └──▶ 2 / 4 / 8 R9700s over PCIe switches   P2P pair stages, host-memory cross stage, RCCL above 2 MB
 ```
 
-The image is the pinned nightly plus the plugin (`docker/Dockerfile`); the plugin tree is mounted at `/opt/r9700`
+The image is the pinned vLLM release plus the plugin (`docker/Dockerfile`); the plugin tree is mounted at `/opt/r9700`
 and its kernels are rebuilt by the serve scripts when a source is newer than the library. Every kernel has a stock
 fallback behind an `R9K_*` knob, and the integration gate checks the stock entry points the plugin depends on against
 the installed vLLM before a tree is served.
@@ -100,13 +100,13 @@ You need 2, 4 or 8 Radeon AI PRO R9700s, ROCm 10 on the host, docker, and the we
 (eight cards), and for DeepSeek-V4.1-Flash a directory composed of the EXL3 pack's shards and config plus the base
 checkpoint's two Engram shards and tokenizer (`serve/ds41-exl3.sh`'s header has the recipe; about 200 GB of host RAM).
 
-**1. Build the image** (the stock vLLM ROCm 10 nightly plus the plugin; the kernels and exllamav3's extension compile inside):
+**1. Build the image** (the stock vLLM 0.33 ROCm 10 release plus the plugin; the kernels and exllamav3's extension compile inside):
 
 ```sh
 docker build -t r9700/vllm:dev docker/
 ```
 
-The pin (2026-10-25: vLLM 0.32.1rc1, torch 2.13) is in `docker/Dockerfile`; `--build-arg BASE=` picks another nightly.
+The pin (2026-11-07: vLLM 0.33.0 release, torch 2.13, by digest) is in `docker/Dockerfile`; `--build-arg BASE=` picks another image.
 
 **2. Serve.** Each script carries the measured defaults with the reason next to every knob:
 
@@ -150,7 +150,7 @@ Flash-Next configuration needs about 120 GB of host RAM; eight-card runs on a 12
   (bit-exact against a torch reference, graph replay equal to eager), [notes/kernel-inventory.md](notes/kernel-inventory.md)
   what exists and why.
 - **Move the pin:** [notes/picking-up.md](notes/picking-up.md) is the upgrade recipe for a newer vLLM nightly and the
-  release checklist; [notes/vllm-0.32.md](notes/vllm-0.32.md) the last move.
+  release checklist; [notes/vllm-0.33.md](notes/vllm-0.33.md) the last move.
 - **Measure first:** `bench/ds41/ledger/` is the per-kernel step ledger; [notes/exl3-ledger.md](notes/exl3-ledger.md)
   shows how it reads.
 
@@ -175,7 +175,7 @@ kernels/         the HIP sources and build.sh (libr9k.so); Triton kernels live n
 serve/           one launcher per configuration, serve.sh underneath them
 bench/           warm-up, sanity, soak, eval, needle, profiling and ledger tools (bench/ds41/ for DeepSeek)
 tests/           kernel unit gates (bit-exact references, graph replay) and the integration gate
-docker/          the image: the pinned nightly, the plugin, exllamav3's gfx1201 extension
+docker/          the image: the pinned vLLM release, the plugin, exllamav3's gfx1201 extension
 overlay/ host/   the emulated-switch overlay for KVM guests; host-side clock and power helpers
 notes/ docs/     the written record, the graphics
 ```
