@@ -55,6 +55,21 @@ on the plugin image built from the new `BASE`, overlay on, nothing else on the b
   (thinking on) 0 bad of 780; soak at **8 clients** (see Known limits), 937 s: 166 requests, 0 errors, 2,600 prompt tok/s. 0 server
   errors. The worst-card headroom was not sampled for GLM in this gate; the soak passed.
 
+**Re-gate after PR #2 merged** (`~/gate-043b.sh`, 08:18-10:05 UTC; the first gate ran on the candidate before the TP4 collective
+calibration landed on master). The PR touches the TP4 N-rank collective paths and launcher comments only, so the four-card and
+two-card configurations were re-gated in full and the eight-card ones re-launched with their quick checks on the merged tree:
+
+- **Flash-Next TP4:** the calibration picked, on this PLX box, one-shot <= 5 KiB, two-shot <= 480 KiB, RCCL above, compressed from
+  512 KiB, r9k all-gather <= 128 KiB (the fixed cutoffs were 16 KiB / 512 KiB / 128 KiB). KV cache 475,758 tokens; probe 221.3
+  mean, 3.08 tokens a step, 477 / 928 at 8 / 16 streams, prefill 6,777; BetterBench combined **181.9** (185.3 three hours earlier
+  with the fixed cutoffs, 184.8 on v0.4.2; the run-to-run band of this benchmark is ~2 %), update p99 15.2 ms; strict sanity
+  0 bad of 2,460; soak (16 clients, 903 s) 443 requests, 0 errors, 6,542 prompt tok/s. 0 server errors.
+- **27B TP2:** probe 219.0 mean, 4.51 tokens a step, 523 / 636 at 8 / 16 streams; BetterBench **197.5**; strict sanity 0 bad of
+  2,460; soak 191 requests in 954 s, 0 errors, 3,072 prompt tok/s. 0 server errors.
+- **GLM TP8 (quick):** KV cache 284,829 tokens, decode-only 92.7 tok/s (the usual band), four streams 160 then 236, 12.7k needle
+  correct at 119.1 tok/s and 81 % acceptance. 0 server errors.
+- **DeepSeek TP8 (quick):** launch self-test prose 1.70 / code 3.70, KV cache 387,069 tokens. 0 server errors.
+
 **DeepSeek-V4.1-Flash TP8, NSEQ 4, the launcher defaults** (`~/v033/v043-ds41.validate.log`, 06:58-07:46 UTC): KV cache 387,069
 tokens (same). Launch self-test prose 1.75 / code 3.79. TTFT 1.28 s on 1.5k (1,205 tok/s), 3.42 s on 12.3k (3,599 tok/s); the
 4 x 12k burst leaves 0.57 GiB free on the worst card (0.52). spectune per-stream decode prose **108.6-109.0 tok/s** (MAL 1.83-1.84;
