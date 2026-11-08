@@ -9,6 +9,21 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 Nothing yet.
 
+## [0.4.3] - 2026-11-08
+
+Release notes with the validation record: [notes/release-v0.4.3.md](notes/release-v0.4.3.md); the evaluation: [notes/vllm-0.33.md](notes/vllm-0.33.md).
+
+### Changed
+- **The pin moves to the official vLLM 0.33.0 ROCm 10 release image** (`vllm/vllm-openai-rocm:v0.33.0-rocm100`, `docker/Dockerfile`):
+  the same torch 2.13 / triton 3.8 / aiter 0.1.26 / SDK build / HIP runtime / RCCL as the 2026-10-25 nightly it replaces, exllamav3
+  v1.6.6 unchanged, no serving fix needed. __CL43__
+- GLM-5.3-Flash 32k recipe: `KVMEM=2.65` (0.33's profile run would otherwise shrink the KV cache from 203k to 155k tokens).
+
+### Fixed
+- `kernels/build.sh` export check (an `nm | grep -q` SIGPIPE race under `pipefail`); the DeepSeek glue rotation pre-pass rounds once
+  (bit-equal to exllamav3); `serve/ds41-exl3.sh` waits for READY while the container lives (`READY_WAIT`); `compat/gate.py` tested
+  lists gain `0.33.0`; `tests/test_exl3_linear.py`'s negative control names its first error.
+
 ## [0.4.2] - 2026-11-04
 
 Release notes with the validation record: [notes/release-v0.4.2.md](notes/release-v0.4.2.md).

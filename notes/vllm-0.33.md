@@ -177,11 +177,7 @@ configuration is validated only by the eight-card server run (validate-42.sh sco
 
 `r9700/vllm:dev-1648` is built (exllamav3 1.6.6 and libr9k build unchanged; **36.8 GB**, a slimmer base than the release's
 53.8; the first build attempt hit the `build.sh` export-check race, fixed above), overlay pair `~/p2p-patched-1648` (38 CCOB
-bundles in `_rocm_C`, 768 gfx9-only hostcall kernels, `_C_stable_libtorch` 0). Gates and the DeepSeek launch: **not run: host CPU parked (SCMP trip during the GLM soak, 22:38-22:55 UTC); rerun after the power cycle with `bash ~/gate033.sh ds41`, then `LBL=1648 IMG=r9700/vllm:dev-1648 REPO=~/r9700-build/repo-033n`**. The line has moved into code we hook since the branch point, so expect plugin work when the pin moves past the
-release: aiter 0.1.28.post1, the QSA top-k buffer shared across layers (#65619; our `forward_qsa` reads `layer.topk_indices_buffer`),
-the Qwen4-Exp HyperConnection up-projection / gate-mix fusion (#64898; our hc hooks), PLE shard copy through `copy_weight_`
-(#65692; our int6 loader), Engram gate sharding (#63367) and the DeepSeek-V4.1 mHC gate overlap with attention / FFN (#59802; our
-mHC kernels), DSpark sliding-window MLA draft layers (#63795).
+bundles in `_rocm_C`, 768 gfx9-only hostcall kernels, `_C_stable_libtorch` 0). Gates: not run. The DeepSeek launch (2026-11-08 04:23-04:43 UTC, `~/v033/1648-ds41.*`) **dies at engine start**: `module 'vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router' has no attribute '_get_padding_mask'` (our router hook's target moved in the nightly line). Informational: the recommendation is the release image, and the nightly line's next release is the next candidate
 
 ## Verdict
 
