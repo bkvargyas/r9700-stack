@@ -134,11 +134,11 @@
 <text x="150" y="584" font-size="15" fill="#e2e8f0" font-weight="600" text-anchor="start" >DeepSeek-V4.1-Flash</text>
 <text x="150" y="600" font-size="12" fill="#a78bfa" font-weight="600" text-anchor="start" >TP8 · 8 cards · EXL3</text>
 <rect x="340" y="571" width="375" height="16" rx="3" fill="#1e2a44"/>
-<rect x="340" y="571" width="156.6" height="16" rx="3" fill="#a78bfa"/>
-<text x="725.0" y="585" font-size="16" fill="#f8fafc" font-weight="700">104 <tspan font-size="13" fill="#94a3b8" font-weight="400">tok/s</tspan></text>
-<text x="340" y="603" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prose, DSpark k=5 · code 215 · 8 streams · 2x DGX Spark: 81 / 118</text>
-<text x="820" y="584" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >199-221 / 422 @ 4 streams · 317 / 555 @ 8 (prose / code)</text>
-<text x="820" y="603" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prefill 3,600 tok/s · GSM8K 97 % · needles to 128k · KV 387k</text>
+<rect x="340" y="571" width="164.1" height="16" rx="3" fill="#a78bfa"/>
+<text x="725.0" y="585" font-size="16" fill="#f8fafc" font-weight="700">109 <tspan font-size="13" fill="#94a3b8" font-weight="400">tok/s</tspan></text>
+<text x="340" y="603" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prose, DSpark k=5 · code 220 · 8 streams · 2x DGX Spark: 81 / 118</text>
+<text x="820" y="584" font-size="13" fill="#e2e8f0" font-weight="400" text-anchor="start" >229 / 421 @ 4 streams · 313 / 529 @ 8 (prose / code)</text>
+<text x="820" y="603" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >prefill 3,600 tok/s · GSM8K 97-98 % · needles to 128k · KV 387k</text>
 <text x="30" y="638" font-size="13" fill="#94a3b8" font-weight="400" text-anchor="start" >210 W/card · VM with emulated PCIe switches · measured 2026-10 / 11</text>
 <text x="1170" y="638" font-size="13" fill="#94a3b8" font-weight="600" text-anchor="end" >github.com/bkvargyas/r9700-stack</text>
 </svg>

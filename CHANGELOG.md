@@ -16,7 +16,7 @@ Release notes with the validation record: [notes/release-v0.4.3.md](notes/releas
 ### Changed
 - **The pin moves to the official vLLM 0.33.0 ROCm 10 release image** (`vllm/vllm-openai-rocm:v0.33.0-rocm100`, `docker/Dockerfile`):
   the same torch 2.13 / triton 3.8 / aiter 0.1.26 / SDK build / HIP runtime / RCCL as the 2026-10-25 nightly it replaces, exllamav3
-  v1.6.6 unchanged, no serving fix needed. __CL43__
+  v1.6.6 unchanged, no serving fix needed. Gate on the tagged tree: Flash-Next TP4 BetterBench 185.3, 27B TP2 197.7, GLM TP8 97.5 tok/s (KV cache 284,829 tokens with `KVMEM=2.65`), DeepSeek-V4.1-Flash prose 109 / code 221 tok/s single stream, 229 / 421 at four, 313 / 529 at eight, GSM8K 97.5 %; every soak 0 errors.
 - GLM-5.3-Flash 32k recipe: `KVMEM=2.65` (0.33's profile run would otherwise shrink the KV cache from 203k to 155k tokens).
 
 ### Fixed
