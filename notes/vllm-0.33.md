@@ -145,7 +145,15 @@ same mamba padding) and the CUDA-graph estimate is unchanged (0.94 = 0.9229 with
 ~0.15 GiB higher on 0.33, and with blocks this coarse 0.15 GiB costs a quarter of the tokens. A candidate is #57926 (the sampler
 is profiled with the parameters the warm-up uses). Not a plugin matter; `KVMEM=` pins the budget explicitly (see the open items).
 
-**DeepSeek-V4.1-Flash TP8: **not run: host CPU parked (SCMP trip during the GLM soak, 22:38-22:55 UTC); rerun after the power cycle with `bash ~/gate033.sh ds41`, then `LBL=1648 IMG=r9700/vllm:dev-1648 REPO=~/r9700-build/repo-033n`**.** Two launches (`~/v033/v0330-ds41-try1-cold.*`, `~/v033/v0330-ds41.*`):
+**DeepSeek-V4.1-Flash TP8 (launcher defaults, SELFTEST on; after the host power cycle, 2026-11-08 03:41-04:22 UTC; `~/v033/v0330-ds41.*`):
+at the v0.4.2 numbers, no fix needed.** KV cache 387,069 tokens (same), model load from a cold page cache, self-test prose 1.66 /
+code 3.59. TTFT 1.25 s on 1.5k (1,236 tok/s), 3.36 s on 12.3k (3,669 tok/s); the 4 x 12k burst leaves **0.74 GiB** free on the
+worst card (v0.4.2 0.52). spectune prose x1 **104.1-104.7** tok/s (MAL 1.75-1.77; v0.4.2 103.5), x4 202-231 aggregate (199-221);
+code x1 **210.8-210.9** (4.24-4.27; 214.5), x4 **422-424** (422-423); GSM8K-style 160.6 / 190-230. divergence 24 / 24 and
+22 / 24 (23 / 24, 24 / 24, 24 / 24). Needles 3 / 3 at 8k, 16k, 28k. Strict sanity 0 bad of 25 at 5 streams and 0 of 80 at 8.
+Soak (8 clients, 200-28k, 928 s): 191 requests, 0 errors, median prompt 14.8k, 2,989 prompt tok/s, 0.74 GiB free throughout.
+GSM8K 200: **196 / 200 = 98.0 %** (194 on the pin). 0 server errors; the 16 "untested patch" warnings were `moe_shared_fold`
+(its TESTED tuple lacked e4a5b5537 and 0.33.0; added in bcf3622). The earlier two launches, before the power cycle (`~/v033/v0330-ds41-try1-cold.*`, `~/v033/v0330-ds41.*`):
 
 - The first launch read the 196 GiB pack and the Engram tables from a cold page cache (the GLM gate had just run): ~21 minutes
   of Engram / pre-weight reads, then 45 shards at ~24 s each. `serve/ds41-exl3.sh`'s WARM / SELFTEST waits were a fixed 20
@@ -177,7 +185,7 @@ mHC kernels), DSpark sliding-window MLA draft layers (#63795).
 
 ## Verdict
 
-**So far: three of four configurations at the v0.4.2 numbers with no serving fix; DeepSeek pending.**
+**All four configurations serve at the v0.4.2 numbers on v0.33.0-rocm100 with no serving fix.**
 
 - **v0.33.0-rocm100 is the first exact vLLM release on the platform we target**, and it is a small step from our pin: 95 main
   commits + 12 picks, the same torch / triton / aiter / SDK build / HIP runtime / RCCL. The image builds from `docker/Dockerfile`
@@ -189,15 +197,16 @@ mHC kernels), DSpark sliding-window MLA draft layers (#63795).
 - **Flash-Next TP4, 27B TP2 and GLM-5.3-Flash TP8 serve at or slightly above the v0.4.2 numbers** (BetterBench 185.7 / 197.9;
   GLM decode 96.6) with 0 bad answers and 0 soak errors. The one regression: **GLM's KV cache at 0.94 shrinks 203k -> 155k tokens**
   (a ~0.15 GiB larger profile peak against coarse 163,840-token blocks).
-- **DeepSeek-V4.1-Flash TP8 -- the configuration v0.4.x is about -- is not validated**: the host's CPU was parked by the power-limit
-  trip before its run.
+- **DeepSeek-V4.1-Flash TP8 -- the configuration v0.4.x is about -- passes its full validation** (prose 104 / code 211 single
+  stream, 422 at four streams, GSM8K 98 %, soak 0 errors, self-test ok) after the host power cycle, with 0.2 GiB more headroom on
+  the worst card than the pin.
 
-## Recommendation: wait -- move the pin to `v0.33.0-rocm100` once DeepSeek passes on it
+## Recommendation: move the pin to `v0.33.0-rocm100` (DeepSeek passed 2026-11-08)
 
 Reasons: (1) an exact release on ROCm 10 is the pin we want (reproducible, named, documented, no nightly churn), and nothing in
-three of four configurations argues against it; (2) but the protocol requires the eight-card DeepSeek validation before a pin
-moves, and it has not run; (3) the GLM KV regression should be measured with `KVMEM=2.65` (the pin's budget) before the move, so
-the 32k recipe either keeps its ~203k tokens or documents the new figure. Do not chase the nightly line: it is ~1,060 commits
+the four configurations argues against it; (2) the eight-card DeepSeek validation that the protocol requires before a pin moves
+has now run and is level with v0.4.2; (3) the GLM KV regression is to be measured with `KVMEM=2.65` (the pin's budget) in the
+release gate, so the 32k recipe either keeps its ~203k tokens or documents the new figure. Do not chase the nightly line: it is ~1,060 commits
 further on and touches five of our hook sites; take the next release instead.
 
 Steps after the host's power cycle: `ssh devops@192.168.0.123 'bash ~/gate033.sh ds41'` (launcher defaults, self-test, the
@@ -207,7 +216,8 @@ level with v0.4.2 (prose 103.5 / code 214.5 single stream, 199-221 / 422 at four
 
 ## Open items
 
-- DeepSeek-V4.1-Flash TP8 on v0.33.0 and the nightly 1648 pass: **not run: host CPU parked (SCMP trip during the GLM soak, 22:38-22:55 UTC); rerun after the power cycle with `bash ~/gate033.sh ds41`, then `LBL=1648 IMG=r9700/vllm:dev-1648 REPO=~/r9700-build/repo-033n`**.
+- The nightly 1648 DeepSeek pass: running 2026-11-08 04:23 UTC (`~/v033/gate033-ds41-1648.out`); informational only, the
+  recommendation does not depend on it.
 - **GLM-5.3-Flash KV cache, for the pin move: 155,437 tokens on 0.33 vs 203,329 on the pin** (UTIL 0.94, 32k recipe). Same
   KV layout (groups 32768 x 3 / 1280 / 8, mamba page padded 16.79 %, lcm block 163,840 tokens) and the same CUDA-graph estimate;
   "Available KV cache memory" is 2.5 GiB a rank instead of 2.65 because the profile run peaks ~0.15 GiB higher (candidate:
