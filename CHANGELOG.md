@@ -7,6 +7,12 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.4.3] - 2026-11-08
+
+Release notes with the validation record: [notes/release-v0.4.3.md](notes/release-v0.4.3.md); the evaluation: [notes/vllm-0.33.md](notes/vllm-0.33.md).
+
 ### Added
 - **Startup calibration of the TP4 collective cutoffs** (`comm/calibrate.py`): one-shot / two-shot / RCCL all-reduce
   and r9k / RCCL all-gather, graph-timed on every rank at launch, slowest rank decides. The fixed cutoffs were PLX-switch
@@ -20,11 +26,6 @@ Radeon AI PRO R9700 -- at a 225 W cap through v0.2.3, at 210 W with a -42 mV vol
 - The compressed all-reduce (`ar4`) only takes messages above the exact path's original ceiling (`ar4_min`, 512 KiB), so
   a calibrated, smaller exact range sends the sizes in between to RCCL instead of compressing decode-sized messages.
 
-## [0.4.3] - 2026-11-08
-
-Release notes with the validation record: [notes/release-v0.4.3.md](notes/release-v0.4.3.md); the evaluation: [notes/vllm-0.33.md](notes/vllm-0.33.md).
-
-### Changed
 - **The pin moves to the official vLLM 0.33.0 ROCm 10 release image** (`vllm/vllm-openai-rocm:v0.33.0-rocm100`, `docker/Dockerfile`):
   the same torch 2.13 / triton 3.8 / aiter 0.1.26 / SDK build / HIP runtime / RCCL as the 2026-10-25 nightly it replaces, exllamav3
   v1.6.6 unchanged, no serving fix needed. Gate on the tagged tree: Flash-Next TP4 BetterBench 185.3, 27B TP2 197.7, GLM TP8 97.5 tok/s (KV cache 284,829 tokens with `KVMEM=2.65`), DeepSeek-V4.1-Flash prose 109 / code 221 tok/s single stream, 229 / 421 at four, 313 / 529 at eight, GSM8K 97.5 %; every soak 0 errors.

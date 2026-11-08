@@ -27,6 +27,12 @@ VM100 (210 W / -42 mV, eight-card runs at the -500 MHz offset).
   `glm5next_rdna4` and `moe_shared_fold` (12 + 16 "untested patch" warnings a launch before; a release image reports the plain
   version string); `tests/test_exl3_linear.py`'s cold-capture negative control names its real first error (exllamav3's
   `exl3_gemv_try_launch` allocates under a torch capture at 9+ rows; the plugin never sends it more than 8).
+- **Also in this release (PR #2, merged 2026-11-07): startup calibration of the TP4 collective cutoffs** (`comm/calibrate.py`;
+  notes/root-ports.md). On a box where every card sits on its own CPU root port the fixed PLX-switch cutoffs put 8-16-stream
+  decode on a two-shot path 4-9x slower than RCCL; at TP4 launch the communicator now graph-times the paths on every rank and
+  the slowest rank decides (`R9K_ARN_CALIBRATE=0` keeps the fixed cutoffs; explicit knobs are respected). The compressed
+  all-reduce keeps its original 512 KiB floor (`ar4_min`). TP2 and TP8 are untouched. Gated on the root-port box in the PR
+  (Flash-Next TP4 probe 191 -> 207, 16 streams 466 -> 995-1,015) and re-gated on VM100 below.
 - **Not taken: the nightly line.** `nightly-rocm100-1648fefab9` (2026-11-07, `0.33.0rc1.dev992`, aiter 0.1.28.post1) touches five
   of our hook sites and the DeepSeek launch dies on it (the router hook's target `fused_topk_bias_router._get_padding_mask` is gone).
   The next release is the next pin candidate.
