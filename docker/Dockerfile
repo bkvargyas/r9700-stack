@@ -1,5 +1,5 @@
 # Stock vLLM ROCm 10 nightly + the r9700_vllm plugin (editable; bind-mount the repo over /opt/r9700 to iterate).
-ARG BASE=vllm/vllm-openai-rocm:nightly-rocm100-e4a5b5537344b103ed10de7764378ef09604ef3d
+ARG BASE=vllm/vllm-openai-rocm:v0.33.0-rocm100
 FROM ${BASE}
 # exllamav3's compiled extension for gfx1201 (EXL3 trellis kernels: the DeepSeek-V4.1-Flash EXL3 pack). MIT, built from the
 # pinned tag with the image's own hipcc; only the extension is used (exllamav3_ext), so no python deps are pulled.
